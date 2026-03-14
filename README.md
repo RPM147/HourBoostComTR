@@ -64,6 +64,7 @@ CRED_KEY=fernet-anahtari
 Not: Gmail kullanıyorsanız normal şifre değil, App Password oluşturmanız gerekir.
 
 5. Çalıştır
+
 python app.py
 
 Prodüksiyon (Gunicorn):
