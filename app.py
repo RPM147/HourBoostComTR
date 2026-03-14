@@ -164,7 +164,7 @@ def _get_user_agent() -> str:
 def _create_session_record(user_id: int, token: str):
     """Yeni oturum kaydı oluştur."""
     try:
-        # Eski oturumları temizle (30'dan fazlaysa en eskiyi sil)
+        # Eski oturumları temizle (10'dan fazlaysa en eskiyi sil)
         old_sessions = (
             UserSession.query
             .filter_by(user_id=user_id, is_active=True)
@@ -175,17 +175,22 @@ def _create_session_record(user_id: int, token: str):
             for s in old_sessions[:len(old_sessions) - 9]:
                 s.is_active = False
 
+        ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "unknown"
+        ua = (request.headers.get("User-Agent", "") or "")[:256]
+
         sess = UserSession(
             user_id=user_id,
             token_hint=token[:16] if token else None,
-            ip_address=_get_client_ip(),
-            user_agent=_get_user_agent(),
+            ip_address=ip,
+            user_agent=ua,
         )
         db.session.add(sess)
         db.session.commit()
+        logger.info("Oturum kaydı oluşturuldu: user_id=%s ip=%s", user_id, ip)
         return sess.id
     except Exception as e:
         logger.error("Oturum kaydı oluşturulamadı: %s", e)
+        db.session.rollback()
         return None
 
 
