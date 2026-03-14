@@ -69,6 +69,15 @@ python app.py
 Prodüksiyon (Gunicorn):
 gunicorn -c gunicorn.conf.py app:app
 
+🛡️ Güvenlik
+Steam şifreleri Fernet ile şifrelenmiş olarak saklanır
+JWT token blacklist sistemi
+IP ve kullanıcı bazlı brute force koruması (5 başarısız girişte 5 dakika kilit)
+E-posta doğrulama zorunluluğu
+CSRF koruması
+SQL Injection koruması (SQLAlchemy ORM)
+Shopier webhook imza doğrulaması
+
 🗂️ Proje Yapısı
 
 hourboost/
@@ -88,17 +97,17 @@ hourboost/
 
 Değişken	Açıklama	Zorunlu
 
-SECRET_KEY	Flask gizli anahtarı	✅
-DATABASE_URL	Veritabanı bağlantı adresi	❌ (SQLite varsayılan)
-MAIL_USERNAME	Gmail adresi	✅
-MAIL_PASSWORD	Gmail App Password	✅
-MAIL_FROM	Gönderici mail adresi	❌ (MAIL_USERNAME varsayılan)
-SITE_URL	Sitenin tam adresi	✅
-SHOPIER_PAT	Shopier API token	✅
-SHOPIER_WEBHOOK_SECRET	Shopier webhook gizli anahtarı	✅
-SHOPIER_BASIC_PRODUCT_ID	Basic plan ürün ID	✅
-SHOPIER_PREMIUM_PRODUCT_ID	Premium plan ürün ID	✅
-CRED_KEY	Steam şifre şifreleme anahtarı	❌ (otomatik oluşturulur)
+SECRET_KEY	Flask gizli anahtarı
+DATABASE_URL	Veritabanı bağlantı adresi (SQLite varsayılan)
+MAIL_USERNAME	Gmail adres
+MAIL_PASSWORD	Gmail App Password	
+MAIL_FROM	Gönderici mail adresi
+SITE_URL	Sitenin tam adresi	
+SHOPIER_PAT	Shopier API token	
+SHOPIER_WEBHOOK_SECRET	Shopier webhook gizli anahtarı	
+SHOPIER_BASIC_PRODUCT_ID	Basic plan ürün ID	
+SHOPIER_PREMIUM_PRODUCT_ID	Premium plan ürün ID	
+CRED_KEY	Steam şifre şifreleme anahtarı
 
 🛡️ Güvenlik
 Steam şifreleri Fernet ile şifrelenmiş olarak saklanır
