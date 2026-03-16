@@ -16,7 +16,8 @@ class Config:
         )
         _raw_secret = secrets.token_hex(32)
     SECRET_KEY = _raw_secret
-
+    STEAM_API_KEY = os.environ.get("STEAM_API_KEY")
+    SITE_URL = os.environ.get("SITE_URL", "https://hourboost.com.tr")
     SQLALCHEMY_DATABASE_URI = os.environ.get(
         "DATABASE_URL", "sqlite:///steamboost.db"
     )

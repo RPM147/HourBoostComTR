@@ -236,6 +236,20 @@ gtag('consent', 'default', {
           Forgot Password
         </a>
       </div>
+
+      <!-- Steam Login Divider -->
+      <div style="display:flex;align-items:center;gap:10px;margin:16px 0;">
+        <div style="flex:1;height:1px;background:var(--border);"></div>
+        <span style="font-size:0.72rem;color:var(--text-muted);white-space:nowrap;">or</span>
+        <div style="flex:1;height:1px;background:var(--border);"></div>
+      </div>
+
+      <!-- Steam Login Button -->
+      <a href="/steam/login?lang=en" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:11px;background:#1b2838;border:1px solid #4c6b8a;color:#fff;border-radius:10px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:600;text-decoration:none;transition:all 0.2s;margin-top:0;" onmouseover="this.style.background='#2a475e';this.style.borderColor='#66c0f4'" onmouseout="this.style.background='#1b2838';this.style.borderColor='#4c6b8a'">
+        <img src="https://store.steampowered.com/public/shared/images/header/logo_steam.svg" alt="Steam" style="height:18px;filter:brightness(0) invert(1);">
+        Sign in with Steam
+      </a>
+
     </div>
     <div class="pane" id="pane-register">
       <label>Username</label>
@@ -444,7 +458,7 @@ gtag('consent', 'default', {
         <div class="pricing-card" id="pcard-free">
           <div class="pricing-tier pricing-tier-free">Free</div>
           <div class="pricing-price">
-            <span class="currency">$</span><span class="amount">0</span>
+            <span class="currency"></span><span class="amount">Free</span>
           </div>
           <div class="pricing-period">forever</div>
           <ul class="pricing-features">
@@ -464,7 +478,7 @@ gtag('consent', 'default', {
           <div class="pricing-popular">&#11088; Popular</div>
           <div class="pricing-tier pricing-tier-basic">Basic</div>
           <div class="pricing-price">
-            <span class="currency">$</span><span class="amount">29<span style="font-size:1.1rem">.99</span></span>
+            <span class="currency">TRY</span><span class="amount">29<span style="font-size:1.1rem">.99</span></span>
           </div>
           <div class="pricing-period">one-time · 1,500 hours</div>
           <ul class="pricing-features">
@@ -483,7 +497,7 @@ gtag('consent', 'default', {
         <div class="pricing-card" id="pcard-premium">
           <div class="pricing-tier pricing-tier-premium">Premium</div>
           <div class="pricing-price">
-            <span class="currency">$</span><span class="amount">59<span style="font-size:1.1rem">.99</span></span>
+            <span class="currency">TRY</span><span class="amount">59<span style="font-size:1.1rem">.99</span></span>
           </div>
           <div class="pricing-period">one-time · 3,500 hours</div>
           <ul class="pricing-features">

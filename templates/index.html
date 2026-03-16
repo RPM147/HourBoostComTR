@@ -205,6 +205,7 @@ gtag('consent', 'default', {
 </script>
 </head>
 <body>
+
 <!-- AUTH -->
 <div id="authLayout" class="auth-layout" style="display:none">
 <div class="auth-card">
@@ -225,13 +226,27 @@ gtag('consent', 'default', {
 <div class="input-wrap"><input type="password" id="reg-pass-l" placeholder="..." autocomplete="off"><button class="toggle-pass" type="button" onclick="toggleVis('reg-pass-l',this)">Göster</button></div>
 <button class="btn btn-green" onclick="doSiteLogin()">GİRİŞ YAP</button>
 <div style="text-align:center;margin-top:12px;">
-  <a href="#" onclick="showForgotPassword();return false;" 
+  <a href="#" onclick="showForgotPassword();return false;"
      style="font-size:0.78rem;color:var(--text-muted);text-decoration:none;transition:color 0.2s;"
-     onmouseover="this.style.color='var(--accent)'" 
+     onmouseover="this.style.color='var(--accent)'"
      onmouseout="this.style.color='var(--text-muted)'">
     Şifremi Unuttum
   </a>
 </div>
+
+<!-- Steam ile Giriş Ayırıcı -->
+<div style="display:flex;align-items:center;gap:10px;margin:16px 0;">
+  <div style="flex:1;height:1px;background:var(--border);"></div>
+  <span style="font-size:0.72rem;color:var(--text-muted);white-space:nowrap;">veya</span>
+  <div style="flex:1;height:1px;background:var(--border);"></div>
+</div>
+
+<!-- Steam ile Giriş Butonu -->
+<a href="/steam/login" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:11px;background:#1b2838;border:1px solid #4c6b8a;color:#fff;border-radius:10px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:600;text-decoration:none;transition:all 0.2s;margin-top:0;" onmouseover="this.style.background='#2a475e';this.style.borderColor='#66c0f4'" onmouseout="this.style.background='#1b2838';this.style.borderColor='#4c6b8a'">
+  <img src="https://store.steampowered.com/public/shared/images/header/logo_steam.svg" alt="Steam" style="height:18px;filter:brightness(0) invert(1);">
+  Steam ile Giriş Yap
+</a>
+
 </div>
 
 <div class="pane" id="pane-register">

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 from flask import Flask, request, jsonify, session, g, render_template
+from flask import redirect as flask_redirect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from steam.enums import EResult
@@ -1960,6 +1961,183 @@ def create_announcement():
     db.session.add(ann)
     db.session.commit()
     return jsonify({"ok": True})
+
+# ───────────────────── Steam OpenID ─────────────────────
+
+import urllib.parse
+
+STEAM_OPENID_URL = "https://steamcommunity.com/openid/login"
+
+
+def _build_steam_login_url(return_to: str) -> str:
+    params = {
+        "openid.ns": "http://specs.openid.net/auth/2.0",
+        "openid.mode": "checkid_setup",
+        "openid.return_to": return_to,
+        "openid.realm": Config.SITE_URL,
+        "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+        "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+    }
+    return STEAM_OPENID_URL + "?" + urllib.parse.urlencode(params)
+
+
+def _verify_steam_callback(params: dict) -> str | None:
+    """Steam OpenID callback'ini doğrula, Steam ID döndür."""
+    check_params = dict(params)
+    check_params["openid.mode"] = "check_authentication"
+    try:
+        data = urllib.parse.urlencode(check_params).encode("utf-8")
+        req = urllib.request.Request(
+            STEAM_OPENID_URL,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            response = r.read().decode("utf-8")
+        if "is_valid:true" not in response:
+            return None
+        # Steam ID'yi claimed_id'den çıkar
+        claimed_id = params.get("openid.claimed_id", "")
+        import re as _re
+        m = _re.search(r"https://steamcommunity\.com/openid/id/(\d+)", claimed_id)
+        if not m:
+            return None
+        return m.group(1)
+    except Exception as e:
+        logger.error("Steam OpenID dogrulama hatasi: %s", e)
+        return None
+
+
+def _get_steam_profile(steam_id: str) -> dict:
+    """Steam Web API'den profil bilgisi çek."""
+    try:
+        api_key = Config.STEAM_API_KEY
+        if not api_key:
+            return {}
+        url = (
+            f"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+            f"?key={api_key}&steamids={steam_id}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        players = data.get("response", {}).get("players", [])
+        if not players:
+            return {}
+        p = players[0]
+        return {
+            "steam_id": steam_id,
+            "name": p.get("personaname", ""),
+            "avatar": p.get("avatarfull", ""),
+            "profile_url": p.get("profileurl", ""),
+        }
+    except Exception as e:
+        logger.error("Steam profil bilgisi alinamadi: %s", e)
+        return {}
+
+
+@app.route("/steam/login")
+def steam_login():
+    """Steam OpenID ile giriş başlat."""
+    lang = request.args.get("lang", "tr")
+    return_to = f"{Config.SITE_URL}/steam/callback?lang={lang}"
+    redirect_url = _build_steam_login_url(return_to)
+    from flask import redirect as flask_redirect
+    return flask_redirect(redirect_url)
+
+
+@app.route("/steam/callback")
+def steam_callback():
+    """Steam OpenID callback — doğrula ve giriş yap."""
+    lang = request.args.get("lang", "tr")
+
+    params = dict(request.args)
+    steam_id = _verify_steam_callback(params)
+
+    if not steam_id:
+        logger.warning("Steam OpenID dogrulama basarisiz")
+        if lang == "en":
+            return flask_redirect("/en/?error=steam_failed")
+        return flask_redirect("/?error=steam_failed")
+
+    # Steam profil bilgisi al
+    profile = _get_steam_profile(steam_id)
+    display_name = profile.get("name", "")
+    avatar = profile.get("avatar", "")
+
+    # Bu Steam ID'ye kayıtlı kullanıcı var mı?
+    user = User.query.filter_by(steam_id=steam_id).first()
+
+    if user:
+        # Mevcut kullanıcı — giriş yap
+        user.last_login = datetime.utcnow()
+        user.steam_avatar = avatar
+        user.steam_display_name = display_name
+        db.session.commit()
+    else:
+        # Yeni kullanıcı — otomatik kayıt
+        # Kullanıcı adı Steam display name'den üret
+        base_username = re.sub(r"[^a-zA-Z0-9_]", "", display_name)[:30] or f"steam_{steam_id[-6:]}"
+        username = base_username
+        counter = 1
+        while User.query.filter_by(username=username).first():
+            username = f"{base_username}{counter}"
+            counter += 1
+
+        # Rastgele e-posta (Steam OAuth'ta mail gelmez)
+        fake_email = f"steam_{steam_id}@steamlogin.hourboost"
+
+        user = User(
+            username=username,
+            email=fake_email,
+            is_verified=True,           # Steam zaten doğrulanmış
+            steam_id=steam_id,
+            steam_avatar=avatar,
+            steam_display_name=display_name,
+            lang=lang,
+        )
+        # Rastgele şifre (Steam ile giriş yapıldığı için kullanılmaz)
+        user.set_password(secrets.token_hex(32))
+        db.session.add(user)
+        db.session.commit()
+        logger.info("Steam ile yeni kullanici olusturuldu: %s (steam_id=%s)", username, steam_id)
+
+    # Oturum aç
+    session.permanent = True
+    session["user_id"] = user.id
+    token = generate_api_token(user.id)
+    _create_session_record(user.id, token)
+
+    # Dashboard'a yönlendir
+    if lang == "en":
+        from flask import redirect as flask_redirect
+        response = flask_redirect("/en/dashboard")
+    else:
+        from flask import redirect as flask_redirect
+        response = flask_redirect("/dashboard")
+
+    return response
+
+
+@app.route("/steam/unlink", methods=["POST"])
+@login_required
+def steam_unlink():
+    """Steam hesabını siteden ayır."""
+    user = g.user
+
+    # Steam ile kaydolmuşsa şifre olmayabilir, uyar
+    if user.email.endswith("@steamlogin.hourboost"):
+        return jsonify({
+            "ok": False,
+            "error": "Steam ile kayıt oldunuz. Önce bir e-posta ve şifre belirleyin."
+        })
+
+    user.steam_id = None
+    user.steam_avatar = None
+    user.steam_display_name = None
+    db.session.commit()
+    return jsonify({"ok": True, "message": "Steam hesabı bağlantısı kaldırıldı."})
 
 
 # ───────────────────── Başlat ─────────────────────

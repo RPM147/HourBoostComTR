@@ -19,6 +19,9 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime)
     lang = db.Column(db.String(5), default="tr", nullable=True)
+    steam_id = db.Column(db.String(20), nullable=True, unique=True)
+    steam_avatar = db.Column(db.String(256), nullable=True)
+    steam_display_name = db.Column(db.String(100), nullable=True)
 
     # ── E-posta doğrulama ──────────────────────────
     is_verified = db.Column(db.Boolean, default=False)
