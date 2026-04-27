@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="google-adsense-account" content="ca-pub-4233612570799995">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hour Boost — Admin Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--purple:#7c5cfc;--red:#ff4d6d;--red-dim:rgba(255,77,109,0.12);--gold:#f0a841;--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);padding:28px;min-height:100vh;}
+.top-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;}
+.top-bar h1{font-size:1.4rem;font-weight:700;}
+.top-bar a{color:var(--accent);text-decoration:none;font-size:0.85rem;}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:28px;}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;}
+.stat-card .label{font-size:0.68rem;font-weight:600;letter-spacing:1.5px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;}
+.stat-card .value{font-family:Space Grotesk,monospace;font-size:1.5rem;font-weight:700;color:var(--text);}
+.stat-card .value.green{color:var(--accent);}
+.stat-card .value.gold{color:var(--gold);}
+.stat-card .value.purple{color:var(--purple);}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;}
+.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.section-title{font-size:0.85rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);}
+.search-input{padding:8px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:Outfit,sans-serif;font-size:0.85rem;outline:none;width:250px;}
+.search-input:focus{border-color:rgba(0,229,160,0.4);}
+table{width:100%;border-collapse:collapse;}
+th{text-align:left;font-size:0.68rem;font-weight:600;letter-spacing:1px;color:var(--text-muted);text-transform:uppercase;padding:10px 12px;border-bottom:1px solid var(--border);}
+td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.85rem;color:var(--text-sub);}
+tr:hover td{background:var(--surface2);}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;}
+.badge-free{background:rgba(90,96,112,0.2);color:var(--text-muted);}
+.badge-basic{background:rgba(124,92,252,0.15);color:var(--purple);}
+.badge-premium{background:rgba(240,168,65,0.15);color:var(--gold);}
+.badge-pending{background:rgba(240,168,65,0.15);color:var(--gold);}
+.badge-completed{background:var(--accent-dim);color:var(--accent);}
+.badge-admin{background:var(--red-dim);color:var(--red);}
+.btn-sm{padding:5px 12px;border:none;border-radius:6px;font-family:Outfit,sans-serif;font-size:0.75rem;font-weight:600;cursor:pointer;transition:all 0.2s;}
+.btn-approve{background:var(--accent-dim);color:var(--accent);border:1px solid rgba(0,229,160,0.2);}
+.btn-approve:hover{background:rgba(0,229,160,0.2);}
+.btn-edit{background:rgba(124,92,252,0.1);color:var(--purple);border:1px solid rgba(124,92,252,0.2);}
+.btn-edit:hover{background:rgba(124,92,252,0.2);}
+/* Silme butonu stili */
+.btn-delete{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,77,109,0.2);}
+.btn-delete:hover{background:rgba(255,77,109,0.25);}
+.btn-delete:disabled{opacity:0.4;cursor:not-allowed;}
+select{padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:Outfit,sans-serif;font-size:0.8rem;}
+.msg{padding:10px 14px;border-radius:10px;font-size:0.82rem;margin-bottom:14px;display:none;font-weight:500;}
+.msg.ok{background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.2);color:var(--accent);display:block;}
+.msg.er{background:var(--red-dim);border:1px solid rgba(255,77,109,0.2);color:var(--red);display:block;}
+.pagination{display:flex;gap:6px;margin-top:14px;justify-content:center;}
+.page-btn{padding:6px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text-sub);font-size:0.8rem;cursor:pointer;}
+.page-btn.active{background:var(--accent-dim);color:var(--accent);border-color:rgba(0,229,160,0.3);}
+.empty{text-align:center;padding:20px;color:var(--text-muted);font-size:0.85rem;}
+/* Silme onay modalı */
+#deleteModal{
+  display:none;position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,0.75);
+  align-items:center;justify-content:center;
+}
+#deleteModal.open{display:flex;}
+.delete-modal-card{
+  background:#13151b;border:1px solid rgba(255,77,109,0.3);
+  border-radius:16px;padding:32px;max-width:440px;width:100%;
+  box-shadow:0 20px 60px rgba(0,0,0,0.6);
+}
+.delete-modal-icon{font-size:40px;text-align:center;margin-bottom:14px;}
+.delete-modal-title{font-size:1.1rem;font-weight:700;color:var(--red);margin-bottom:10px;text-align:center;}
+.delete-modal-body{font-size:0.88rem;color:var(--text-sub);line-height:1.7;margin-bottom:24px;text-align:center;}
+.delete-modal-body strong{color:var(--text);}
+.delete-modal-footer{display:flex;gap:10px;justify-content:center;}
+.btn-cancel{padding:10px 24px;background:transparent;color:var(--text-sub);border:1px solid var(--border2);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;}
+.btn-cancel:hover{color:var(--text);}
+.btn-confirm-delete{padding:10px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;}
+.btn-confirm-delete:hover{background:#e0354f;box-shadow:0 4px 16px rgba(255,77,109,0.4);}
+.btn-confirm-delete:disabled{opacity:0.5;cursor:not-allowed;}
+</style>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('consent', 'default', {
+  'ad_user_data': 'denied',
+  'ad_personalization': 'denied',
+  'ad_storage': 'denied',
+  'analytics_storage': 'denied',
+  'wait_for_update': 500
+});
+</script>
+</head>
+<body>
+
+<div class="top-bar">
+  <h1>&#128736; Admin Panel</h1>
+  <a href="/dashboard">&#8592; Dashboard'a Dön</a>
+</div>
+
+<div class="msg" id="adminMsg"></div>
+<div class="stats-grid" id="statsGrid"></div>
+
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">&#128176; Bekleyen Ödemeler</div>
+  </div>
+  <div id="pendingPayments"><div class="empty">Yükleniyor...</div></div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">&#128101; Kullanıcılar</div>
+    <input class="search-input" type="text" id="userSearch"
+           placeholder="Kullanıcı ara..." oninput="searchUsers()">
+  </div>
+  <div id="usersTable"><div class="empty">Yükleniyor...</div></div>
+  <div class="pagination" id="pagination"></div>
+</div>
+
+<!-- Silme Onay Modalı -->
+<div id="deleteModal">
+  <div class="delete-modal-card">
+    <div class="delete-modal-icon">&#9888;&#65039;</div>
+    <div class="delete-modal-title">Kullanıcıyı Sil</div>
+    <div class="delete-modal-body" id="deleteModalBody">
+      Bu işlem geri alınamaz.
+    </div>
+    <div class="delete-modal-footer">
+      <button class="btn-cancel" onclick="closeDeleteModal()">İptal</button>
+      <button class="btn-confirm-delete" id="confirmDeleteBtn" onclick="confirmDelete()">
+        &#128465; Evet, Sil
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+var searchTimer = null;
+var currentPage = 1;
+var _deleteTargetId = null;
+var _deleteTargetName = null;
+
+// ── API yardımcıları ──────────────────────────────────────────────────────────
+
+function api(path, d) {
+  return fetch(path, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest'
+    },
+    body: JSON.stringify(d || {})
+  }).then(function(r) { return r.json(); });
+}
+
+function admsg(t, c) {
+  var e = document.getElementById('adminMsg');
+  e.textContent = t;
+  e.className = 'msg ' + c;
+  setTimeout(function() { e.className = 'msg'; }, 6000);
+}
+
+// ── İstatistikler ─────────────────────────────────────────────────────────────
+
+function loadStats() {
+  fetch('/admin/stats').then(function(r) { return r.json(); }).then(function(d) {
+    var grid = document.getElementById('statsGrid');
+    grid.innerHTML =
+      card('Toplam Kullanıcı',   '',       d.total_users) +
+      card('Bu Hafta Yeni',      '',       d.new_users_week) +
+      card('Ödeme Yapan',        'purple', d.paying_users) +
+      card('Aktif Boost',        'green',  d.active_boosts) +
+      card('Aylık Gelir',        'gold',   '₺' + Number(d.revenue_month).toFixed(2)) +
+      card('Toplam Gelir',       'gold',   '₺' + Number(d.revenue_total).toFixed(2)) +
+      card('Free / Basic / Premium', '',
+           d.plan_breakdown.free + ' / ' + d.plan_breakdown.basic + ' / ' + d.plan_breakdown.premium) +
+      card('Bekleyen Ödeme',     '',       d.pending_payments);
+  });
+}
+
+function card(label, color, value) {
+  return '<div class="stat-card"><div class="label">' + label +
+         '</div><div class="value' + (color ? ' ' + color : '') + '">' +
+         value + '</div></div>';
+}
+
+// ── Ödemeler ──────────────────────────────────────────────────────────────────
+
+function loadPendingPayments() {
+  fetch('/admin/payments').then(function(r) { return r.json(); }).then(function(d) {
+    var el = document.getElementById('pendingPayments');
+    if (!d.payments.length) {
+      el.innerHTML = '<div class="empty">Ödeme yok &#10003;</div>';
+      return;
+    }
+    var html = '<table><thead><tr>' +
+      '<th>Kullanıcı</th><th>Plan</th><th>Tutar</th>' +
+      '<th>Durum</th><th>Tarih</th><th>İşlem</th>' +
+      '</tr></thead><tbody>';
+
+    d.payments.forEach(function(p) {
+      var rowStyle = p.status === 'unmatched'
+        ? 'style="background:rgba(240,80,80,0.08)"' : '';
+
+      var statusBadge =
+        p.status === 'completed'  ? '<span style="color:#00e5a0">&#10003; Tamamlandı</span>' :
+        p.status === 'unmatched'  ? '<span style="color:#f05050">&#9888; Eşleşmedi</span>' :
+        p.status === 'cancelled'  ? '<span style="color:#5a6070">İptal</span>' :
+                                    '<span style="color:#f0a841">Bekliyor</span>';
+
+      var actionBtn =
+        p.status === 'unmatched'  ? '<button class="btn-sm btn-approve" onclick="approveUnmatched(' + p.id + ')">&#9881; Eşleştir</button>' :
+        p.status === 'completed'  ? '—' :
+                                    '<button class="btn-sm btn-approve" onclick="approvePayment(' + p.id + ')">&#10003; Onayla</button>';
+
+      html += '<tr ' + rowStyle + '>' +
+        '<td>' + p.username + '</td>' +
+        '<td><span class="badge badge-' + p.plan + '">' + p.plan + '</span></td>' +
+        '<td>₺' + p.amount + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td>' + new Date(p.created_at).toLocaleDateString('tr') + '</td>' +
+        '<td>' + actionBtn + '</td>' +
+        '</tr>';
+    });
+
+    el.innerHTML = html + '</tbody></table>';
+  });
+}
+
+function approvePayment(id) {
+  if (!confirm('Bu ödemeyi onaylamak istiyor musunuz?')) return;
+  api('/admin/payments/approve', { payment_id: id }).then(function(r) {
+    if (r.ok) { admsg(r.message, 'ok'); loadPendingPayments(); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+function approveUnmatched(id) {
+  var username = prompt('Sipariş hangi kullanıcıya ait? HourBoost kullanıcı adını girin:');
+  if (!username || !username.trim()) return;
+  api('/admin/payments/approve', { payment_id: id, username: username.trim() }).then(function(r) {
+    if (r.ok) { admsg(r.message, 'ok'); loadPendingPayments(); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+// ── Kullanıcılar ──────────────────────────────────────────────────────────────
+
+function loadUsers(page, search) {
+  currentPage = page || 1;
+  var url = '/admin/users?page=' + currentPage;
+  if (search) url += '&q=' + encodeURIComponent(search);
+
+  fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+    var el = document.getElementById('usersTable');
+    if (!d.users.length) {
+      el.innerHTML = '<div class="empty">Kullanıcı bulunamadı</div>';
+      return;
+    }
+
+    var html = '<table><thead><tr>' +
+      '<th>ID</th><th>Kullanıcı</th><th>E-posta</th><th>Plan</th>' +
+      '<th>Hesaplar</th><th>Kayıt</th><th>Son Giriş</th><th>İşlem</th>' +
+      '</tr></thead><tbody>';
+
+    d.users.forEach(function(u) {
+      // Silme butonu: admin hesabına ve kendi hesabına gösterilmez
+      var deleteBtn = u.is_admin
+        ? '<span style="color:var(--text-muted);font-size:0.75rem;">—</span>'
+        : '<button class="btn-sm btn-delete" onclick="openDeleteModal(' +
+            u.id + ',\'' + escapeHtml(u.username) + '\')">' +
+          '&#128465; Sil</button>';
+
+      html += '<tr>' +
+        '<td>' + u.id + '</td>' +
+        '<td>' + escapeHtml(u.username) +
+          (u.is_admin ? ' <span class="badge badge-admin">ADMIN</span>' : '') +
+        '</td>' +
+        '<td>' + escapeHtml(u.email) + '</td>' +
+        '<td>' +
+          '<select onchange="changePlan(' + u.id + ',this.value)">' +
+            '<option value="free"'     + (u.plan === 'free'    ? ' selected' : '') + '>Free</option>' +
+            '<option value="basic"'    + (u.plan === 'basic'   ? ' selected' : '') + '>Basic</option>' +
+            '<option value="premium"'  + (u.plan === 'premium' ? ' selected' : '') + '>Premium</option>' +
+          '</select>' +
+        '</td>' +
+        '<td>' + u.accounts + '</td>' +
+        '<td>' + new Date(u.created_at).toLocaleDateString('tr') + '</td>' +
+        '<td>' + (u.last_login ? new Date(u.last_login).toLocaleDateString('tr') : '-') + '</td>' +
+        '<td>' + deleteBtn + '</td>' +
+        '</tr>';
+    });
+
+    el.innerHTML = html + '</tbody></table>';
+
+    // Sayfalama
+    var pag = document.getElementById('pagination');
+    pag.innerHTML = '';
+    for (var i = 1; i <= d.pages; i++) {
+      var btn = document.createElement('button');
+      btn.className = 'page-btn' + (i === currentPage ? ' active' : '');
+      btn.textContent = i;
+      (function(p) {
+        btn.onclick = function() {
+          loadUsers(p, document.getElementById('userSearch').value);
+        };
+      })(i);
+      pag.appendChild(btn);
+    }
+  });
+}
+
+function changePlan(userId, plan) {
+  api('/admin/users/update', { user_id: userId, plan: plan }).then(function(r) {
+    if (r.ok) { admsg('Plan güncellendi.', 'ok'); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+// ── Kullanıcı Silme ───────────────────────────────────────────────────────────
+
+function openDeleteModal(userId, username) {
+  _deleteTargetId   = userId;
+  _deleteTargetName = username;
+
+  document.getElementById('deleteModalBody').innerHTML =
+    '<strong>' + escapeHtml(username) + '</strong> adlı kullanıcı ve ona ait tüm veriler ' +
+    '(Steam hesapları, boost geçmişi, ödemeler) <strong>kalıcı olarak silinecek.</strong>' +
+    '<br><br>Bu işlem geri alınamaz. Emin misiniz?';
+
+  var btn = document.getElementById('confirmDeleteBtn');
+  btn.disabled = false;
+  btn.textContent = '🗑️ Evet, Sil';
+
+  document.getElementById('deleteModal').classList.add('open');
+}
+
+function closeDeleteModal() {
+  _deleteTargetId   = null;
+  _deleteTargetName = null;
+  document.getElementById('deleteModal').classList.remove('open');
+}
+
+function confirmDelete() {
+  if (!_deleteTargetId) return;
+
+  var btn = document.getElementById('confirmDeleteBtn');
+  btn.disabled = true;
+  btn.textContent = 'Siliniyor...';
+
+  api('/admin/users/delete', { user_id: _deleteTargetId }).then(function(r) {
+    closeDeleteModal();
+    if (r.ok) {
+      admsg(r.message, 'ok');
+      // Mevcut sayfayı yenile; sayfa boşaldıysa bir öncekine git
+      var search = document.getElementById('userSearch').value;
+      loadUsers(currentPage, search);
+      loadStats();
+    } else {
+      admsg(r.error || 'Silme basarisiz.', 'er');
+    }
+  }).catch(function() {
+    closeDeleteModal();
+    admsg('Sunucu hatası. Lütfen tekrar deneyin.', 'er');
+  });
+}
+
+// Modal dışına tıklayınca kapat
+document.getElementById('deleteModal').addEventListener('click', function(e) {
+  if (e.target === this) closeDeleteModal();
+});
+
+// ── Yardımcılar ───────────────────────────────────────────────────────────────
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function searchUsers() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(function() {
+    loadUsers(1, document.getElementById('userSearch').value);
+  }, 400);
+}
+
+// ── Başlangıç ─────────────────────────────────────────────────────────────────
+
+loadStats();
+loadPendingPayments();
+loadUsers(1);
+</script>
+
+<!-- ── COOKIE BANNER ── -->
+<style>
+#cookie-banner{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#13151b;border-top:1px solid rgba(255,255,255,0.1);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;box-shadow:0 -8px 32px rgba(0,0,0,0.4);transform:translateY(100%);transition:transform 0.4s ease;}
+[id="cookie-banner"].visible{transform:translateY(0) !important;}
+.ck-text{flex:1;font-size:0.83rem;color:#8892a0;line-height:1.6;}
+.ck-text a{color:#00e5a0;text-decoration:none;}
+.ck-text strong{color:#e8eaf0;}
+.ck-btns{display:flex;gap:10px;flex-shrink:1;max-width:420px;}
+.ck-btn{padding:9px 20px;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.83rem;font-weight:600;cursor:pointer;border:none;transition:all 0.2s;white-space:nowrap;}
+.ck-btn-accept{background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;}
+.ck-btn-accept:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.ck-btn-reject{background:rgba(255,255,255,0.06);color:#8892a0;border:1px solid rgba(255,255,255,0.1);}
+.ck-btn-reject:hover{background:rgba(255,255,255,0.1);color:#e8eaf0;}
+.ck-btn-settings{background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);font-size:0.78rem;}
+.ck-btn-settings:hover{color:#8892a0;}
+#cookie-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;padding:20px;}
+#cookie-modal.open{display:flex;}
+.ck-modal-card{background:#13151b;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+.ck-modal-title{font-size:1.1rem;font-weight:700;margin-bottom:20px;color:#e8eaf0;}
+.ck-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+.ck-row:last-of-type{border-bottom:none;}
+.ck-row-info .ck-name{font-size:0.88rem;font-weight:600;color:#e8eaf0;margin-bottom:3px;}
+.ck-row-info .ck-desc{font-size:0.78rem;color:#5a6070;line-height:1.5;}
+.ck-toggle{position:relative;width:44px;height:24px;flex-shrink:0;margin-left:16px;}
+.ck-toggle input{opacity:0;width:0;height:0;}
+.ck-slider{position:absolute;inset:0;background:#1f2230;border-radius:24px;cursor:pointer;transition:background 0.2s;}
+.ck-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#5a6070;border-radius:50%;transition:all 0.2s;}
+.ck-toggle input:checked+.ck-slider{background:rgba(0,229,160,0.2);}
+.ck-toggle input:checked+.ck-slider:before{background:#00e5a0;transform:translateX(20px);}
+.ck-toggle input:disabled+.ck-slider{cursor:not-allowed;opacity:0.6;}
+.ck-modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end;}
+.ck-modal-save{padding:10px 24px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;}
+.ck-modal-save:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);}
+.ck-modal-close{padding:10px 20px;background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;}
+.ck-modal-close:hover{color:#8892a0;}
+@media(max-width:768px){[id="cookie-banner"]{flex-direction:column;align-items:flex-start;padding:16px 20px;}.ck-btns{width:100%;flex-wrap:wrap;}.ck-btn{flex:1;text-align:center;}}
+</style>
+
+<div id="cookie-banner">
+  <div class="ck-text"><strong>&#127850; Çerez Bildirimi</strong><br>Sitemizde oturum yönetimi için zorunlu, analitik ve reklam amaçlı çerezler kullanılmaktadır. Detaylar için <a href="/cerez-politikasi">Çerez Politikası</a>'nı inceleyebilirsiniz.</div>
+  <div class="ck-btns">
+    <button class="ck-btn ck-btn-settings" onclick="ckOpenModal()">&#9881; Ayarlar</button>
+    <button class="ck-btn ck-btn-reject" onclick="ckReject()">Reddet</button>
+    <button class="ck-btn ck-btn-accept" onclick="ckAcceptAll()">Tümünü Kabul Et</button>
+  </div>
+</div>
+
+<div id="cookie-modal">
+  <div class="ck-modal-card">
+    <div class="ck-modal-title">&#9881; Çerez Tercihlerim</div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Zorunlu Çerezler</div><div class="ck-desc">Oturum yönetimi için gereklidir. Devre dışı bırakılamaz.</div></div><label class="ck-toggle"><input type="checkbox" checked disabled><span class="ck-slider"></span></label></div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Analitik Çerezler</div><div class="ck-desc">Site kullanımını ölçmek için Google Analytics kullanılır.</div></div><label class="ck-toggle"><input type="checkbox" id="ck-analytics"><span class="ck-slider"></span></label></div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Reklam Çerezleri</div><div class="ck-desc">Kişiselleştirilmiş reklam için Google AdSense kullanılır.</div></div><label class="ck-toggle"><input type="checkbox" id="ck-ads"><span class="ck-slider"></span></label></div>
+    <div class="ck-modal-footer"><button class="ck-modal-close" onclick="ckCloseModal()">İptal</button><button class="ck-modal-save" onclick="ckSavePrefs()">Kaydet</button></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var KEY='hb_cookie_consent';
+  function getP(){try{return JSON.parse(localStorage.getItem(KEY)||'null');}catch(e){return null;}}
+  function saveP(p){try{localStorage.setItem(KEY,JSON.stringify(p));}catch(e){}}
+  function showBanner(){var b=document.getElementById('cookie-banner');if(b)setTimeout(function(){b.classList.add('visible');},600);}
+  function hideBanner(){var b=document.getElementById('cookie-banner');if(b)b.classList.remove('visible');}
+  function loadScripts(a,d){
+    if(a&&typeof window._gaLoaded==='undefined'){window._gaLoaded=1;var s=document.createElement('script');s.async=true;s.src='https://www.googletagmanager.com/gtag/js?id=G-HVSNSK8REJ';document.head.appendChild(s);s.onload=function(){window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}window.gtag=gtag;gtag('js',new Date());gtag('config','G-HVSNSK8REJ');};}
+    if(d&&!document.getElementById('ck-adsense')){var a2=document.createElement('script');a2.id='ck-adsense';a2.async=true;a2.src='https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4233612570799995';a2.crossOrigin='anonymous';document.head.appendChild(a2);}
+  }
+  window.ckAcceptAll=function(){saveP({analytics:true,ads:true,ts:Date.now()});hideBanner();loadScripts(true,true);if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"granted","ad_personalization":"granted","ad_storage":"granted","analytics_storage":"granted"});}};
+  window.ckReject=function(){saveP({analytics:false,ads:false,ts:Date.now()});hideBanner();if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"denied","ad_personalization":"denied","ad_storage":"denied","analytics_storage":"denied"});}};
+  window.ckOpenModal=function(){var p=getP();if(p){document.getElementById('ck-analytics').checked=!!p.analytics;document.getElementById('ck-ads').checked=!!p.ads;}document.getElementById('cookie-modal').classList.add('open');};
+  window.ckCloseModal=function(){document.getElementById('cookie-modal').classList.remove('open');};
+  window.ckSavePrefs=function(){var a=document.getElementById('ck-analytics').checked,d=document.getElementById('ck-ads').checked;saveP({analytics:a,ads:d,ts:Date.now()});ckCloseModal();hideBanner();loadScripts(a,d);if(typeof gtag!=="undefined"){gtag("consent","update",{"analytics_storage":a?"granted":"denied","ad_storage":d?"granted":"denied","ad_user_data":d?"granted":"denied","ad_personalization":d?"granted":"denied"});}};
+  document.getElementById('cookie-modal').addEventListener('click',function(e){if(e.target===this)ckCloseModal();});
+  var p=getP();if(!p){showBanner();}else{loadScripts(p.analytics,p.ads);}
+})();
+</script>
+</body>
+</html>

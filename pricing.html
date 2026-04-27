@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="google-adsense-account" content="ca-pub-4233612570799995">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hour Boost — Fiyatlandırma</title>
+<meta name="description" content="Hour Boost fiyatlandırma planları. Ücretsiz başla, ihtiyacına göre yükselt.">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--surface3:#1f2230;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--purple:#7c5cfc;--purple-dim:rgba(124,92,252,0.12);--gold:#f0a841;--gold-dim:rgba(240,168,65,0.12);--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,160,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
+body::after{content:'';position:fixed;top:-200px;left:50%;transform:translateX(-50%);width:600px;height:400px;background:radial-gradient(ellipse,rgba(0,229,160,0.06) 0%,transparent 70%);pointer-events:none;z-index:0;}
+
+/* NAV */
+.navbar{position:fixed;top:0;left:0;right:0;z-index:100;padding:16px 40px;display:flex;align-items:center;justify-content:space-between;background:rgba(13,14,18,0.8);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);}
+.nav-logo{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:700;letter-spacing:1px;text-decoration:none;color:var(--text);}
+.nav-logo span{color:var(--accent);}
+.nav-logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),#00a572);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;}
+.nav-links{display:flex;gap:14px;align-items:center;}
+.nav-links a{color:var(--text-sub);text-decoration:none;font-size:0.88rem;font-weight:500;transition:color 0.2s;}
+.nav-links a:hover{color:var(--text);}
+.nav-cta{padding:8px 20px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f !important;border-radius:8px;font-weight:600 !important;font-size:0.85rem;text-decoration:none;transition:all 0.2s;}
+.nav-cta:hover{box-shadow:0 4px 20px rgba(0,229,160,0.3);transform:translateY(-1px);}
+
+/* MAIN */
+.main{position:relative;z-index:1;padding:120px 20px 80px;}
+
+/* HEADER */
+.pricing-header{text-align:center;margin-bottom:48px;}
+.pricing-header h1{font-size:2.4rem;font-weight:700;margin-bottom:12px;}
+.pricing-header h1 span{background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.pricing-header p{color:var(--text-muted);font-size:1rem;max-width:480px;margin:0 auto;}
+
+/* GRID */
+.pricing-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;max-width:900px;margin:0 auto 60px;}
+
+/* CARD */
+.pricing-card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:28px 24px;position:relative;transition:all 0.3s;display:flex;flex-direction:column;}
+.pricing-card:hover{border-color:var(--border2);transform:translateY(-2px);}
+.pricing-card.featured{border-color:rgba(124,92,252,0.4);box-shadow:0 8px 40px rgba(124,92,252,0.15);}
+.pricing-card.featured::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--purple),var(--accent));border-radius:20px 20px 0 0;}
+.pricing-popular{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,var(--purple),var(--accent));color:white;padding:4px 14px;border-radius:20px;font-size:0.68rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;white-space:nowrap;}
+
+/* TIER BADGE */
+.pricing-tier{font-size:0.82rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;display:inline-block;padding:4px 14px;border-radius:20px;}
+.pricing-tier-free{background:var(--surface3);color:var(--text-sub);border:1px solid var(--border2);}
+.pricing-tier-basic{background:linear-gradient(135deg,var(--purple-dim),rgba(98,68,234,0.2));color:var(--purple);border:1px solid rgba(124,92,252,0.3);}
+.pricing-tier-premium{background:linear-gradient(135deg,var(--gold-dim),rgba(240,168,65,0.2));color:var(--gold);border:1px solid rgba(240,168,65,0.3);text-shadow:0 0 12px rgba(240,168,65,0.3);}
+
+/* PRICE */
+.pricing-price{display:flex;align-items:baseline;gap:4px;margin-bottom:4px;}
+.pricing-price .amount{font-family:Space Grotesk,monospace;font-size:2.2rem;font-weight:700;color:var(--text);}
+.pricing-price .currency{font-size:1rem;color:var(--text-muted);font-weight:600;}
+.pricing-period{font-size:0.78rem;color:var(--text-muted);margin-bottom:24px;}
+
+/* FEATURES */
+.pricing-features{list-style:none;margin-bottom:24px;flex:1;}
+.pricing-features li{display:flex;align-items:center;gap:8px;padding:7px 0;font-size:0.88rem;font-weight:500;color:var(--text);border-bottom:1px solid var(--border);}
+.pricing-features li:last-child{border-bottom:none;}
+.pricing-features .check{color:var(--accent);font-weight:700;font-size:0.9rem;flex-shrink:0;}
+.pricing-features .cross{color:var(--text-muted);font-size:0.9rem;flex-shrink:0;}
+.pricing-features .feat-text{flex:1;}
+
+/* BUTTON */
+.btn{width:100%;padding:11px;border:none;border-radius:10px;cursor:pointer;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:600;letter-spacing:0.5px;margin-top:auto;transition:all 0.2s;text-decoration:none;display:block;text-align:center;}
+.btn-green{background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;}
+.btn-green:hover{box-shadow:0 4px 20px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.btn-purple{background:linear-gradient(135deg,#7c5cfc,#6244ea);color:white;}
+.btn-purple:hover{box-shadow:0 4px 20px rgba(124,92,252,0.3);transform:translateY(-1px);}
+.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--text-sub);}
+.btn-outline:hover{border-color:var(--accent);color:var(--accent);}
+
+/* FAQ / NOTE */
+.pricing-note{max-width:900px;margin:0 auto;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px 28px;}
+.pricing-note h3{font-size:0.9rem;font-weight:700;margin-bottom:16px;color:var(--text);}
+.note-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;}
+.note-item{display:flex;gap:10px;align-items:flex-start;}
+.note-icon{font-size:1rem;flex-shrink:0;margin-top:2px;}
+.note-text{font-size:0.82rem;color:var(--text-sub);line-height:1.6;}
+.note-text strong{color:var(--text);}
+
+/* FOOTER */
+footer{position:relative;z-index:1;text-align:center;padding:40px 20px 24px;color:var(--text-muted);font-size:0.78rem;}
+footer a{color:var(--text-muted);text-decoration:none;margin:0 8px;}
+footer a:hover{color:var(--text);}
+
+@media(max-width:768px){
+  .navbar{padding:14px 20px;}
+  .pricing-grid{grid-template-columns:1fr;}
+  .note-grid{grid-template-columns:1fr;}
+  .pricing-header h1{font-size:1.8rem;}
+}
+</style>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('consent', 'default', {
+  'ad_user_data': 'denied',
+  'ad_personalization': 'denied',
+  'ad_storage': 'denied',
+  'analytics_storage': 'denied',
+  'wait_for_update': 500
+});
+</script>
+</head>
+<body>
+
+<nav class="navbar">
+  <a class="nav-logo" href="/">
+    <div class="nav-logo-icon">&#9889;</div>
+    HOUR <span>BOOST</span>
+  </a>
+  <div class="nav-links">
+    <a href="/">Ana Sayfa</a>
+    <a href="/#features">Özellikler</a>
+    <a href="/dashboard" class="nav-cta">Hemen Başla</a>
+  </div>
+</nav>
+
+<div class="main">
+
+  <div class="pricing-header">
+    <h1>&#11088; <span>Planını Seç</span></h1>
+    <p>İhtiyacına uygun planı seç ve boost'a hemen başla. İstediğin zaman yükseltebilirsin.</p>
+  </div>
+
+  <div class="pricing-grid">
+
+    <!-- FREE -->
+    <div class="pricing-card">
+      <div class="pricing-tier pricing-tier-free">Ücretsiz</div>
+      <div class="pricing-price"><span class="currency">&#8378;</span><span class="amount">0</span></div>
+      <div class="pricing-period">sonsuza dek</div>
+      <ul class="pricing-features">
+        <li><span class="check">&#10003;</span><span class="feat-text">1 Steam hesabı</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Hesap başına 1 oyun</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Günlük 8 saat boost</span></li>
+        <li><span class="cross">&#10007;</span><span class="feat-text">Otomatik yeniden bağlantı</span></li>
+      </ul>
+      <a href="/dashboard" class="btn btn-outline">Ücretsiz Başla</a>
+    </div>
+
+    <!-- BASIC -->
+    <div class="pricing-card featured">
+      <div class="pricing-popular">&#11088; Popüler</div>
+      <div class="pricing-tier pricing-tier-basic">Basic</div>
+      <div class="pricing-price"><span class="currency">&#8378;</span><span class="amount">29<span style="font-size:1.1rem">.99</span></span></div>
+      <div class="pricing-period">tek seferlik &middot; 1.500 saat</div>
+      <ul class="pricing-features">
+        <li><span class="check">&#10003;</span><span class="feat-text">3 Steam hesabı</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Hesap başına 10 oyun</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">1.500 saat boost kotası</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Otomatik yeniden bağlantı</span></li>
+      </ul>
+      <a href="/dashboard" class="btn btn-purple">Basic'e Başla</a>
+    </div>
+
+    <!-- PREMIUM -->
+    <div class="pricing-card">
+      <div class="pricing-tier pricing-tier-premium">Premium</div>
+      <div class="pricing-price"><span class="currency">&#8378;</span><span class="amount">59<span style="font-size:1.1rem">.99</span></span></div>
+      <div class="pricing-period">tek seferlik &middot; 3.500 saat</div>
+      <ul class="pricing-features">
+        <li><span class="check">&#10003;</span><span class="feat-text">10 Steam hesabı</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Hesap başına 32 oyun</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">3.500 saat boost kotası</span></li>
+        <li><span class="check">&#10003;</span><span class="feat-text">Otomatik yeniden bağlantı</span></li>
+      </ul>
+      <a href="/dashboard" class="btn btn-green">Premium'a Başla</a>
+    </div>
+
+  </div>
+
+  <!-- NOTLAR -->
+  <div class="pricing-note">
+    <h3>&#8505;&#65039; Sık Sorulan Sorular</h3>
+    <div class="note-grid">
+      <div class="note-item">
+        <div class="note-icon">&#128197;</div>
+        <div class="note-text"><strong>Ödeme ne zaman alınır?</strong><br>Tek seferlik ödeme sistemiyle çalışır. Ödeme sonrası plan aktifleşir.</div>
+      </div>
+      <div class="note-item">
+        <div class="note-icon">&#128260;</div>
+        <div class="note-text"><strong>Plan değiştirebilir miyim?</strong><br>İstediğin zaman planını yükseltebilirsin.</div>
+      </div>
+      <div class="note-item">
+        <div class="note-icon">&#9201;</div>
+        <div class="note-text"><strong>Günlük limit ne anlama gelir?</strong><br>Ücretsiz planda günlük 8 saat boost yapılabilir. Limit her gece yarısı sıfırlanır.</div>
+      </div>
+      <div class="note-item">
+        <div class="note-icon">&#128272;</div>
+        <div class="note-text"><strong>Hesabım güvende mi?</strong><br>Şifreler şifrelenmiş olarak saklanır. Steam bağlantısı güvenli protokol üzerinden yapılır.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <div style="margin-bottom:10px;">
+    <a href="/gizlilik">Gizlilik Politikası</a>
+    <a href="/kullanim-sartlari">Kullanım Şartları</a>
+    <a href="/mesafeli-satis">Mesafeli Satış</a>
+    <a href="/iade-politikasi">İade Politikası</a>
+    <a href="/hakkimizda">Hakkımızda</a>
+  </div>
+  &copy; 2025 HourBoost. Tüm hakları saklıdır.
+</footer>
+
+<!-- Cookie Banner -->
+<style>
+#cookie-banner{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#13151b;border-top:1px solid rgba(255,255,255,0.1);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;box-shadow:0 -8px 32px rgba(0,0,0,0.4);transform:translateY(100%);transition:transform 0.4s ease;}
+[id="cookie-banner"].visible{transform:translateY(0) !important;}
+.ck-text{flex:1;font-size:0.83rem;color:#8892a0;line-height:1.6;}
+.ck-text a{color:#00e5a0;text-decoration:none;}
+.ck-text strong{color:#e8eaf0;}
+.ck-btns{display:flex;gap:10px;flex-shrink:1;max-width:420px;}
+.ck-btn{padding:9px 20px;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.83rem;font-weight:600;cursor:pointer;border:none;transition:all 0.2s;white-space:nowrap;}
+.ck-btn-accept{background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;}
+.ck-btn-accept:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.ck-btn-reject{background:rgba(255,255,255,0.06);color:#8892a0;border:1px solid rgba(255,255,255,0.1);}
+.ck-btn-reject:hover{background:rgba(255,255,255,0.1);color:#e8eaf0;}
+.ck-btn-settings{background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);font-size:0.78rem;}
+.ck-btn-settings:hover{color:#8892a0;}
+#cookie-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;padding:20px;}
+#cookie-modal.open{display:flex;}
+.ck-modal-card{background:#13151b;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+.ck-modal-title{font-size:1.1rem;font-weight:700;margin-bottom:20px;color:#e8eaf0;}
+.ck-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+.ck-row:last-of-type{border-bottom:none;}
+.ck-row-info .ck-name{font-size:0.88rem;font-weight:600;color:#e8eaf0;margin-bottom:3px;}
+.ck-row-info .ck-desc{font-size:0.78rem;color:#5a6070;line-height:1.5;}
+.ck-toggle{position:relative;width:44px;height:24px;flex-shrink:0;margin-left:16px;}
+.ck-toggle input{opacity:0;width:0;height:0;}
+.ck-slider{position:absolute;inset:0;background:#1f2230;border-radius:24px;cursor:pointer;transition:background 0.2s;}
+.ck-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#5a6070;border-radius:50%;transition:all 0.2s;}
+.ck-toggle input:checked+.ck-slider{background:rgba(0,229,160,0.2);}
+.ck-toggle input:checked+.ck-slider:before{background:#00e5a0;transform:translateX(20px);}
+.ck-toggle input:disabled+.ck-slider{cursor:not-allowed;opacity:0.6;}
+.ck-modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end;}
+.ck-modal-save{padding:10px 24px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;}
+.ck-modal-close{padding:10px 20px;background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;}
+</style>
+<div id="cookie-banner">
+  <div class="ck-text"><strong>&#127850; Çerez Bildirimi</strong><br>Sitemizde oturum yönetimi için zorunlu, analitik ve reklam amaçlı çerezler kullanılmaktadır. Detaylar için <a href="/cerez-politikasi">Çerez Politikası</a>'nı inceleyebilirsiniz.</div>
+  <div class="ck-btns">
+    <button class="ck-btn ck-btn-settings" onclick="ckOpenModal()">&#9881; Ayarlar</button>
+    <button class="ck-btn ck-btn-reject" onclick="ckReject()">Reddet</button>
+    <button class="ck-btn ck-btn-accept" onclick="ckAcceptAll()">Tümünü Kabul Et</button>
+  </div>
+</div>
+<div id="cookie-modal">
+  <div class="ck-modal-card">
+    <div class="ck-modal-title">&#9881; Çerez Tercihlerim</div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Zorunlu Çerezler</div><div class="ck-desc">Oturum yönetimi için gereklidir. Devre dışı bırakılamaz.</div></div><label class="ck-toggle"><input type="checkbox" checked disabled><span class="ck-slider"></span></label></div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Analitik Çerezler</div><div class="ck-desc">Site kullanımını ölçmek için Google Analytics kullanılır.</div></div><label class="ck-toggle"><input type="checkbox" id="ck-analytics"><span class="ck-slider"></span></label></div>
+    <div class="ck-row"><div class="ck-row-info"><div class="ck-name">Reklam Çerezleri</div><div class="ck-desc">Kişiselleştirilmiş reklam için Google AdSense kullanılır.</div></div><label class="ck-toggle"><input type="checkbox" id="ck-ads"><span class="ck-slider"></span></label></div>
+    <div class="ck-modal-footer"><button class="ck-modal-close" onclick="ckCloseModal()">İptal</button><button class="ck-modal-save" onclick="ckSavePrefs()">Kaydet</button></div>
+  </div>
+</div>
+<script>
+(function(){
+var KEY='hb_cookie_consent';
+function getP(){try{return JSON.parse(localStorage.getItem(KEY)||'null');}catch(e){return null;}}
+function saveP(p){try{localStorage.setItem(KEY,JSON.stringify(p));}catch(e){}}
+function showBanner(){var b=document.getElementById('cookie-banner');if(b)setTimeout(function(){b.classList.add('visible');},600);}
+function hideBanner(){var b=document.getElementById('cookie-banner');if(b)b.classList.remove('visible');}
+function loadScripts(a,d){
+  if(a&&typeof window._gaLoaded==='undefined'){window._gaLoaded=1;var s=document.createElement('script');s.async=true;s.src='https://www.googletagmanager.com/gtag/js?id=G-HVSNSK8REJ';document.head.appendChild(s);s.onload=function(){window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}window.gtag=gtag;gtag('js',new Date());gtag('config','G-HVSNSK8REJ');};}
+  if(d&&!document.getElementById('ck-adsense')){var a2=document.createElement('script');a2.id='ck-adsense';a2.async=true;a2.src='https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4233612570799995';a2.crossOrigin='anonymous';document.head.appendChild(a2);}
+}
+window.ckAcceptAll=function(){saveP({analytics:true,ads:true,ts:Date.now()});hideBanner();loadScripts(true,true);if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"granted","ad_personalization":"granted","ad_storage":"granted","analytics_storage":"granted"});}};
+window.ckReject=function(){saveP({analytics:false,ads:false,ts:Date.now()});hideBanner();if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"denied","ad_personalization":"denied","ad_storage":"denied","analytics_storage":"denied"});}};
+window.ckOpenModal=function(){var p=getP();if(p){document.getElementById('ck-analytics').checked=!!p.analytics;document.getElementById('ck-ads').checked=!!p.ads;}document.getElementById('cookie-modal').classList.add('open');};
+window.ckCloseModal=function(){document.getElementById('cookie-modal').classList.remove('open');};
+window.ckSavePrefs=function(){var a=document.getElementById('ck-analytics').checked,d=document.getElementById('ck-ads').checked;saveP({analytics:a,ads:d,ts:Date.now()});ckCloseModal();hideBanner();loadScripts(a,d);if(typeof gtag!=="undefined"){gtag("consent","update",{"analytics_storage":a?"granted":"denied","ad_storage":d?"granted":"denied","ad_user_data":d?"granted":"denied","ad_personalization":d?"granted":"denied"});}};
+document.getElementById('cookie-modal').addEventListener('click',function(e){if(e.target===this)ckCloseModal();});
+var p=getP();if(!p){showBanner();}else{loadScripts(p.analytics,p.ads);}
+})();
+</script>
+</body>
+</html>
