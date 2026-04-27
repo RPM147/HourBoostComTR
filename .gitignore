@@ -1,52 +1,36 @@
-# secrets
+```
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
 .env
+.env.local
 .env.*
 
-# database
-*.db
-instance/
-
-# steam tokens
-tokens/
-
-# sentry
-sentry/
-
-# logs
-*.log
-
-# python
-__pycache__/
-*.pyc
-
-# venv
-venv/
-
-# system
-.DS_Store
-
-# Gizli bilgiler
-.env
-.cred_key
-tokens/
-sentry/
-
-# Veritabanı
-instance/
-*.db
-*.db-shm
-*.db-wal
-
-# Loglar
-logs/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-venv/
-.venv/
-
-# IDE
+# Editors
 .vscode/
 .idea/
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+```

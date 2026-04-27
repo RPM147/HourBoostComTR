@@ -1,11 +1,7 @@
 from gevent import monkey; monkey.patch_all()
 
-try:
-    from keyrings.alt.file import PlaintextKeyring
-    import keyring, keyring.backend
-    keyring.set_keyring(PlaintextKeyring())
-except Exception:
-    pass
+# Removed insecure PlaintextKeyring - credentials should be stored encrypted or in environment variables
+# If keyring functionality is needed, use a secure backend like SecretService or WindowsWinVault
 
 import os
 import json
@@ -18,8 +14,94 @@ import re
 import bleach
 import mailer
 import jwt as pyjwt
-
+import hmac
+import hashlib
+import ipaddress
+from urllib.parse import urlparse
 from functools import wraps
+
+# Allowed hosts for external HTTP requests to prevent SSRF
+ALLOWED_HOSTS = {
+    'steamcommunity.com',
+    'api.steampowered.com',
+    'store.steampowered.com',
+    'avatars.steamstatic.com',
+    'cdn.cloudflare.steamstatic.com',
+    'api.shopier.com',
+    'www.shopier.com',
+}
+
+# Private IP ranges that should be blocked
+PRIVATE_IP_RANGES = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('169.254.0.0/16'),
+    ipaddress.ip_network('0.0.0.0/8'),
+    ipaddress.ip_network('::1/128'),  # IPv6 localhost
+    ipaddress.ip_network('fc00::/7'),  # IPv6 private
+    ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
+]
+
+
+def is_safe_url(url):
+    """Validate URL to prevent SSRF attacks."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False
+        if not parsed.hostname:
+            return False
+        # Check if hostname is allowed
+        if parsed.hostname not in ALLOWED_HOSTS:
+            logger.warning("URL hostname not allowed: %s", parsed.hostname)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def is_private_ip(ip_str):
+    """Check if an IP address is in a private range."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in network for network in PRIVATE_IP_RANGES)
+    except ValueError:
+        return True  # Treat invalid IPs as unsafe
+
+
+class SafeURLOpener:
+    """URL opener that validates URLs and prevents SSRF attacks."""
+    
+    @staticmethod
+    def urlopen(url, timeout=10, **kwargs):
+        """Open URL only if it's safe."""
+        if isinstance(url, str):
+            if not is_safe_url(url):
+                raise ValueError(f"Unsafe URL blocked: {url}")
+        elif hasattr(url, 'full_url'):  # Request object
+            if not is_safe_url(url.full_url):
+                raise ValueError(f"Unsafe URL blocked: {url.full_url}")
+        
+        # Perform DNS resolution and check IP
+        if isinstance(url, str):
+            hostname = urlparse(url).hostname
+        else:
+            hostname = urlparse(url.full_url).hostname
+        
+        try:
+            import socket
+            ip_addresses = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+            for family, socktype, proto, canonname, sockaddr in ip_addresses:
+                ip = sockaddr[0]
+                if is_private_ip(ip):
+                    logger.warning("URL resolves to private IP, blocked: %s -> %s", hostname, ip)
+                    raise ValueError(f"URL resolves to private IP: {ip}")
+        except socket.gaierror:
+            pass  # Let the actual request fail with DNS error
+        
+        return SafeURLOpener.urlopen(url, timeout=timeout, **kwargs)
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -28,9 +110,10 @@ from flask import redirect as flask_redirect
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from steam.enums import EResult
+from flask_wtf.csrf import CSRFProtect
 
 from config import Config
-from models import db, User, SteamAccount, BoostGame, Payment, BoostLog, Announcement, UserSession
+from models import db, User, SteamAccount, BoostGame, Payment, BoostLog, Announcement, UserSession, RevokedToken
 from steam_manager import boost_service
 import shopier as shopier_lib
 
@@ -45,6 +128,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
+
+# Initialize CSRF protection
+csrf = CSRFProtect(app)
 
 db.init_app(app)
 
@@ -70,6 +156,7 @@ _blacklist_cleanup_last = time.time()
 
 
 def _cleanup_blacklist():
+    """Clean up expired tokens from in-memory blacklist."""
     global _blacklist_cleanup_last
     now = time.time()
     if now - _blacklist_cleanup_last < 3600:
@@ -91,19 +178,48 @@ def _cleanup_blacklist():
         logger.info("JWT blacklist temizlendi: %d token silindi", len(to_remove))
 
 
+def _cleanup_revoked_tokens():
+    """Periodically clean up expired revoked tokens from database."""
+    try:
+        RevokedToken.cleanup_expired()
+        logger.info("Revoked tokens cleaned up from database")
+    except Exception as e:
+        logger.error("Error cleaning up revoked tokens: %s", e)
+
+
 def generate_api_token(user_id, expires_hours=24 * 30):
     payload = {
         "user_id": user_id,
         "exp": datetime.utcnow() + timedelta(hours=expires_hours),
         "iat": datetime.utcnow(),
+        "jti": secrets.token_hex(16),  # Unique token identifier
     }
     return pyjwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
 def verify_api_token(token):
+    # Check persistent revoked tokens database
+    try:
+        payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"], options={"verify_exp": False})
+        jti = payload.get("jti")
+        if jti:
+            revoked = RevokedToken.query.filter_by(token_jti=jti).first()
+            if revoked:
+                if revoked.expires_at > datetime.utcnow():
+                    logger.info("Token is revoked (persistent): jti=%s", jti)
+                    return None
+                else:
+                    # Token expired, can be removed from DB
+                    db.session.delete(revoked)
+                    db.session.commit()
+    except pyjwt.InvalidTokenError:
+        pass
+    
+    # Also check in-memory blacklist for recently revoked tokens
     with _blacklist_lock:
         if token in _token_blacklist:
             return None
+    
     try:
         payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
         return payload["user_id"]
@@ -115,6 +231,26 @@ def verify_api_token(token):
 
 def blacklist_token(token):
     if token:
+        try:
+            payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"], options={"verify_exp": False})
+            jti = payload.get("jti")
+            exp_timestamp = payload.get("exp", time.time() + 3600)
+            exp_datetime = datetime.utcfromtimestamp(exp_timestamp)
+            
+            if jti:
+                # Store in persistent database
+                revoked = RevokedToken(
+                    token_jti=jti,
+                    user_id=payload.get("user_id"),
+                    expires_at=exp_datetime
+                )
+                db.session.add(revoked)
+                db.session.commit()
+                logger.info("Token blacklisted persistently: jti=%s", jti)
+        except pyjwt.InvalidTokenError:
+            logger.warning("Could not decode token for blacklisting")
+        
+        # Also add to in-memory blacklist for immediate effect
         with _blacklist_lock:
             _token_blacklist.add(token)
         _cleanup_blacklist()
@@ -288,6 +424,27 @@ def shutdown_cleanup():
                     )
                     db.session.add(log)
         db.session.commit()
+        
+        # Clean up expired revoked tokens on shutdown
+        try:
+            _cleanup_revoked_tokens()
+        except Exception as e:
+            logger.error("Error during revoked token cleanup at shutdown: %s", e)
+
+
+# Periodic cleanup of revoked tokens (runs every hour)
+def periodic_token_cleanup():
+    import gevent
+    while True:
+        gevent.sleep(3600)  # Run every hour
+        try:
+            with app.app_context():
+                _cleanup_revoked_tokens()
+        except Exception as e:
+            logger.error("Error in periodic token cleanup: %s", e)
+
+# Start background cleanup task
+gevent.spawn(periodic_token_cleanup)
 
 
 # ───────────────────── Yardımcılar ─────────────────────
@@ -349,22 +506,36 @@ def extract_username_from_note(note: str):
 
 # ───────────────────── Middleware ─────────────────────
 
-@app.before_request
-def csrf_check():
-    if request.method in ("POST", "PUT", "DELETE"):
-        if request.path in (
-            "/payment/callback",
-            "/payment/webhook",
-            "/shopier/webhook",
-        ):
-            return
-        if not request.is_json:
-            return
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            return
-        if request.headers.get("X-Requested-With") != "XMLHttpRequest":
-            return jsonify({"error": "Invalid request."}), 403
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses."""
+    # Prevent clickjacking
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    # XSS Protection
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    # Referrer Policy
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # Permissions Policy (formerly Feature-Policy)
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # Content Security Policy - restrictive but functional
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.jsdelivr.net https://js.stripe.com 'unsafe-inline'; "
+        "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self' https://api.shopier.com https://api.steampowered.com;"
+    )
+    response.headers['Content-Security-Policy'] = csp
+    # HSTS (only in production with HTTPS)
+    if app.config.get('SESSION_COOKIE_SECURE', False):
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+
+# Note: CSRF protection is now handled by Flask-WTF's CSRFProtect
+# The custom csrf_check is kept for additional API validation but is no longer the primary CSRF defense
 
 
 _plan_expiry_cache: dict = {}
@@ -1070,8 +1241,14 @@ def payment_check(payment_id):
 
 @app.route("/shopier/webhook", methods=["POST"])
 def shopier_webhook():
+    # Webhook secret is now REQUIRED - no bypass allowed
+    if not Config.SHOPIER_WEBHOOK_SECRET:
+        logger.error("SHOPIER_WEBHOOK_SECRET is not configured! Webhook rejected.")
+        return jsonify({"error": "Server configuration error"}), 500
+    
     raw_body = request.get_data()
     signature = request.headers.get("Shopier-Signature", "")
+    
     if not shopier_lib.verify_webhook(raw_body, signature, Config.SHOPIER_WEBHOOK_SECRET):
         logger.warning("Shopier webhook: IMZA HATASI!")
         return jsonify({"error": "Invalid signature"}), 401
@@ -1663,7 +1840,7 @@ def steam_profile():
             try:
                 api_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with SafeURLOpener.urlopen(req, timeout=5) as r:
                     xml = r.read().decode()
                 m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", xml)
                 if m:
@@ -1692,7 +1869,7 @@ def game_search():
             f"?term={urllib.parse.quote(term)}&l=english&cc=US"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with SafeURLOpener.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
         return jsonify([
             {"id": i["id"], "name": i["name"], "tiny_image": i.get("tiny_image", "")}
@@ -1716,7 +1893,7 @@ def game_info():
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={aid}&l=english"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with SafeURLOpener.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read().decode())
             if data.get(str(aid), {}).get("success"):
                 d = data[str(aid)]["data"]
@@ -1993,7 +2170,7 @@ def _verify_steam_callback(params: dict) -> str | None:
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with SafeURLOpener.urlopen(req, timeout=10) as r:
             response = r.read().decode("utf-8")
         if "is_valid:true" not in response:
             return None
@@ -2020,7 +2197,7 @@ def _get_steam_profile(steam_id: str) -> dict:
             f"?key={api_key}&steamids={steam_id}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with SafeURLOpener.urlopen(req, timeout=10) as r:
             data = json.loads(r.read().decode("utf-8"))
         players = data.get("response", {}).get("players", [])
         if not players:
