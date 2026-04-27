@@ -131,3 +131,22 @@ class UserSession(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
+
+
+class RevokedToken(db.Model):
+    """Persistently stores revoked JWT tokens to prevent reuse after restart."""
+    __tablename__ = "revoked_tokens"
+
+    id = db.Column(db.Integer, primary_key=True)
+    token_jti = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    
+    @classmethod
+    def cleanup_expired(cls):
+        """Remove expired tokens from the database."""
+        from sqlalchemy import delete
+        now = datetime.utcnow()
+        db.session.execute(delete(cls).where(cls.expires_at < now))
+        db.session.commit()
