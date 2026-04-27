@@ -103,7 +103,6 @@ class BoostLog(db.Model):
     stopped_at = db.Column(db.DateTime)
     duration_seconds = db.Column(db.Integer, default=0)
     games_count = db.Column(db.Integer, default=0)
-    # Hangi oyunların boost edildiğini sakla (JSON string: "[730, 440]")
     app_ids_json = db.Column(db.Text, nullable=True)
 
 
@@ -124,7 +123,6 @@ class UserSession(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    # JWT token'ın jti yerine token'ın ilk 16 karakteri (tanımlama için)
     token_hint = db.Column(db.String(32), nullable=True)
     ip_address = db.Column(db.String(64), nullable=True)
     user_agent = db.Column(db.String(256), nullable=True)
@@ -134,7 +132,7 @@ class UserSession(db.Model):
 
 
 class RevokedToken(db.Model):
-    """Persistently stores revoked JWT tokens to prevent reuse after restart."""
+    """Yeniden kullanımı önlemek için iptal edilmiş JWT token'ları kalıcı olarak saklar."""
     __tablename__ = "revoked_tokens"
 
     id = db.Column(db.Integer, primary_key=True)
@@ -142,10 +140,10 @@ class RevokedToken(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     expires_at = db.Column(db.DateTime, nullable=False)
-    
+
     @classmethod
     def cleanup_expired(cls):
-        """Remove expired tokens from the database."""
+        """Süresi dolmuş token'ları veritabanından temizle."""
         from sqlalchemy import delete
         now = datetime.utcnow()
         db.session.execute(delete(cls).where(cls.expires_at < now))

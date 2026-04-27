@@ -1,8 +1,5 @@
 from gevent import monkey; monkey.patch_all()
 
-# Removed insecure PlaintextKeyring - credentials should be stored encrypted or in environment variables
-# If keyring functionality is needed, use a secure backend like SecretService or WindowsWinVault
-
 import os
 import json
 import time
@@ -20,14 +17,14 @@ import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
 
-# Initialize logging early so it can be used in helper functions
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Allowed hosts for external HTTP requests to prevent SSRF
+# ───────────────────── SSRF Koruması ─────────────────────
+
 ALLOWED_HOSTS = {
     'steamcommunity.com',
     'api.steampowered.com',
@@ -38,7 +35,6 @@ ALLOWED_HOSTS = {
     'www.shopier.com',
 }
 
-# Private IP ranges that should be blocked
 PRIVATE_IP_RANGES = [
     ipaddress.ip_network('10.0.0.0/8'),
     ipaddress.ip_network('172.16.0.0/12'),
@@ -46,23 +42,22 @@ PRIVATE_IP_RANGES = [
     ipaddress.ip_network('127.0.0.0/8'),
     ipaddress.ip_network('169.254.0.0/16'),
     ipaddress.ip_network('0.0.0.0/8'),
-    ipaddress.ip_network('::1/128'),  # IPv6 localhost
-    ipaddress.ip_network('fc00::/7'),  # IPv6 private
-    ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
+    ipaddress.ip_network('::1/128'),
+    ipaddress.ip_network('fc00::/7'),
+    ipaddress.ip_network('fe80::/10'),
 ]
 
 
 def is_safe_url(url):
-    """Validate URL to prevent SSRF attacks."""
+    """SSRF saldırılarını önlemek için URL'yi doğrula."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return False
         if not parsed.hostname:
             return False
-        # Check if hostname is allowed
         if parsed.hostname not in ALLOWED_HOSTS:
-            logger.warning("URL hostname not allowed: %s", parsed.hostname)
+            logger.warning("URL hostname'e izin verilmiyor: %s", parsed.hostname)
             return False
         return True
     except Exception:
@@ -70,45 +65,48 @@ def is_safe_url(url):
 
 
 def is_private_ip(ip_str):
-    """Check if an IP address is in a private range."""
+    """IP adresinin özel aralıkta olup olmadığını kontrol et."""
     try:
         ip = ipaddress.ip_address(ip_str)
         return any(ip in network for network in PRIVATE_IP_RANGES)
     except ValueError:
-        return True  # Treat invalid IPs as unsafe
+        return True
 
 
+def safe_urlopen(url, timeout=10, **kwargs):
+    """Sadece güvenli URL'leri açan yardımcı fonksiyon."""
+    if isinstance(url, str):
+        check_url = url
+    elif hasattr(url, 'full_url'):
+        check_url = url.full_url
+    else:
+        check_url = str(url)
+
+    if not is_safe_url(check_url):
+        raise ValueError(f"Güvensiz URL engellendi: {check_url}")
+
+    hostname = urlparse(check_url).hostname
+    try:
+        import socket
+        ip_addresses = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        for _family, _socktype, _proto, _canonname, sockaddr in ip_addresses:
+            ip = sockaddr[0]
+            if is_private_ip(ip):
+                logger.warning("URL özel IP'ye çözümleniyor, engellendi: %s -> %s", hostname, ip)
+                raise ValueError(f"URL özel IP'ye çözümleniyor: {ip}")
+    except OSError:
+        pass  # DNS hatası gerçek istekte başarısız olacak
+
+    return urllib.request.urlopen(url, timeout=timeout, **kwargs)
+
+
+# Geriye dönük uyumluluk için sınıf sarmalayıcı
 class SafeURLOpener:
-    """URL opener that validates URLs and prevents SSRF attacks."""
-    
     @staticmethod
     def urlopen(url, timeout=10, **kwargs):
-        """Open URL only if it's safe."""
-        if isinstance(url, str):
-            if not is_safe_url(url):
-                raise ValueError(f"Unsafe URL blocked: {url}")
-        elif hasattr(url, 'full_url'):  # Request object
-            if not is_safe_url(url.full_url):
-                raise ValueError(f"Unsafe URL blocked: {url.full_url}")
-        
-        # Perform DNS resolution and check IP
-        if isinstance(url, str):
-            hostname = urlparse(url).hostname
-        else:
-            hostname = urlparse(url.full_url).hostname
-        
-        try:
-            import socket
-            ip_addresses = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
-            for family, socktype, proto, canonname, sockaddr in ip_addresses:
-                ip = sockaddr[0]
-                if is_private_ip(ip):
-                    logger.warning("URL resolves to private IP, blocked: %s -> %s", hostname, ip)
-                    raise ValueError(f"URL resolves to private IP: {ip}")
-        except socket.gaierror:
-            pass  # Let the actual request fail with DNS error
-        
-        return SafeURLOpener.urlopen(url, timeout=timeout, **kwargs)
+        return safe_urlopen(url, timeout=timeout, **kwargs)
+
+
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -130,7 +128,6 @@ app = Flask(__name__)
 app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
 
-# Initialize CSRF protection
 csrf = CSRFProtect(app)
 
 db.init_app(app)
@@ -157,7 +154,6 @@ _blacklist_cleanup_last = time.time()
 
 
 def _cleanup_blacklist():
-    """Clean up expired tokens from in-memory blacklist."""
     global _blacklist_cleanup_last
     now = time.time()
     if now - _blacklist_cleanup_last < 3600:
@@ -180,12 +176,11 @@ def _cleanup_blacklist():
 
 
 def _cleanup_revoked_tokens():
-    """Periodically clean up expired revoked tokens from database."""
     try:
         RevokedToken.cleanup_expired()
-        logger.info("Revoked tokens cleaned up from database")
+        logger.info("Revoked token'lar veritabanından temizlendi")
     except Exception as e:
-        logger.error("Error cleaning up revoked tokens: %s", e)
+        logger.error("Revoked token temizleme hatasi: %s", e)
 
 
 def generate_api_token(user_id, expires_hours=24 * 30):
@@ -193,13 +188,12 @@ def generate_api_token(user_id, expires_hours=24 * 30):
         "user_id": user_id,
         "exp": datetime.utcnow() + timedelta(hours=expires_hours),
         "iat": datetime.utcnow(),
-        "jti": secrets.token_hex(16),  # Unique token identifier
+        "jti": secrets.token_hex(16),
     }
     return pyjwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
 def verify_api_token(token):
-    # Check persistent revoked tokens database
     try:
         payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"], options={"verify_exp": False})
         jti = payload.get("jti")
@@ -207,20 +201,18 @@ def verify_api_token(token):
             revoked = RevokedToken.query.filter_by(token_jti=jti).first()
             if revoked:
                 if revoked.expires_at > datetime.utcnow():
-                    logger.info("Token is revoked (persistent): jti=%s", jti)
+                    logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
                     return None
                 else:
-                    # Token expired, can be removed from DB
                     db.session.delete(revoked)
                     db.session.commit()
     except pyjwt.InvalidTokenError:
         pass
-    
-    # Also check in-memory blacklist for recently revoked tokens
+
     with _blacklist_lock:
         if token in _token_blacklist:
             return None
-    
+
     try:
         payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
         return payload["user_id"]
@@ -237,9 +229,8 @@ def blacklist_token(token):
             jti = payload.get("jti")
             exp_timestamp = payload.get("exp", time.time() + 3600)
             exp_datetime = datetime.utcfromtimestamp(exp_timestamp)
-            
+
             if jti:
-                # Store in persistent database
                 revoked = RevokedToken(
                     token_jti=jti,
                     user_id=payload.get("user_id"),
@@ -247,11 +238,10 @@ def blacklist_token(token):
                 )
                 db.session.add(revoked)
                 db.session.commit()
-                logger.info("Token blacklisted persistently: jti=%s", jti)
+                logger.info("Token kalıcı olarak blacklist'e eklendi: jti=%s", jti)
         except pyjwt.InvalidTokenError:
-            logger.warning("Could not decode token for blacklisting")
-        
-        # Also add to in-memory blacklist for immediate effect
+            logger.warning("Token blacklist için decode edilemedi")
+
         with _blacklist_lock:
             _token_blacklist.add(token)
         _cleanup_blacklist()
@@ -346,14 +336,8 @@ def _deactivate_session_by_token(token: str):
 # ───────────────────── Dil Yardımcısı ─────────────────────
 
 def _get_request_lang() -> str:
-    """
-    İstek dilini tespit et.
-    Öncelik sırası: URL prefix (/en/) → query param (?lang=en) → varsayılan tr
-    """
-    # URL /en/ ile başlıyorsa İngilizce
     if request.path.startswith("/en/") or request.path == "/en":
         return "en"
-    # Query param
     lang = request.args.get("lang", "")
     if lang in ("en", "tr"):
         return lang
@@ -425,26 +409,24 @@ def shutdown_cleanup():
                     )
                     db.session.add(log)
         db.session.commit()
-        
-        # Clean up expired revoked tokens on shutdown
+
         try:
             _cleanup_revoked_tokens()
         except Exception as e:
-            logger.error("Error during revoked token cleanup at shutdown: %s", e)
+            logger.error("Kapatma sırasında revoked token temizleme hatasi: %s", e)
 
 
-# Periodic cleanup of revoked tokens (runs every hour)
 def periodic_token_cleanup():
-    import gevent
+    import gevent as _gevent
     while True:
-        gevent.sleep(3600)  # Run every hour
+        _gevent.sleep(3600)
         try:
             with app.app_context():
                 _cleanup_revoked_tokens()
         except Exception as e:
-            logger.error("Error in periodic token cleanup: %s", e)
+            logger.error("Periyodik token temizleme hatasi: %s", e)
 
-# Start background cleanup task
+
 gevent.spawn(periodic_token_cleanup)
 
 
@@ -509,17 +491,11 @@ def extract_username_from_note(note: str):
 
 @app.after_request
 def add_security_headers(response):
-    """Add security headers to all responses."""
-    # Prevent clickjacking
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-    # XSS Protection
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
-    # Referrer Policy
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    # Permissions Policy (formerly Feature-Policy)
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
-    # Content Security Policy - restrictive but functional
     csp = (
         "default-src 'self'; "
         "script-src 'self' https://cdn.jsdelivr.net https://js.stripe.com 'unsafe-inline'; "
@@ -529,14 +505,9 @@ def add_security_headers(response):
         "connect-src 'self' https://api.shopier.com https://api.steampowered.com;"
     )
     response.headers['Content-Security-Policy'] = csp
-    # HSTS (only in production with HTTPS)
     if app.config.get('SESSION_COOKIE_SECURE', False):
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-
-
-# Note: CSRF protection is now handled by Flask-WTF's CSRFProtect
-# The custom csrf_check is kept for additional API validation but is no longer the primary CSRF defense
 
 
 _plan_expiry_cache: dict = {}
@@ -736,7 +707,6 @@ def register():
     u = sanitize(data.get("username", ""), 40)
     e = sanitize(data.get("email", ""), 120).lower()
     p = data.get("password", "")
-    # Kayıt sayfasının diline göre mail dili belirle
     lang = data.get("lang", "tr")
     if lang not in ("en", "tr"):
         lang = "tr"
@@ -757,7 +727,7 @@ def register():
         is_verified=False,
         verification_token=verification_token,
         verification_sent_at=datetime.utcnow(),
-        lang=lang,  # Dili kaydet
+        lang=lang,
     )
     user.set_password(p)
     db.session.add(user)
@@ -808,7 +778,6 @@ def verify_email(token):
     user.verification_token = None
     db.session.commit()
 
-    # Kullanıcının kayıtlı diliyle hoş geldin maili gönder
     user_lang = getattr(user, "lang", "tr") or "tr"
     mailer.send_welcome_email(user.email, user.username, lang=user_lang)
 
@@ -880,7 +849,6 @@ def forgot_password():
     db.session.commit()
 
     user_lang = getattr(user, "lang", "tr") or "tr"
-    import gevent
     gevent.spawn(mailer.send_password_reset_email, user.email, user.username, token, user_lang)
 
     return jsonify(_generic_msg)
@@ -986,7 +954,6 @@ def change_email():
     db.session.commit()
 
     user_lang = getattr(user, "lang", "tr") or "tr"
-    import gevent
     gevent.spawn(mailer.send_email_change_email, new_email, user.username, token, user_lang)
 
     return jsonify({"ok": True, "message": f"A verification email has been sent to {new_email}."})
@@ -1242,14 +1209,13 @@ def payment_check(payment_id):
 
 @app.route("/shopier/webhook", methods=["POST"])
 def shopier_webhook():
-    # Webhook secret is now REQUIRED - no bypass allowed
     if not Config.SHOPIER_WEBHOOK_SECRET:
-        logger.error("SHOPIER_WEBHOOK_SECRET is not configured! Webhook rejected.")
+        logger.error("SHOPIER_WEBHOOK_SECRET ayarlanmamış! Webhook reddedildi.")
         return jsonify({"error": "Server configuration error"}), 500
-    
+
     raw_body = request.get_data()
     signature = request.headers.get("Shopier-Signature", "")
-    
+
     if not shopier_lib.verify_webhook(raw_body, signature, Config.SHOPIER_WEBHOOK_SECRET):
         logger.warning("Shopier webhook: IMZA HATASI!")
         return jsonify({"error": "Invalid signature"}), 401
@@ -1841,7 +1807,7 @@ def steam_profile():
             try:
                 api_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with SafeURLOpener.urlopen(req, timeout=5) as r:
+                with safe_urlopen(req, timeout=5) as r:
                     xml = r.read().decode()
                 m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", xml)
                 if m:
@@ -1870,7 +1836,7 @@ def game_search():
             f"?term={urllib.parse.quote(term)}&l=english&cc=US"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with SafeURLOpener.urlopen(req, timeout=5) as r:
+        with safe_urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
         return jsonify([
             {"id": i["id"], "name": i["name"], "tiny_image": i.get("tiny_image", "")}
@@ -1894,7 +1860,7 @@ def game_info():
         try:
             url = f"https://store.steampowered.com/api/appdetails?appids={aid}&l=english"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with SafeURLOpener.urlopen(req, timeout=5) as r:
+            with safe_urlopen(req, timeout=5) as r:
                 data = json.loads(r.read().decode())
             if data.get(str(aid), {}).get("success"):
                 d = data[str(aid)]["data"]
@@ -2140,9 +2106,8 @@ def create_announcement():
     db.session.commit()
     return jsonify({"ok": True})
 
-# ───────────────────── Steam OpenID ─────────────────────
 
-import urllib.parse
+# ───────────────────── Steam OpenID ─────────────────────
 
 STEAM_OPENID_URL = "https://steamcommunity.com/openid/login"
 
@@ -2159,8 +2124,7 @@ def _build_steam_login_url(return_to: str) -> str:
     return STEAM_OPENID_URL + "?" + urllib.parse.urlencode(params)
 
 
-def _verify_steam_callback(params: dict) -> str | None:
-    """Steam OpenID callback'ini doğrula, Steam ID döndür."""
+def _verify_steam_callback(params: dict):
     check_params = dict(params)
     check_params["openid.mode"] = "check_authentication"
     try:
@@ -2171,14 +2135,12 @@ def _verify_steam_callback(params: dict) -> str | None:
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with SafeURLOpener.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             response = r.read().decode("utf-8")
         if "is_valid:true" not in response:
             return None
-        # Steam ID'yi claimed_id'den çıkar
         claimed_id = params.get("openid.claimed_id", "")
-        import re as _re
-        m = _re.search(r"https://steamcommunity\.com/openid/id/(\d+)", claimed_id)
+        m = re.search(r"https://steamcommunity\.com/openid/id/(\d+)", claimed_id)
         if not m:
             return None
         return m.group(1)
@@ -2188,7 +2150,6 @@ def _verify_steam_callback(params: dict) -> str | None:
 
 
 def _get_steam_profile(steam_id: str) -> dict:
-    """Steam Web API'den profil bilgisi çek."""
     try:
         api_key = Config.STEAM_API_KEY
         if not api_key:
@@ -2198,7 +2159,7 @@ def _get_steam_profile(steam_id: str) -> dict:
             f"?key={api_key}&steamids={steam_id}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with SafeURLOpener.urlopen(req, timeout=10) as r:
+        with safe_urlopen(req, timeout=10) as r:
             data = json.loads(r.read().decode("utf-8"))
         players = data.get("response", {}).get("players", [])
         if not players:
@@ -2217,17 +2178,14 @@ def _get_steam_profile(steam_id: str) -> dict:
 
 @app.route("/steam/login")
 def steam_login():
-    """Steam OpenID ile giriş başlat."""
     lang = request.args.get("lang", "tr")
     return_to = f"{Config.SITE_URL}/steam/callback?lang={lang}"
     redirect_url = _build_steam_login_url(return_to)
-    from flask import redirect as flask_redirect
     return flask_redirect(redirect_url)
 
 
 @app.route("/steam/callback")
 def steam_callback():
-    """Steam OpenID callback — doğrula ve giriş yap."""
     lang = request.args.get("lang", "tr")
 
     params = dict(request.args)
@@ -2239,23 +2197,18 @@ def steam_callback():
             return flask_redirect("/en/?error=steam_failed")
         return flask_redirect("/?error=steam_failed")
 
-    # Steam profil bilgisi al
     profile = _get_steam_profile(steam_id)
     display_name = profile.get("name", "")
     avatar = profile.get("avatar", "")
 
-    # Bu Steam ID'ye kayıtlı kullanıcı var mı?
     user = User.query.filter_by(steam_id=steam_id).first()
 
     if user:
-        # Mevcut kullanıcı — giriş yap
         user.last_login = datetime.utcnow()
         user.steam_avatar = avatar
         user.steam_display_name = display_name
         db.session.commit()
     else:
-        # Yeni kullanıcı — otomatik kayıt
-        # Kullanıcı adı Steam display name'den üret
         base_username = re.sub(r"[^a-zA-Z0-9_]", "", display_name)[:30] or f"steam_{steam_id[-6:]}"
         username = base_username
         counter = 1
@@ -2263,48 +2216,37 @@ def steam_callback():
             username = f"{base_username}{counter}"
             counter += 1
 
-        # Rastgele e-posta (Steam OAuth'ta mail gelmez)
         fake_email = f"steam_{steam_id}@steamlogin.hourboost"
 
         user = User(
             username=username,
             email=fake_email,
-            is_verified=True,           # Steam zaten doğrulanmış
+            is_verified=True,
             steam_id=steam_id,
             steam_avatar=avatar,
             steam_display_name=display_name,
             lang=lang,
         )
-        # Rastgele şifre (Steam ile giriş yapıldığı için kullanılmaz)
         user.set_password(secrets.token_hex(32))
         db.session.add(user)
         db.session.commit()
         logger.info("Steam ile yeni kullanici olusturuldu: %s (steam_id=%s)", username, steam_id)
 
-    # Oturum aç
     session.permanent = True
     session["user_id"] = user.id
     token = generate_api_token(user.id)
     _create_session_record(user.id, token)
 
-    # Dashboard'a yönlendir
     if lang == "en":
-        from flask import redirect as flask_redirect
-        response = flask_redirect("/en/dashboard")
-    else:
-        from flask import redirect as flask_redirect
-        response = flask_redirect("/dashboard")
-
-    return response
+        return flask_redirect("/en/dashboard")
+    return flask_redirect("/dashboard")
 
 
 @app.route("/steam/unlink", methods=["POST"])
 @login_required
 def steam_unlink():
-    """Steam hesabını siteden ayır."""
     user = g.user
 
-    # Steam ile kaydolmuşsa şifre olmayabilir, uyar
     if user.email.endswith("@steamlogin.hourboost"):
         return jsonify({
             "ok": False,

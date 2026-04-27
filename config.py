@@ -6,14 +6,14 @@ load_dotenv()
 
 
 class Config:
-    # SECRET_KEY is now REQUIRED - no fallback to random generation
+    # SECRET_KEY zorunlu; env'de yoksa RuntimeError fırlat
     SECRET_KEY = os.environ.get("SECRET_KEY")
     if not SECRET_KEY:
         raise RuntimeError(
             "SECRET_KEY environment variable is not set! "
             "Please set a secure SECRET_KEY in your environment variables."
         )
-    
+
     STEAM_API_KEY = os.environ.get("STEAM_API_KEY")
     SITE_URL = os.environ.get("SITE_URL", "https://hourboost.com.tr")
     SQLALCHEMY_DATABASE_URI = os.environ.get(
@@ -21,19 +21,16 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     PERMANENT_SESSION_LIFETIME = 30 * 24 * 3600
-    
-    # Secure session cookie configuration
+
+    # Güvenli oturum çerezi ayarları
     SESSION_COOKIE_HTTPONLY = True
-    SESSION_COOKIE_SECURE = True  # Only send cookies over HTTPS
-    SESSION_COOKIE_SAMESITE = 'Lax'  # Prevent CSRF attacks
-    SESSION_COOKIE_NAME = 'hourboost_session'
-    
-    # CSRF Protection
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_NAME = "hourboost_session"
+
+    # CSRF Koruması
     WTF_CSRF_ENABLED = True
-    WTF_CSRF_TIME_LIMIT = 3600  # 1 hour
-    
-    # Security: Require webhook secret for Shopier
-    SHOPIER_WEBHOOK_REQUIRED = True
+    WTF_CSRF_TIME_LIMIT = 3600
 
     PLANS = {
         "free": {
