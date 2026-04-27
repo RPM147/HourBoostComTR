@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="google-adsense-account" content="ca-pub-4233612570799995">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4233612570799995" crossorigin="anonymous"></script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hour Boost — Automatically Boost Your Game Hours</title>
+<meta name="description" content="Automatically boost your Steam game hours. 24/7 boosting, easy setup, free plan.">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--border:rgba(255,255,255,0.07);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--purple:#7c5cfc;--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,160,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
+.navbar{position:fixed;top:0;left:0;right:0;z-index:100;padding:16px 40px;display:flex;align-items:center;justify-content:space-between;background:rgba(13,14,18,0.8);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);}
+.nav-logo{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:700;letter-spacing:1px;}
+.nav-logo span{color:var(--accent);}
+.nav-logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),#00a572);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;}
+.nav-links{display:flex;gap:24px;align-items:center;}
+.nav-links a{color:var(--text);text-decoration:none;font-size:0.88rem;font-weight:500;transition:color 0.2s;}
+.nav-links a:hover{color:var(--text);}
+.nav-cta{padding:8px 20px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border-radius:8px;font-weight:600;font-size:0.85rem;text-decoration:none;transition:all 0.2s;}
+.nav-cta:hover{box-shadow:0 4px 20px rgba(0,229,160,0.3);transform:translateY(-1px);color:#001a0f;}
+.hero{position:relative;z-index:1;min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;padding:120px 20px 80px;}
+.hero::after{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:800px;height:600px;background:radial-gradient(ellipse,rgba(0,229,160,0.08) 0%,transparent 70%);pointer-events:none;}
+.hero-content{position:relative;max-width:700px;}
+.hero-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 16px;background:var(--accent-dim);border:1px solid rgba(0,229,160,0.2);border-radius:20px;font-size:0.78rem;font-weight:600;color:var(--accent);margin-bottom:24px;}
+.hero-title{font-size:3.2rem;font-weight:700;line-height:1.15;margin-bottom:20px;}
+.hero-title span{background:linear-gradient(135deg,var(--accent),#7c5cfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero-sub{font-size:1.1rem;color:var(--text-sub);line-height:1.7;margin-bottom:36px;max-width:550px;margin-left:auto;margin-right:auto;}
+.hero-btns{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;}
+.hero-btn-primary{padding:14px 32px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border-radius:12px;font-weight:700;font-size:1rem;text-decoration:none;transition:all 0.2s;box-shadow:0 4px 24px rgba(0,229,160,0.2);}
+.hero-btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,229,160,0.3);color:#001a0f;}
+.hero-btn-secondary{padding:14px 32px;background:transparent;border:1px solid var(--border);color:var(--text-sub);border-radius:12px;font-weight:600;font-size:1rem;text-decoration:none;transition:all 0.2s;}
+.hero-btn-secondary:hover{border-color:var(--accent);color:var(--accent);}
+.hero-stats{display:flex;gap:40px;justify-content:center;margin-top:60px;}
+.hero-stat{text-align:center;}
+.hero-stat-value{font-family:Space Grotesk,monospace;font-size:1.8rem;font-weight:700;color:var(--accent);}
+.hero-stat-label{font-size:0.78rem;color:var(--text-muted);margin-top:4px;}
+.features{position:relative;z-index:1;padding:80px 40px;max-width:1100px;margin:0 auto;}
+.features-title{text-align:center;font-size:2rem;font-weight:700;margin-bottom:12px;}
+.features-sub{text-align:center;color:var(--text-muted);font-size:1rem;margin-bottom:48px;}
+.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;}
+.feature-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;transition:all 0.3s;}
+.feature-card:hover{border-color:rgba(0,229,160,0.2);transform:translateY(-2px);}
+.feature-icon{width:44px;height:44px;border-radius:12px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;font-size:1.3rem;margin-bottom:16px;}
+.feature-name{font-size:1rem;font-weight:700;margin-bottom:8px;}
+.feature-desc{font-size:0.85rem;color:var(--text-sub);line-height:1.6;}
+.cta-section{position:relative;z-index:1;text-align:center;padding:80px 20px;max-width:600px;margin:0 auto;}
+.cta-section h2{font-size:2rem;font-weight:700;margin-bottom:12px;}
+.cta-section p{color:var(--text-muted);margin-bottom:32px;font-size:1rem;}
+.footer{position:relative;z-index:1;text-align:center;padding:30px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:0.8rem;}
+@media(max-width:768px){.hero-title{font-size:2rem;}.features-grid{grid-template-columns:1fr;}.hero-stats{flex-direction:column;gap:20px;}.navbar{padding:12px 20px;}.nav-links{gap:12px;}}
+</style>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('consent', 'default', {
+  'ad_user_data': 'denied',
+  'ad_personalization': 'denied',
+  'ad_storage': 'denied',
+  'analytics_storage': 'denied',
+  'wait_for_update': 500
+});
+</script>
+</head>
+<body>
+
+<nav class="navbar">
+  <div class="nav-logo">
+    <div class="nav-logo-icon">&#9889;</div>HOUR <span>BOOST</span>
+  </div>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="/en/pricing">Plans</a>
+    <a href="/" style="display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:var(--text-muted);font-size:0.82rem;font-weight:600;text-decoration:none;transition:all 0.2s;" onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'" onmouseout="this.style.borderColor='rgba(255,255,255,0.15)';this.style.color='var(--text-muted)'">🌐 TR</a>
+    <a href="/en/dashboard" class="nav-cta">Login</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-content">
+    <div class="hero-badge">&#9889; 24/7 Uninterrupted Boost</div>
+    <h1 class="hero-title">Automatically Boost<br><span>Steam Game Hours</span></h1>
+    <p class="hero-sub">Connect your account, select your games, and start boosting. We handle the rest. Start for free right now.</p>
+    <div class="hero-btns">
+      <a href="/en/dashboard" class="hero-btn-primary">&#128640; Start for Free</a>
+      <a href="/steam/login?lang=en" style="display:inline-flex;align-items:center;gap:10px;padding:14px 32px;background:#1b2838;border:1px solid #4c6b8a;color:#fff;border-radius:12px;font-weight:700;font-size:1rem;text-decoration:none;transition:all 0.2s;" onmouseover="this.style.background='#2a475e';this.style.borderColor='#66c0f4'" onmouseout="this.style.background='#1b2838';this.style.borderColor='#4c6b8a'">
+        <img src="https://store.steampowered.com/public/shared/images/header/logo_steam.svg" alt="Steam" style="height:20px;filter:brightness(0) invert(1);">
+        Sign in with Steam
+      </a>
+      <a href="https://github.com/RPM147/HourBoostComTR" class="hero-btn-secondary">Source-Code</a>
+    </div>
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <div class="hero-stat-value" id="hs-users">-</div>
+        <div class="hero-stat-label">Users</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-value" id="hs-boosts">-</div>
+        <div class="hero-stat-label">Active Boosts</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-value">24/7</div>
+        <div class="hero-stat-label">Uninterrupted</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <h2 class="features-title">Why Hour Boost?</h2>
+  <p class="features-sub">Easy, fast and reliable boost experience</p>
+  <div class="features-grid">
+
+    <div class="feature-card">
+      <div class="feature-icon">&#9889;</div>
+      <div class="feature-name">Instant Start</div>
+      <div class="feature-desc">Connect your Steam account, pick a game, start boosting with one click. Setup takes 1 minute.</div>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-icon">&#128274;</div>
+      <div class="feature-name">Secure Connection</div>
+      <div class="feature-desc">Steam Guard and 2FA support. Your password is never stored on the server — only a session token is used.</div>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-icon">&#128260;</div>
+      <div class="feature-name">Auto Reconnect</div>
+      <div class="feature-desc">If the connection drops, it automatically reconnects and continues boosting.</div>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-icon">&#127918;</div>
+      <div class="feature-name">Multiple Games</div>
+      <div class="feature-desc">Boost multiple games at the same time. Up to 32 games supported on the Premium plan.</div>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-icon">&#128101;</div>
+      <div class="feature-name">Multiple Accounts</div>
+      <div class="feature-desc">Manage and boost multiple Steam accounts simultaneously.</div>
+    </div>
+
+    <div class="feature-card">
+      <div class="feature-icon">&#128200;</div>
+      <div class="feature-name">Statistics</div>
+      <div class="feature-desc">Track total boost time, account status, and detailed statistics.</div>
+    </div>
+
+  </div>
+</section>
+
+<!-- AdSense Ad Unit -->
+<div style="position:relative;z-index:1;max-width:900px;margin:0 auto;padding:0 20px 40px;text-align:center;">
+  <ins class="adsbygoogle" style="display:block"
+       data-ad-client="ca-pub-4233612570799995"
+       data-ad-slot="auto"
+       data-ad-format="auto"
+       data-full-width-responsive="true"></ins>
+  <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+</div>
+
+<section class="cta-section">
+  <h2>Get Started Now</h2>
+  <p>Start boosting right away with the free plan. No payment required.</p>
+  <a href="/en/dashboard" class="hero-btn-primary">&#128640; Create a Free Account</a>
+</section>
+
+<footer class="footer">
+  &copy; 2025 HourBoost.com.tr — All rights reserved.<br>
+  <div style="margin-top:10px;">
+    <a href="/en/privacy" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">Privacy Policy</a>
+    <a href="/en/terms-of-service" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">Terms of Service</a>
+    <a href="/en/distance-selling" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">Distance Selling</a>
+    <a href="/en/refund-policy" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">Refund Policy</a>
+    <a href="/en/about" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">About Us</a>
+    <a href="/en/cookie-policy" style="color:var(--text-muted);text-decoration:none;margin:0 8px;">Cookie Policy</a>
+  </div>
+</footer>
+
+<script>
+fetch('/server_status').then(function(r){return r.json();}).then(function(d){
+  document.getElementById('hs-users').textContent=d.total_users||'0';
+  document.getElementById('hs-boosts').textContent=d.active_boosts||'0';
+}).catch(function(){});
+</script>
+
+<!-- COOKIE BANNER -->
+<style>
+#cookie-banner{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#13151b;border-top:1px solid rgba(255,255,255,0.1);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;box-shadow:0 -8px 32px rgba(0,0,0,0.4);transform:translateY(100%);transition:transform 0.4s ease;}
+[id="cookie-banner"].visible{transform:translateY(0) !important;}
+.ck-text{flex:1;font-size:0.83rem;color:#8892a0;line-height:1.6;}
+.ck-text a{color:#00e5a0;text-decoration:none;}
+.ck-text strong{color:#e8eaf0;}
+.ck-btns{display:flex;gap:10px;flex-shrink:1;max-width:420px;}
+.ck-btn{padding:9px 20px;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.83rem;font-weight:600;cursor:pointer;border:none;transition:all 0.2s;white-space:nowrap;}
+.ck-btn-accept{background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;}
+.ck-btn-accept:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.ck-btn-reject{background:rgba(255,255,255,0.06);color:#8892a0;border:1px solid rgba(255,255,255,0.1);}
+.ck-btn-reject:hover{background:rgba(255,255,255,0.1);color:#e8eaf0;}
+.ck-btn-settings{background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);font-size:0.78rem;}
+.ck-btn-settings:hover{color:#8892a0;}
+#cookie-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;padding:20px;}
+#cookie-modal.open{display:flex;}
+.ck-modal-card{background:#13151b;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+.ck-modal-title{font-size:1.1rem;font-weight:700;margin-bottom:20px;color:#e8eaf0;}
+.ck-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+.ck-row:last-of-type{border-bottom:none;}
+.ck-row-info .ck-name{font-size:0.88rem;font-weight:600;color:#e8eaf0;margin-bottom:3px;}
+.ck-row-info .ck-desc{font-size:0.78rem;color:#5a6070;line-height:1.5;}
+.ck-toggle{position:relative;width:44px;height:24px;flex-shrink:0;margin-left:16px;}
+.ck-toggle input{opacity:0;width:0;height:0;}
+.ck-slider{position:absolute;inset:0;background:#1f2230;border-radius:24px;cursor:pointer;transition:background 0.2s;}
+.ck-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#5a6070;border-radius:50%;transition:all 0.2s;}
+.ck-toggle input:checked+.ck-slider{background:rgba(0,229,160,0.2);}
+.ck-toggle input:checked+.ck-slider:before{background:#00e5a0;transform:translateX(20px);}
+.ck-toggle input:disabled+.ck-slider{cursor:not-allowed;opacity:0.6;}
+.ck-modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end;}
+.ck-modal-save{padding:10px 24px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;}
+.ck-modal-save:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);}
+.ck-modal-close{padding:10px 20px;background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;}
+.ck-modal-close:hover{color:#8892a0;}
+@media(max-width:768px){[id="cookie-banner"]{flex-direction:column;align-items:flex-start;padding:16px 20px;}.ck-btns{width:100%;flex-wrap:wrap;}.ck-btn{flex:1;text-align:center;}}
+</style>
+
+<div id="cookie-banner">
+  <div class="ck-text">
+    <strong>&#127850; Cookie Notice</strong><br>
+    We use essential, analytics, and advertising cookies on our site for session management. For details, please review our <a href="/en/cookie-policy">Cookie Policy</a>.
+  </div>
+  <div class="ck-btns">
+    <button class="ck-btn ck-btn-settings" onclick="ckOpenModal()">&#9881; Settings</button>
+    <button class="ck-btn ck-btn-reject" onclick="ckReject()">Reject</button>
+    <button class="ck-btn ck-btn-accept" onclick="ckAcceptAll()">Accept All</button>
+  </div>
+</div>
+
+<div id="cookie-modal">
+  <div class="ck-modal-card">
+    <div class="ck-modal-title">&#9881; My Cookie Preferences</div>
+    <div class="ck-row">
+      <div class="ck-row-info">
+        <div class="ck-name">Essential Cookies</div>
+        <div class="ck-desc">Required for session management. Cannot be disabled.</div>
+      </div>
+      <label class="ck-toggle"><input type="checkbox" checked disabled><span class="ck-slider"></span></label>
+    </div>
+    <div class="ck-row">
+      <div class="ck-row-info">
+        <div class="ck-name">Analytics Cookies</div>
+        <div class="ck-desc">Google Analytics is used to measure site usage.</div>
+      </div>
+      <label class="ck-toggle"><input type="checkbox" id="ck-analytics"><span class="ck-slider"></span></label>
+    </div>
+    <div class="ck-row">
+      <div class="ck-row-info">
+        <div class="ck-name">Advertising Cookies</div>
+        <div class="ck-desc">Google AdSense is used for personalized advertising.</div>
+      </div>
+      <label class="ck-toggle"><input type="checkbox" id="ck-ads"><span class="ck-slider"></span></label>
+    </div>
+    <div class="ck-modal-footer">
+      <button class="ck-modal-close" onclick="ckCloseModal()">Cancel</button>
+      <button class="ck-modal-save" onclick="ckSavePrefs()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+var KEY='hb_cookie_consent';
+function getP(){try{return JSON.parse(localStorage.getItem(KEY)||'null');}catch(e){return null;}}
+function saveP(p){try{localStorage.setItem(KEY,JSON.stringify(p));}catch(e){}}
+function showBanner(){var b=document.getElementById('cookie-banner');if(b)setTimeout(function(){b.classList.add('visible');},600);}
+function hideBanner(){var b=document.getElementById('cookie-banner');if(b)b.classList.remove('visible');}
+function loadScripts(a,d){
+  if(a&&typeof window._gaLoaded==='undefined'){window._gaLoaded=1;var s=document.createElement('script');s.async=true;s.src='https://www.googletagmanager.com/gtag/js?id=G-HVSNSK8REJ';document.head.appendChild(s);s.onload=function(){window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}window.gtag=gtag;gtag('js',new Date());gtag('config','G-HVSNSK8REJ');};}
+  if(d&&!document.getElementById('ck-adsense')){var a2=document.createElement('script');a2.id='ck-adsense';a2.async=true;a2.src='https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4233612570799995';a2.crossOrigin='anonymous';document.head.appendChild(a2);}
+}
+window.ckAcceptAll=function(){saveP({analytics:true,ads:true,ts:Date.now()});hideBanner();loadScripts(true,true);if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"granted","ad_personalization":"granted","ad_storage":"granted","analytics_storage":"granted"});}};
+window.ckReject=function(){saveP({analytics:false,ads:false,ts:Date.now()});hideBanner();if(typeof gtag!=="undefined"){gtag("consent","update",{"ad_user_data":"denied","ad_personalization":"denied","ad_storage":"denied","analytics_storage":"denied"});}};
+window.ckOpenModal=function(){var p=getP();if(p){document.getElementById('ck-analytics').checked=!!p.analytics;document.getElementById('ck-ads').checked=!!p.ads;}document.getElementById('cookie-modal').classList.add('open');};
+window.ckCloseModal=function(){document.getElementById('cookie-modal').classList.remove('open');};
+window.ckSavePrefs=function(){var a=document.getElementById('ck-analytics').checked,d=document.getElementById('ck-ads').checked;saveP({analytics:a,ads:d,ts:Date.now()});ckCloseModal();hideBanner();loadScripts(a,d);if(typeof gtag!=="undefined"){gtag("consent","update",{"analytics_storage":a?"granted":"denied","ad_storage":d?"granted":"denied","ad_user_data":d?"granted":"denied","ad_personalization":d?"granted":"denied"});}};
+document.getElementById('cookie-modal').addEventListener('click',function(e){if(e.target===this)ckCloseModal();});
+var p=getP();if(!p){showBanner();}else{loadScripts(p.analytics,p.ads);}
+})();
+</script>
+
+</body>
+</html>

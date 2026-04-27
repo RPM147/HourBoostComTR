@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="google-adsense-account" content="ca-pub-4233612570799995">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cookie Policy — HourBoost.com.tr</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--border:rgba(255,255,255,0.07);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,160,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
+.navbar{position:fixed;top:0;left:0;right:0;z-index:100;padding:16px 40px;display:flex;align-items:center;justify-content:space-between;background:rgba(13,14,18,0.8);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);}
+.nav-logo{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:700;letter-spacing:1px;}
+.nav-logo span{color:var(--accent);}
+.nav-logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),#00a572);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;}
+.nav-links a{color:var(--text-sub);text-decoration:none;font-size:0.88rem;font-weight:500;transition:color 0.2s;}
+.nav-links a:hover{color:var(--accent);}
+.page-wrap{position:relative;z-index:1;max-width:860px;margin:0 auto;padding:120px 24px 80px;}
+.page-header{margin-bottom:40px;padding-bottom:24px;border-bottom:1px solid var(--border);}
+.page-header h1{font-size:2rem;font-weight:700;margin-bottom:8px;}
+.page-header .meta{font-size:0.82rem;color:var(--text-muted);}
+.section{margin-bottom:32px;}
+.section h2{font-size:1.05rem;font-weight:700;color:var(--accent);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+.section p{font-size:0.9rem;color:var(--text-sub);line-height:1.75;margin-bottom:10px;}
+.section ul li{font-size:0.9rem;color:var(--text-sub);line-height:1.75;margin-bottom:4px;}
+.section ul{padding-left:20px;margin-bottom:10px;}
+.footer{position:relative;z-index:1;text-align:center;padding:30px 20px;border-top:1px solid var(--border);color:var(--text-muted);font-size:0.8rem;}
+.footer a{color:var(--text-muted);text-decoration:none;margin:0 8px;}
+.footer a:hover{color:var(--accent);}
+
+/* ── CEREZ BANNER ── */
+#cookie-banner{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#13151b;border-top:1px solid rgba(255,255,255,0.1);padding:18px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;box-shadow:0 -8px 32px rgba(0,0,0,0.4);transform:translateY(100%);transition:transform 0.4s ease;}
+[id="cookie-banner"].visible{transform:translateY(0) !important;}
+.cookie-text{flex:1;font-size:0.83rem;color:#8892a0;line-height:1.6;}
+.cookie-text a{color:#00e5a0;text-decoration:none;}
+.cookie-text a:hover{text-decoration:underline;}
+.cookie-text strong{color:#e8eaf0;}
+.cookie-buttons{display:flex;gap:10px;flex-shrink:0;}
+.cookie-btn{padding:9px 20px;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.83rem;font-weight:600;cursor:pointer;border:none;transition:all 0.2s;white-space:nowrap;}
+.cookie-btn-accept{background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;}
+.cookie-btn-accept:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.cookie-btn-reject{background:rgba(255,255,255,0.06);color:#8892a0;border:1px solid rgba(255,255,255,0.1);}
+.cookie-btn-reject:hover{background:rgba(255,255,255,0.1);color:#e8eaf0;}
+.cookie-btn-settings{background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);font-size:0.78rem;}
+.cookie-btn-settings:hover{color:#8892a0;}
+@media(max-width:768px){
+  #cookie-banner{flex-direction:column;align-items:flex-start;padding:16px 20px;}
+  .cookie-buttons{width:100%;flex-wrap:wrap;}
+  .cookie-btn{flex:1;text-align:center;}
+  .navbar{padding:12px 20px;}
+  .page-wrap{padding:90px 16px 60px;}
+  .page-header h1{font-size:1.5rem;}
+}
+
+/* ── CEREZ TERCIH PANELI ── */
+#cookie-modal{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;padding:20px;}
+#cookie-modal.open{display:flex;}
+.cookie-modal-card{background:#13151b;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:520px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+.cookie-modal-title{font-size:1.1rem;font-weight:700;margin-bottom:20px;color:#e8eaf0;}
+.cookie-toggle-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+.cookie-toggle-row:last-of-type{border-bottom:none;}
+.cookie-toggle-info .name{font-size:0.88rem;font-weight:600;color:#e8eaf0;margin-bottom:3px;}
+.cookie-toggle-info .desc{font-size:0.78rem;color:#5a6070;line-height:1.5;}
+.toggle-switch{position:relative;width:44px;height:24px;flex-shrink:0;margin-left:16px;}
+.toggle-switch input{opacity:0;width:0;height:0;}
+.toggle-slider{position:absolute;inset:0;background:#1f2230;border-radius:24px;cursor:pointer;transition:background 0.2s;}
+.toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#5a6070;border-radius:50%;transition:all 0.2s;}
+.toggle-switch input:checked+.toggle-slider{background:rgba(0,229,160,0.2);}
+.toggle-switch input:checked+.toggle-slider:before{background:#00e5a0;transform:translateX(20px);}
+.toggle-switch input:disabled+.toggle-slider{cursor:not-allowed;opacity:0.6;}
+.cookie-modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end;}
+.cookie-modal-save{padding:10px 24px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;}
+.cookie-modal-save:hover{box-shadow:0 4px 16px rgba(0,229,160,0.3);}
+.cookie-modal-close{padding:10px 20px;background:transparent;color:#5a6070;border:1px solid rgba(255,255,255,0.07);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;transition:all 0.2s;}
+.cookie-modal-close:hover{color:#8892a0;}
+</style>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('consent', 'default', {
+  'ad_user_data': 'denied',
+  'ad_personalization': 'denied',
+  'ad_storage': 'denied',
+  'analytics_storage': 'denied',
+  'wait_for_update': 500
+});
+</script>
+</head>
+<body>
+
+<nav class="navbar">
+  <a href="/en" style="text-decoration:none;color:inherit;">
+    <div class="nav-logo">
+      <div class="nav-logo-icon">&#9889;</div>HOUR <span>BOOST</span>
+    </div>
+  </a>
+  <div class="nav-links"><a href="/en">&#8592; Home</a></div>
+</nav>
+
+<div class="page-wrap">
+  <div class="page-header">
+    <h1>&#127850; Cookie Policy</h1>
+    <div class="meta">Last updated: March 2025 &mdash; HourBoost.com.tr</div>
+  </div>
+
+  <div class="section">
+    <h2>What Are Cookies?</h2>
+    <p>Cookies are small text files saved to your browser when you visit a website. They are used for session management, remembering preferences, and analytics purposes.</p>
+  </div>
+
+  <div class="section">
+    <h2>Cookies We Use</h2>
+    <ul>
+      <li><strong>Essential cookies:</strong> Required for session management. Cannot be rejected.</li>
+      <li><strong>Analytics cookies:</strong> Used to measure site usage via Google Analytics. Can be rejected.</li>
+      <li><strong>Advertising cookies:</strong> Used to display personalized ads via Google AdSense. Can be rejected.</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>Manage Your Preferences</h2>
+    <p>You can change your cookie preferences from the cookie notice that appears at the bottom of our site or from your browser settings. Essential cookies cannot be rejected as they are required for the service to function.</p>
+  </div>
+
+  <div class="section">
+    <h2>Contact</h2>
+    <p>For questions about our cookie policy:
+    <strong><!--email_off-->yuksekrpm@gmail.com<!--/email_off--></strong></p>
+  </div>
+</div>
+
+<footer class="footer">
+  &copy; 2025 HourBoost.com.tr — All rights reserved.<br>
+  <div style="margin-top:10px;">
+    <a href="/en/privacy">Privacy Policy</a>
+    <a href="/en/terms-of-service">Terms of Service</a>
+    <a href="/en/distance-selling">Distance Selling Agreement</a>
+    <a href="/en/refund-policy">Refund Policy</a>
+    <a href="/en/about">About Us</a>
+    <a href="/en/contact">Contact</a>
+  </div>
+</footer>
+
+<!-- COOKIE BANNER -->
+<!-- Banner -->
+<div id="cookie-banner">
+  <div class="cookie-text">
+    <strong>&#127850; Cookie Notice</strong><br>
+    We use essential, analytical, and advertising cookies for session management, analytics, and personalized advertising.
+    For more details, please review our <a href="/en/cookie-policy">Cookie Policy</a>.
+  </div>
+  <div class="cookie-buttons">
+    <button class="cookie-btn cookie-btn-settings" onclick="openCookieModal()">&#9881; Settings</button>
+    <button class="cookie-btn cookie-btn-reject" onclick="rejectCookies()">Reject</button>
+    <button class="cookie-btn cookie-btn-accept" onclick="acceptAllCookies()">Accept All</button>
+  </div>
+</div>
+
+<!-- Tercih Modalı -->
+<div id="cookie-modal">
+  <div class="cookie-modal-card">
+    <div class="cookie-modal-title">&#9881; Cookie Preferences</div>
+
+    <div class="cookie-toggle-row">
+      <div class="cookie-toggle-info">
+        <div class="name">Essential Cookies</div>
+        <div class="desc">Required for session management. Cannot be disabled.</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" checked disabled>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div class="cookie-toggle-row">
+      <div class="cookie-toggle-info">
+        <div class="name">Analytical Cookies</div>
+        <div class="desc">Site usage is measured using Google Analytics.</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-analytics">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div class="cookie-toggle-row">
+      <div class="cookie-toggle-info">
+        <div class="name">Advertising Cookies</div>
+        <div class="desc">Personalized ads are displayed using Google AdSense.</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-ads">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div class="cookie-modal-footer">
+      <button class="cookie-modal-close" onclick="closeCookieModal()">Cancel</button>
+      <button class="cookie-modal-save" onclick="savePreferences()">Save Preferences</button>
+    </div>
+  </div>
+</div>
+
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script>
+
+<script>
+(function(){
+  var PREF_KEY = 'hb_cookie_consent';
+
+  function getPrefs(){
+    try{ return JSON.parse(localStorage.getItem(PREF_KEY)||'null'); }
+    catch(e){ return null; }
+  }
+  function savePrefs(p){
+    try{ localStorage.setItem(PREF_KEY, JSON.stringify(p)); }catch(e){}
+  }
+
+  function showBanner(){
+    var b = document.getElementById('cookie-banner');
+    if(b) setTimeout(function(){ b.classList.add('visible'); }, 600);
+  }
+  function hideBanner(){
+    var b = document.getElementById('cookie-banner');
+    if(b){ b.classList.remove('visible'); }
+  }
+
+  window.acceptAllCookies = function(){
+    savePrefs({analytics:true, ads:true, ts:Date.now()});
+    hideBanner();
+    loadScripts(true, true);
+  };
+
+  window.rejectCookies = function(){
+    savePrefs({analytics:false, ads:false, ts:Date.now()});
+    hideBanner();
+  };
+
+  window.openCookieModal = function(){
+    var prefs = getPrefs();
+    if(prefs){
+      document.getElementById('toggle-analytics').checked = !!prefs.analytics;
+      document.getElementById('toggle-ads').checked = !!prefs.ads;
+    }
+    document.getElementById('cookie-modal').classList.add('open');
+  };
+
+  window.closeCookieModal = function(){
+    document.getElementById('cookie-modal').classList.remove('open');
+  };
+
+  window.savePreferences = function(){
+    var analytics = document.getElementById('toggle-analytics').checked;
+    var ads = document.getElementById('toggle-ads').checked;
+    savePrefs({analytics:analytics, ads:ads, ts:Date.now()});
+    closeCookieModal();
+    hideBanner();
+    loadScripts(analytics, ads);
+  };
+
+  function loadScripts(analytics, ads){
+    if(analytics && typeof gtag === 'undefined'){
+      var s = document.createElement('script');
+      s.async = true;
+      s.src = 'https://www.googletagmanager.com/gtag/js?id=G-HVSNSK8REJ';
+      document.head.appendChild(s);
+      s.onload = function(){
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        window.gtag = gtag;
+        gtag('js', new Date());
+        gtag('config', 'G-HVSNSK8REJ');
+      };
+    }
+    if(ads && !document.getElementById('adsense-script')){
+      var a = document.createElement('script');
+      a.id = 'adsense-script';
+      a.async = true;
+      a.src = 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4233612570799995';
+      a.crossOrigin = 'anonymous';
+      document.head.appendChild(a);
+    }
+  }
+
+  // Modal dışına tıklayınca kapat
+  var modal = document.getElementById('cookie-modal');
+  if(modal){
+    modal.addEventListener('click', function(e){
+      if(e.target === this) closeCookieModal();
+    });
+  }
+
+  // Sayfa yüklenince kontrol et
+  var prefs = getPrefs();
+  if(!prefs){
+    showBanner();
+  } else {
+    loadScripts(prefs.analytics, prefs.ads);
+  }
+})();
+</script>
+</body>
+</html>
+
