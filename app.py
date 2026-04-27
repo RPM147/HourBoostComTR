@@ -20,6 +20,13 @@ import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
 
+# Initialize logging early so it can be used in helper functions
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # Allowed hosts for external HTTP requests to prevent SSRF
 ALLOWED_HOSTS = {
     'steamcommunity.com',
@@ -118,12 +125,6 @@ from steam_manager import boost_service
 import shopier as shopier_lib
 
 from gevent.lock import RLock
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config.from_object(Config)
