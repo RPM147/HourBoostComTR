@@ -47,6 +47,45 @@ PRIVATE_IP_RANGES = [
     ipaddress.ip_network('fe80::/10'),
 ]
 
+# Cloudflare resmi IPv4 ve IPv6 aralıkları.
+# Kaynak: https://www.cloudflare.com/ips/
+# Periyodik olarak (ayda bir) https://www.cloudflare.com/ips-v4 ve /ips-v6
+# adreslerinden güncellenmelidir.
+_CF_IP_RANGES = [
+    ipaddress.ip_network('103.21.244.0/22'),
+    ipaddress.ip_network('103.22.200.0/22'),
+    ipaddress.ip_network('103.31.4.0/22'),
+    ipaddress.ip_network('104.16.0.0/13'),
+    ipaddress.ip_network('104.24.0.0/14'),
+    ipaddress.ip_network('108.162.192.0/18'),
+    ipaddress.ip_network('131.0.72.0/22'),
+    ipaddress.ip_network('141.101.64.0/18'),
+    ipaddress.ip_network('162.158.0.0/15'),
+    ipaddress.ip_network('172.64.0.0/13'),
+    ipaddress.ip_network('173.245.48.0/20'),
+    ipaddress.ip_network('188.114.96.0/20'),
+    ipaddress.ip_network('190.93.240.0/20'),
+    ipaddress.ip_network('197.234.240.0/22'),
+    ipaddress.ip_network('198.41.128.0/17'),
+    # IPv6
+    ipaddress.ip_network('2400:cb00::/32'),
+    ipaddress.ip_network('2606:4700::/32'),
+    ipaddress.ip_network('2803:f800::/32'),
+    ipaddress.ip_network('2405:b500::/32'),
+    ipaddress.ip_network('2405:8100::/32'),
+    ipaddress.ip_network('2a06:98c0::/29'),
+    ipaddress.ip_network('2c0f:f248::/32'),
+]
+
+
+def _is_cloudflare_ip(ip_str: str) -> bool:
+    """Gelen isteğin gerçekten Cloudflare proxy'sinden gelip gelmediğini doğrula."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return any(ip in net for net in _CF_IP_RANGES)
+    except ValueError:
+        return False
+
 
 def is_safe_url(url):
     """SSRF saldırılarını önlemek için URL'yi doğrula."""
@@ -129,6 +168,8 @@ app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
 
 csrf = CSRFProtect(app)
+# Otomatik CSRF kontrolünü kapat — JWT Bearer istekleri muaf tutulacak.
+app.config["WTF_CSRF_CHECK_DEFAULT"] = False
 
 db.init_app(app)
 
@@ -194,32 +235,40 @@ def generate_api_token(user_id, expires_hours=24 * 30):
 
 
 def verify_api_token(token):
+    # Tek decode — önce imza + süre doğrulaması yap.
+    # verify_exp=False ile yapılan önceki iki aşamalı tasarım
+    # süresi dolmuş token'ların revoke kontrolünden geçip
+    # ikinci decode'da reddedileceği varsayımına dayanıyordu;
+    # bu aradaki pencere gereksiz bir race condition yaratıyordu.
     try:
-        payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"], options={"verify_exp": False})
-        jti = payload.get("jti")
-        if jti:
-            revoked = RevokedToken.query.filter_by(token_jti=jti).first()
-            if revoked:
-                if revoked.expires_at > datetime.utcnow():
-                    logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
-                    return None
-                else:
+        payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
+    except pyjwt.ExpiredSignatureError:
+        return None
+    except pyjwt.InvalidTokenError:
+        return None
+
+    # İmza ve süre geçerliyse revoke/blacklist kontrolü yap.
+    jti = payload.get("jti")
+    if jti:
+        revoked = RevokedToken.query.filter_by(token_jti=jti).first()
+        if revoked:
+            # Kayıt hâlâ geçerliyse reddet; süresi gectiyse temizle.
+            if revoked.expires_at > datetime.utcnow():
+                logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
+                return None
+            else:
+                try:
                     db.session.delete(revoked)
                     db.session.commit()
-    except pyjwt.InvalidTokenError:
-        pass
+                except Exception as e:
+                    db.session.rollback()
+                    logger.error("Revoked token temizleme hatasi: %s", e)
 
     with _blacklist_lock:
         if token in _token_blacklist:
             return None
 
-    try:
-        payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
-        return payload["user_id"]
-    except pyjwt.ExpiredSignatureError:
-        return None
-    except pyjwt.InvalidTokenError:
-        return None
+    return payload.get("user_id")
 
 
 def blacklist_token(token):
@@ -281,7 +330,20 @@ def clear_failed_logins(identifier: str):
 # ───────────────────── Oturum Yardımcıları ─────────────────────
 
 def _get_client_ip() -> str:
-    return request.headers.get("CF-Connecting-IP") or request.remote_addr or "unknown"
+    """
+    Gerçek istemci IP'sini döndür.
+
+    CF-Connecting-IP başlığı yalnızca istek Cloudflare'in bilinen IP
+    aralıklarından geliyorsa güvenilir kabul edilir. Aksi takdirde
+    (doğrudan bağlantı veya spoof girişimi) remote_addr kullanılır.
+    Bu sayede saldırgan sahte bir CF-Connecting-IP başlığı göndererek
+    brute-force korumasını bypass edemez.
+    """
+    remote = request.remote_addr or "unknown"
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip and _is_cloudflare_ip(remote):
+        return cf_ip
+    return remote
 
 
 def _get_user_agent() -> str:
@@ -301,7 +363,7 @@ def _create_session_record(user_id: int, token: str):
             for s in old_sessions[:len(old_sessions) - 9]:
                 s.is_active = False
 
-        ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "unknown"
+        ip = _get_client_ip()
         ua = (request.headers.get("User-Agent", "") or "")[:256]
 
         sess = UserSession(
@@ -514,6 +576,34 @@ def add_security_headers(response):
 
 _plan_expiry_cache: dict = {}
 _PLAN_CHECK_INTERVAL = 300
+
+
+@app.before_request
+def auto_csrf_protect():
+    """
+    CSRF korumasını manuel olarak yönet.
+
+    Flask-WTF'in otomatik before_request kontrolü (WTF_CSRF_CHECK_DEFAULT=False)
+    kapatılmıştır. Bu fonksiyon:
+      - Bearer JWT ile gelen istekleri CSRF'den muaf tutar.
+        (JWT localStorage'da saklandığından tarayıcı otomatik göndermez → CSRF riski yok)
+      - Cookie/session tabanlı isteklerde standart CSRF doğrulamasını uygular.
+
+    Böylece eski cache'den açılan sayfalar veya uzun süre açık kalan sekmeler
+    süresi dolmuş CSRF token nedeniyle 400/403 almaz; JWT varsa istek geçer.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return  # Salt-okunur metodlarda CSRF gerekmez
+
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        if verify_api_token(token):
+            # Geçerli JWT → CSRF kontrolünü atla
+            return
+
+    # JWT yoksa veya geçersizse standart CSRF doğrulaması yap
+    csrf.protect()
 
 
 @app.before_request
@@ -995,7 +1085,7 @@ def site_login():
     u = sanitize(data.get("username", ""), 40)
     p = data.get("password", "")
 
-    ip = request.headers.get("CF-Connecting-IP") or request.remote_addr
+    ip = _get_client_ip()
     ip_key = f"ip:{ip}"
     user_key = f"user:{u}"
 
@@ -1289,6 +1379,24 @@ def get_accounts():
     result = []
     for acct in accounts:
         mgr = boost_service.get_or_create(acct.id, acct.steam_username)
+
+        # Hesap bağlı değil ama kayıtlı şifre var → arka planda reconnect tetikle.
+        # Bu sayede sayfa yüklenirken bile bağlantı denemesi başlar;
+        # kullanıcı birkaç saniye sonra yenilediğinde hesap bağlı gelir.
+        if not mgr.logged_in and mgr.has_credentials():
+            def _bg_reconnect(m=mgr, a=acct):
+                try:
+                    result = m.login()
+                    if result == EResult.OK:
+                        m.app_ids = a.app_ids()
+                        m.persona_state = a.persona_state
+                        logger.info("[%s] Arka plan reconnect basarili", a.steam_username)
+                    else:
+                        logger.info("[%s] Arka plan reconnect: %s", a.steam_username, result)
+                except Exception as e:
+                    logger.warning("[%s] Arka plan reconnect hatasi: %s", a.steam_username, e)
+            gevent.spawn(_bg_reconnect)
+
         if mgr.logged_in:
             s = mgr.summary()
             s["app_ids"] = acct.app_ids()
@@ -1586,7 +1694,7 @@ def toggle_boost():
                 elapsed2 = mgr2.stop_boost()
                 if elapsed2 > 0 and boost_start2:
                     with app.app_context():
-                        acct2 = SteamAccount.query.get(acct_id)
+                        acct2 = db.session.get(SteamAccount, acct_id)
                         log2 = BoostLog(
                             account_id=acct_id,
                             user_id=_uid_daily,
@@ -1616,7 +1724,7 @@ def toggle_boost():
                     elapsed_t = mgr_t.stop_boost()
                     if elapsed_t > 0 and boost_start_t:
                         with app.app_context():
-                            acct_t = SteamAccount.query.get(acct_id)
+                            acct_t = db.session.get(SteamAccount, acct_id)
                             log_t = BoostLog(
                                 account_id=acct_id,
                                 user_id=_uid_timer,
@@ -1657,7 +1765,7 @@ def toggle_boost():
                 elapsed3 = mgr3.stop_boost()
                 if elapsed3 > 0 and boost_start3:
                     with app.app_context():
-                        acct3 = SteamAccount.query.get(acct_id)
+                        acct3 = db.session.get(SteamAccount, acct_id)
                         log3 = BoostLog(
                             account_id=acct_id,
                             user_id=_uid_total,
