@@ -443,7 +443,9 @@ def login_required(f):
         if not user_id:
             user_id = session.get("user_id")
         if not user_id:
-            return jsonify({"ok": False, "error": "Not logged in."}), 401
+            if request.method != 'GET' or request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify({"ok": False, "error": "Not logged in."}), 401
+            return flask_redirect("/")
         user = db.session.get(User, user_id)
         if not user:
             session.clear()
@@ -1208,6 +1210,7 @@ def payment_check(payment_id):
 
 
 @app.route("/shopier/webhook", methods=["POST"])
+@csrf.exempt
 def shopier_webhook():
     if not Config.SHOPIER_WEBHOOK_SECRET:
         logger.error("SHOPIER_WEBHOOK_SECRET ayarlanmamış! Webhook reddedildi.")
@@ -1890,8 +1893,8 @@ def game_info():
 @app.route("/admin")
 @login_required
 def admin_page():
-    if not g.user.is_admin:
-        return "Unauthorized", 403
+    if not getattr(g.user, 'is_admin', False):
+        return flask_redirect("/")
     return render_template("admin.html")
 
 
