@@ -22,6 +22,9 @@ class Config:
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     PERMANENT_SESSION_LIFETIME = 30 * 24 * 3600
 
+    # Rate Limiting Depolama (Redis önerilir: redis://localhost:6379)
+    LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI", "memory://")
+
     # Güvenli oturum çerezi ayarları
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SECURE = True

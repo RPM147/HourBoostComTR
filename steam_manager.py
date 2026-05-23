@@ -11,9 +11,19 @@ logger = logging.getLogger(__name__)
 
 TOKEN_DIR = os.path.join(os.path.dirname(__file__), "tokens")
 os.makedirs(TOKEN_DIR, exist_ok=True)
+if os.name != 'nt':
+    try:
+        os.chmod(TOKEN_DIR, 0o700)
+    except Exception:
+        pass
 
 SENTRY_DIR = os.path.join(os.path.dirname(__file__), "sentry")
 os.makedirs(SENTRY_DIR, exist_ok=True)
+if os.name != 'nt':
+    try:
+        os.chmod(SENTRY_DIR, 0o700)
+    except Exception:
+        pass
 
 _FERNET = None
 
@@ -24,6 +34,8 @@ def _get_fernet():
         return _FERNET
     try:
         from cryptography.fernet import Fernet
+        import base64
+        import hashlib
 
         key_str = os.environ.get("CRED_KEY")
         if key_str:
@@ -34,13 +46,13 @@ def _get_fernet():
             if os.path.exists(key_path):
                 with open(key_path, "rb") as f:
                     key = f.read().strip()
-                logger.info("Sifreleme anahtari dosyadan yuklendi")
+                logger.warning("DIKKAT: Sifreleme anahtari .cred_key dosyasindan okundu. Lutfen bunu CRED_KEY ortam degiskenine tasiyin ve dosyayi silin.")
             else:
-                key = Fernet.generate_key()
-                with open(key_path, "wb") as f:
-                    f.write(key)
-                os.chmod(key_path, 0o600)
-                logger.info("Yeni sifreleme anahtari olusturuldu")
+                # SECRET_KEY tabanli guvenli bir anahtar uret (Dosyaya yazmadan)
+                secret = os.environ.get("SECRET_KEY", "default_insecure_secret").encode()
+                derived = hashlib.sha256(b"steam_cred_salt_" + secret).digest()
+                key = base64.urlsafe_b64encode(derived)
+                logger.info("Sifreleme anahtari SECRET_KEY uzerinden dinamik olarak uretildi")
 
         _FERNET = Fernet(key)
     except Exception as e:
@@ -163,7 +175,10 @@ class SteamAccountManager:
     def _schedule_reconnect(self):
         if self._reconnect_attempts >= 5:
             logger.error("[%s] Max reconnect asildi", self.steam_username)
-            self.boosting = False
+            if self.boosting:
+                elapsed = self.stop_boost()
+                if elapsed > 0 and boost_service.fatal_disconnect_callback:
+                    boost_service.fatal_disconnect_callback(self.account_id, elapsed)
             return
         delay = min(30 * (2 ** self._reconnect_attempts), 300)
         self._reconnect_attempts += 1
@@ -365,6 +380,7 @@ class SteamAccountManager:
 class BoostService:
     def __init__(self):
         self._managers = {}
+        self.fatal_disconnect_callback = None
 
     def get(self, account_id):
         return self._managers.get(account_id)

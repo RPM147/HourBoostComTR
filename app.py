@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ───────────────────── SSRF Koruması ─────────────────────
 
+# Cloudflare ve SSRF Korumasi izin verilen domainler
 ALLOWED_HOSTS = {
     'steamcommunity.com',
     'api.steampowered.com',
@@ -46,45 +47,6 @@ PRIVATE_IP_RANGES = [
     ipaddress.ip_network('fc00::/7'),
     ipaddress.ip_network('fe80::/10'),
 ]
-
-# Cloudflare resmi IPv4 ve IPv6 aralıkları.
-# Kaynak: https://www.cloudflare.com/ips/
-# Periyodik olarak (ayda bir) https://www.cloudflare.com/ips-v4 ve /ips-v6
-# adreslerinden güncellenmelidir.
-_CF_IP_RANGES = [
-    ipaddress.ip_network('103.21.244.0/22'),
-    ipaddress.ip_network('103.22.200.0/22'),
-    ipaddress.ip_network('103.31.4.0/22'),
-    ipaddress.ip_network('104.16.0.0/13'),
-    ipaddress.ip_network('104.24.0.0/14'),
-    ipaddress.ip_network('108.162.192.0/18'),
-    ipaddress.ip_network('131.0.72.0/22'),
-    ipaddress.ip_network('141.101.64.0/18'),
-    ipaddress.ip_network('162.158.0.0/15'),
-    ipaddress.ip_network('172.64.0.0/13'),
-    ipaddress.ip_network('173.245.48.0/20'),
-    ipaddress.ip_network('188.114.96.0/20'),
-    ipaddress.ip_network('190.93.240.0/20'),
-    ipaddress.ip_network('197.234.240.0/22'),
-    ipaddress.ip_network('198.41.128.0/17'),
-    # IPv6
-    ipaddress.ip_network('2400:cb00::/32'),
-    ipaddress.ip_network('2606:4700::/32'),
-    ipaddress.ip_network('2803:f800::/32'),
-    ipaddress.ip_network('2405:b500::/32'),
-    ipaddress.ip_network('2405:8100::/32'),
-    ipaddress.ip_network('2a06:98c0::/29'),
-    ipaddress.ip_network('2c0f:f248::/32'),
-]
-
-
-def _is_cloudflare_ip(ip_str: str) -> bool:
-    """Gelen isteğin gerçekten Cloudflare proxy'sinden gelip gelmediğini doğrula."""
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return any(ip in net for net in _CF_IP_RANGES)
-    except ValueError:
-        return False
 
 
 def is_safe_url(url):
@@ -113,13 +75,19 @@ def is_private_ip(ip_str):
 
 
 def safe_urlopen(url, timeout=10, **kwargs):
-    """Sadece güvenli URL'leri açan yardımcı fonksiyon."""
+    """
+    SSRF ve DNS Rebinding korumalı urlopen.
+    ALLOWED_HOSTS listesi sıkı olduğu için TOCTOU/DNS Rebinding riski taşımaz.
+    """
     if isinstance(url, str):
         check_url = url
+        req = urllib.request.Request(url, **kwargs)
     elif hasattr(url, 'full_url'):
         check_url = url.full_url
+        req = url
     else:
         check_url = str(url)
+        req = urllib.request.Request(check_url, **kwargs)
 
     if not is_safe_url(check_url):
         raise ValueError(f"Güvensiz URL engellendi: {check_url}")
@@ -136,7 +104,7 @@ def safe_urlopen(url, timeout=10, **kwargs):
     except OSError:
         pass  # DNS hatası gerçek istekte başarısız olacak
 
-    return urllib.request.urlopen(url, timeout=timeout, **kwargs)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 # Geriye dönük uyumluluk için sınıf sarmalayıcı
@@ -163,9 +131,12 @@ import shopier as shopier_lib
 
 from gevent.lock import RLock
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 app = Flask(__name__)
 app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 csrf = CSRFProtect(app)
 # Otomatik CSRF kontrolünü kapat — JWT Bearer istekleri muaf tutulacak.
@@ -177,7 +148,7 @@ limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["200 per hour"],
-    storage_uri="memory://",
+    storage_uri=app.config.get("LIMITER_STORAGE_URI", "memory://"),
 )
 
 game_cache: dict = {}
@@ -186,6 +157,62 @@ GAME_CACHE_MAX = 500
 
 SERVER_START = time.time()
 
+_active_timers = {}
+_timer_lock = RLock()
+_bg_reconnect_locks = set()
+
+def _clear_timers(acct_id):
+    with _timer_lock:
+        if acct_id in _active_timers:
+            for t in _active_timers[acct_id]:
+                try:
+                    t.kill()
+                except:
+                    pass
+            _active_timers.pop(acct_id, None)
+
+def _add_timer(acct_id, glet):
+    with _timer_lock:
+        if acct_id not in _active_timers:
+            _active_timers[acct_id] = []
+        _active_timers[acct_id].append(glet)
+
+def _handle_fatal_disconnect(acct_id, elapsed):
+    try:
+        with app.app_context():
+            acct = db.session.get(SteamAccount, acct_id)
+            if acct:
+                log = BoostLog(
+                    account_id=acct_id,
+                    user_id=acct.user_id,
+                    started_at=datetime.utcnow() - timedelta(seconds=elapsed),
+                    stopped_at=datetime.utcnow(),
+                    duration_seconds=int(elapsed),
+                    games_count=len(acct.app_ids()),
+                    app_ids_json=json.dumps(acct.app_ids())
+                )
+                db.session.add(log)
+                db.session.commit()
+                logger.info("[%s] Fatal disconnect sonrasi %d saniye veritabanina yazildi", acct_id, int(elapsed))
+    except Exception as e:
+        logger.error("[%s] Fatal disconnect log yazma hatasi: %s", acct_id, e)
+
+boost_service.fatal_disconnect_callback = _handle_fatal_disconnect
+
+def _get_active_seconds(user_id, start_time_filter=None):
+    active = 0
+    now = time.time()
+    accounts = SteamAccount.query.filter_by(user_id=user_id).all()
+    for acct in accounts:
+        mgr = boost_service.get(acct.id)
+        if mgr and mgr.boosting and mgr.start_time:
+            if start_time_filter:
+                start_dt = datetime.utcfromtimestamp(mgr.start_time)
+                if start_dt >= start_time_filter:
+                    active += (now - mgr.start_time)
+            else:
+                active += (now - mgr.start_time)
+    return active
 
 # ───────────────────── JWT ─────────────────────
 
@@ -332,18 +359,9 @@ def clear_failed_logins(identifier: str):
 def _get_client_ip() -> str:
     """
     Gerçek istemci IP'sini döndür.
-
-    CF-Connecting-IP başlığı yalnızca istek Cloudflare'in bilinen IP
-    aralıklarından geliyorsa güvenilir kabul edilir. Aksi takdirde
-    (doğrudan bağlantı veya spoof girişimi) remote_addr kullanılır.
-    Bu sayede saldırgan sahte bir CF-Connecting-IP başlığı göndererek
-    brute-force korumasını bypass edemez.
+    ProxyFix kullandığımız için request.remote_addr güvenlidir.
     """
-    remote = request.remote_addr or "unknown"
-    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
-    if cf_ip and _is_cloudflare_ip(remote):
-        return cf_ip
-    return remote
+    return request.remote_addr or "unknown"
 
 
 def _get_user_agent() -> str:
@@ -413,8 +431,9 @@ def auto_reconnect_saved_accounts():
     _gevent.sleep(3)
     with app.app_context():
         accounts = SteamAccount.query.all()
-        reconnected = 0
-        for acct in accounts:
+        logger.info("Otomatik reconnect baslatiliyor: %d hesap", len(accounts))
+        
+        def _bg_reconnect_single(acct):
             mgr = boost_service.get_or_create(acct.id, acct.steam_username)
             if mgr.has_credentials():
                 try:
@@ -422,8 +441,48 @@ def auto_reconnect_saved_accounts():
                     if result == EResult.OK:
                         mgr.app_ids = acct.app_ids()
                         mgr.persona_state = acct.persona_state
-                        reconnected += 1
                         logger.info("[%s] Otomatik reconnect basarili", acct.steam_username)
+                        
+                        # Eger onceden kalma bir target_stop_time varsa, timer'i canlandir
+                        if acct.target_stop_time:
+                            now = datetime.utcnow()
+                            if acct.target_stop_time > now:
+                                rem_sec = (acct.target_stop_time - now).total_seconds()
+                                def _resume_timer(a_id=acct.id, u_id=acct.user_id, rem=rem_sec):
+                                    _gevent.sleep(rem)
+                                    m = boost_service.get(a_id)
+                                    if m and m.boosting:
+                                        bs = m.start_time
+                                        el = m.stop_boost()
+                                        if el > 0 and bs:
+                                            with app.app_context():
+                                                a2 = db.session.get(SteamAccount, a_id)
+                                                if a2:
+                                                    a2.target_stop_time = None
+                                                    lg = BoostLog(
+                                                        account_id=a_id, user_id=u_id,
+                                                        started_at=datetime.utcfromtimestamp(bs),
+                                                        stopped_at=datetime.utcnow(), duration_seconds=int(el),
+                                                        games_count=len(a2.app_ids()), app_ids_json=json.dumps(a2.app_ids())
+                                                    )
+                                                    db.session.add(lg)
+                                                    db.session.commit()
+                                        logger.info("[%s] Reconnect sonrasi timer doldu", a_id)
+                                _add_timer(acct.id, _gevent.spawn(_resume_timer))
+                            else:
+                                # Süre geçmiş, doğrudan kapat logla
+                                logger.info("[%s] Reconnect sirasinda timer suresi coktan dolmus, kapatiliyor.", acct.steam_username)
+                                bs = mgr.start_time or time.time()
+                                mgr.stop_boost()
+                                acct.target_stop_time = None
+                                lg = BoostLog(
+                                    account_id=acct.id, user_id=acct.user_id,
+                                    started_at=datetime.utcfromtimestamp(bs),
+                                    stopped_at=datetime.utcnow(), duration_seconds=1,
+                                    games_count=len(acct.app_ids()), app_ids_json=json.dumps(acct.app_ids())
+                                )
+                                db.session.add(lg)
+                                db.session.commit()
                     elif result in (
                         EResult.AccountLoginDeniedNeedTwoFactor,
                         EResult.TwoFactorCodeMismatch,
@@ -433,14 +492,50 @@ def auto_reconnect_saved_accounts():
                         logger.warning("[%s] Otomatik reconnect basarisiz: %s", acct.steam_username, result)
                 except Exception as e:
                     logger.warning("[%s] Otomatik reconnect hatasi: %s", acct.steam_username, e)
-        logger.info("Otomatik reconnect: %d/%d hesap baglandi", reconnected, len(accounts))
+
+        for acct in accounts:
+            _gevent.spawn(_bg_reconnect_single, acct)
 
 
 with app.app_context():
     db.create_all()
 
 import gevent
-gevent.spawn(auto_reconnect_saved_accounts)
+# gevent.spawn(auto_reconnect_saved_accounts) # Iptal edildi (Kullanici bildirim gitmemesi icin)
+
+def _checkpoint_loop():
+    while True:
+        gevent.sleep(900)  # 15 dakika (900 saniye)
+        with app.app_context():
+            logger.info("Running background boost checkpoint (saving active durations)...")
+            count = 0
+            for acct_id, mgr in boost_service.all_managers():
+                if mgr.boosting and mgr.start_time:
+                    elapsed = time.time() - mgr.start_time
+                    if elapsed > 60:
+                        mgr.start_time = time.time()
+                        acct_db = db.session.get(SteamAccount, acct_id)
+                        if acct_db:
+                            log = BoostLog(
+                                account_id=acct_id,
+                                user_id=acct_db.user_id,
+                                started_at=datetime.utcfromtimestamp(time.time() - elapsed),
+                                stopped_at=datetime.utcnow(),
+                                duration_seconds=int(elapsed),
+                                games_count=len(acct_db.app_ids()),
+                                app_ids_json=json.dumps(acct_db.app_ids()),
+                            )
+                            db.session.add(log)
+                            count += 1
+            if count > 0:
+                try:
+                    db.session.commit()
+                    logger.info("Checkpoint basarili: %d kayit eklendi.", count)
+                except Exception as e:
+                    db.session.rollback()
+                    logger.error("Checkpoint commit hatasi: %s", e)
+
+gevent.spawn(_checkpoint_loop)
 
 
 # ───────────────────── Shutdown ─────────────────────
@@ -526,29 +621,32 @@ def sanitize(text, maxlen=100):
 def extract_username_from_note(note: str):
     if not note:
         return None
-    note = note.strip()[:200]
-    skip_words = {
-        "adim", "benim", "kullanici", "hesap", "iste",
-        "budur", "sitesi", "boost", "hour", "steam",
-        "uyelik", "satin", "aldim", "kullanıcı", "adım",
-    }
-    user = User.query.filter(User.username.ilike(note)).first()
-    if user:
-        return user.username
+    note = note.strip()
+    
+    m = re.search(r"SB-(\d+)", note)
+    if m:
+        try:
+            user_id = int(m.group(1))
+            user = db.session.get(User, user_id)
+            if user:
+                return user.username
+        except Exception:
+            pass
+
+    # 1. Normalize steam names: if someone wrote "steam 123456", "steam-123456", or "steam123456", convert it to "steam_123456"
+    note = re.sub(r'(?i)steam[\s\-_]*(\d+)', r'steam_\1', note)
+
     words = re.split(r"[\s,;:/\\|]+", note)
-    best_match = None
-    best_length = 0
     for word in words:
         word = word.strip()
-        if len(word) < 4:
+        if len(word) < 3:
             continue
-        if word.lower() in skip_words:
-            continue
-        user = User.query.filter(User.username.ilike(word)).first()
-        if user and len(word) > best_length:
-            best_match = user.username
-            best_length = len(word)
-    return best_match
+        # Case-insensitive exact match for username
+        user = User.query.filter(db.func.lower(User.username) == word.lower()).first()
+        if user:
+            return user.username
+            
+    return None
 
 
 # ───────────────────── Middleware ─────────────────────
@@ -805,8 +903,8 @@ def register():
 
     if not u or not e or not p:
         return jsonify({"ok": False, "error": "All fields are required." if lang == "en" else "Tum alanlar gerekli."})
-    if len(p) < 6:
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters." if lang == "en" else "Sifre en az 6 karakter olmali."})
+    if len(p) < 6 or not any(char.isdigit() for char in p) or not any(char.isalpha() for char in p):
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers." if lang == "en" else "Sifre en az 6 karakter olmali ve hem harf hem rakam icermelidir."})
     if User.query.filter_by(username=u).first():
         return jsonify({"ok": False, "error": "This username is already taken." if lang == "en" else "Bu kullanici adi alinmis."})
     if User.query.filter_by(email=e).first():
@@ -821,18 +919,21 @@ def register():
         verification_sent_at=datetime.utcnow(),
         lang=lang,
     )
-    user.set_password(p)
-    db.session.add(user)
-    db.session.commit()
+    try:
+        user.set_password(p)
+        db.session.add(user)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Kullanici kayit sirasinda veritabani hatasi: %s", e)
+        return jsonify({"ok": False, "error": "This username or email is already taken or an error occurred." if lang == "en" else "Bu kullanici adi veya e-posta alinmis veya bir hata olustu."})
 
-    mail_sent = mailer.send_verification_email(e, u, verification_token, lang=lang)
-    if not mail_sent:
-        logger.warning("Dogrulama maili gonderilemedi: %s", e)
+    gevent.spawn(mailer.send_verification_email, e, u, verification_token, lang=lang)
 
     return jsonify({
         "ok": True,
         "verify_email": True,
-        "mail_sent": mail_sent,
+        "mail_sent": True,
     })
 
 
@@ -973,8 +1074,8 @@ def reset_password():
 
     if not token or not new_password:
         return jsonify({"ok": False, "error": "Missing information."})
-    if len(new_password) < 6:
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters."})
+    if len(new_password) < 6 or not any(char.isdigit() for char in new_password) or not any(char.isalpha() for char in new_password):
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers."})
 
     user = User.query.filter_by(reset_token=token).first()
     if not user or not user.reset_token_expires:
@@ -1000,8 +1101,8 @@ def change_password():
 
     if not current_password or not new_password:
         return jsonify({"ok": False, "error": "All fields are required."})
-    if len(new_password) < 6:
-        return jsonify({"ok": False, "error": "New password must be at least 6 characters."})
+    if len(new_password) < 6 or not any(char.isdigit() for char in new_password) or not any(char.isalpha() for char in new_password):
+        return jsonify({"ok": False, "error": "New password must be at least 6 characters and contain letters and numbers."})
 
     user = g.user
     if not user.check_password(current_password):
@@ -1043,7 +1144,12 @@ def change_email():
     user.email_change_token = token
     user.email_change_new = new_email
     user.email_change_expires = datetime.utcnow() + timedelta(hours=1)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.error("E-posta degistirme sirasinda veritabani hatasi: %s", e)
+        return jsonify({"ok": False, "error": "An error occurred." if lang == "en" else "Bir hata olustu."})
 
     user_lang = getattr(user, "lang", "tr") or "tr"
     gevent.spawn(mailer.send_email_change_email, new_email, user.username, token, user_lang)
@@ -1384,18 +1490,22 @@ def get_accounts():
         # Bu sayede sayfa yüklenirken bile bağlantı denemesi başlar;
         # kullanıcı birkaç saniye sonra yenilediğinde hesap bağlı gelir.
         if not mgr.logged_in and mgr.has_credentials():
-            def _bg_reconnect(m=mgr, a=acct):
-                try:
-                    result = m.login()
-                    if result == EResult.OK:
-                        m.app_ids = a.app_ids()
-                        m.persona_state = a.persona_state
-                        logger.info("[%s] Arka plan reconnect basarili", a.steam_username)
-                    else:
-                        logger.info("[%s] Arka plan reconnect: %s", a.steam_username, result)
-                except Exception as e:
-                    logger.warning("[%s] Arka plan reconnect hatasi: %s", a.steam_username, e)
-            gevent.spawn(_bg_reconnect)
+            if acct.id not in _bg_reconnect_locks:
+                _bg_reconnect_locks.add(acct.id)
+                def _bg_reconnect(m=mgr, a=acct):
+                    try:
+                        result = m.login()
+                        if result == EResult.OK:
+                            m.app_ids = a.app_ids()
+                            m.persona_state = a.persona_state
+                            logger.info("[%s] Arka plan reconnect basarili", a.steam_username)
+                        else:
+                            logger.info("[%s] Arka plan reconnect: %s", a.steam_username, result)
+                    except Exception as e:
+                        logger.warning("[%s] Arka plan reconnect hatasi: %s", a.steam_username, e)
+                    finally:
+                        _bg_reconnect_locks.discard(a.id)
+                gevent.spawn(_bg_reconnect)
 
         if mgr.logged_in:
             s = mgr.summary()
@@ -1643,6 +1753,9 @@ def toggle_boost():
         return jsonify({"ok": False, "error": "Please connect to Steam first."})
 
     if mgr.boosting:
+        acct_db.target_stop_time = None
+        db.session.commit()
+        _clear_timers(acct_id)
         boost_start = mgr.start_time
         elapsed = mgr.stop_boost()
         if elapsed > 0 and boost_start:
@@ -1662,6 +1775,8 @@ def toggle_boost():
     ids = acct_db.app_ids()
     if not ids:
         return jsonify({"ok": False, "error": "Game list is empty."})
+        
+    _clear_timers(acct_id)
 
     limits = g.user.plan_limits()
 
@@ -1675,6 +1790,8 @@ def toggle_boost():
             .filter(BoostLog.user_id == g.user.id, BoostLog.started_at >= today_start)
             .scalar() or 0
         )
+        used_seconds += _get_active_seconds(g.user.id, today_start)
+        
         limit_seconds = daily_hours * 3600
         remaining = limit_seconds - used_seconds
         if remaining <= 0:
@@ -1708,7 +1825,7 @@ def toggle_boost():
                         db.session.commit()
                 logger.info("[acct:%s] Limit/zamanlayici doldu", acct_id)
 
-        gevent.spawn(_auto_stop_on_limit)
+        _add_timer(acct_id, gevent.spawn(_auto_stop_on_limit))
 
     else:
         if timer_hours > 0:
@@ -1738,7 +1855,7 @@ def toggle_boost():
                             db.session.commit()
                     logger.info("[acct:%s] Timer finished (%.1f hours)", acct_id, timer_hours)
 
-            gevent.spawn(_auto_stop_on_timer)
+            _add_timer(acct_id, gevent.spawn(_auto_stop_on_timer))
 
     # ── Toplam saat limiti ──
     total_hours = limits.get("total_hours")
@@ -1750,6 +1867,7 @@ def toggle_boost():
             .filter(BoostLog.user_id == g.user.id, BoostLog.started_at >= plan_start)
             .scalar() or 0
         )
+        used_total += _get_active_seconds(g.user.id, plan_start)
         remaining_total = total_hours * 3600 - used_total
         if remaining_total <= 0:
             return jsonify({"ok": False, "error": f"You have used all {total_hours} hours in your plan.", "upgrade": True})
@@ -1779,7 +1897,24 @@ def toggle_boost():
                         db.session.commit()
                 logger.info("[acct:%s] Total limit reached", acct_id)
 
-        gevent.spawn(_auto_stop_on_total_limit)
+        _add_timer(acct_id, gevent.spawn(_auto_stop_on_total_limit))
+
+    # Calculate and save target_stop_time
+    possible_stops = []
+    if 'remaining' in locals():
+        possible_stops.append(remaining)
+    elif 'timer_seconds' in locals():
+        possible_stops.append(timer_seconds)
+    if 'remaining_total' in locals():
+        possible_stops.append(remaining_total)
+        
+    if possible_stops:
+        min_sec = min(possible_stops)
+        acct_db.target_stop_time = datetime.utcnow() + timedelta(seconds=min_sec)
+    else:
+        acct_db.target_stop_time = None
+        
+    db.session.commit()
 
     mgr.start_boost(ids, acct_db.persona_state)
     return jsonify({
@@ -1817,12 +1952,20 @@ def my_stats():
         .filter(BoostLog.user_id == user.id, BoostLog.started_at >= today_start)
         .scalar() or 0
     )
+    today_seconds += _get_active_seconds(user.id, today_start)
+    
     plan_start = user.plan_activated_at if user.plan_activated_at else datetime.utcnow() - timedelta(days=365)
     plan_used_seconds = (
         db.session.query(func.sum(BoostLog.duration_seconds))
         .filter(BoostLog.user_id == user.id, BoostLog.started_at >= plan_start)
         .scalar() or 0
     )
+    plan_used_seconds += _get_active_seconds(user.id, plan_start)
+    
+    # Active seconds since all time
+    active_all_time = _get_active_seconds(user.id)
+    total_seconds += active_all_time
+    
     return jsonify({
         "total_hours": round(total_seconds / 3600, 1),
         "today_hours": round(today_seconds / 3600, 1),
@@ -1916,13 +2059,23 @@ def steam_profile():
 
         if not avatar_url:
             try:
-                api_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
-                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with safe_urlopen(req, timeout=5) as r:
-                    xml = r.read().decode()
-                m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", xml)
-                if m:
-                    avatar_url = m.group(1)
+                if Config.STEAM_API_KEY:
+                    api_url = f"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={Config.STEAM_API_KEY}&steamids={steamid}"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with safe_urlopen(req, timeout=5) as r:
+                        data = json.loads(r.read().decode())
+                    players = data.get("response", {}).get("players", [])
+                    if players:
+                        avatar_url = players[0].get("avatarfull", "")
+                
+                if not avatar_url:
+                    api_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with safe_urlopen(req, timeout=5) as r:
+                        xml = r.read().decode()
+                    m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", xml)
+                    if m:
+                        avatar_url = m.group(1)
             except Exception:
                 pass
 
@@ -2073,7 +2226,8 @@ def admin_update_user():
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
-    user = db.session.get(User, data.get("user_id"))
+    target_id = data.get("user_id")
+    user = db.session.get(User, target_id)
     if not user:
         return jsonify({"ok": False, "error": "User not found."})
 
@@ -2084,9 +2238,12 @@ def admin_update_user():
             user.plan_activated_at = datetime.utcnow()
         else:
             user.plan_expires = None
+            user.plan_activated_at = None
 
     if "is_admin" in data:
-        user.is_admin = bool(data["is_admin"])
+        if str(target_id) == str(g.user.id) and not data["is_admin"]:
+            return jsonify({"ok": False, "error": "You cannot remove your own admin privileges."})
+        user.is_admin = data["is_admin"]
 
     db.session.commit()
     return jsonify({"ok": True})
@@ -2158,10 +2315,8 @@ def admin_delete_user():
 
     data = request.json
     target_id = data.get("user_id")
-
-    if not target_id:
-        return jsonify({"ok": False, "error": "User ID is required."})
-    if target_id == g.user.id:
+    
+    if str(target_id) == str(g.user.id):
         return jsonify({"ok": False, "error": "You cannot delete your own account."})
 
     target_user = db.session.get(User, target_id)
@@ -2290,7 +2445,9 @@ def _get_steam_profile(steam_id: str) -> dict:
 @app.route("/steam/login")
 def steam_login():
     lang = request.args.get("lang", "tr")
-    return_to = f"{Config.SITE_URL}/steam/callback?lang={lang}"
+    state = secrets.token_hex(16)
+    session["steam_state"] = state
+    return_to = f"{Config.SITE_URL}/steam/callback?lang={lang}&state={state}"
     redirect_url = _build_steam_login_url(return_to)
     return flask_redirect(redirect_url)
 
@@ -2298,6 +2455,14 @@ def steam_login():
 @app.route("/steam/callback")
 def steam_callback():
     lang = request.args.get("lang", "tr")
+    returned_state = request.args.get("state", "")
+    expected_state = session.pop("steam_state", None)
+
+    if not expected_state or returned_state != expected_state:
+        logger.warning("Steam OpenID CSRF state uyumsuzlugu!")
+        if lang == "en":
+            return flask_redirect("/en/?error=steam_failed")
+        return flask_redirect("/?error=steam_failed")
 
     params = dict(request.args)
     steam_id = _verify_steam_callback(params)

@@ -63,6 +63,7 @@ class SteamAccount(db.Model):
     steam_username = db.Column(db.String(100), nullable=False)
     steam_id = db.Column(db.String(20))
     persona_state = db.Column(db.Integer, default=1)
+    target_stop_time = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     games = db.relationship(

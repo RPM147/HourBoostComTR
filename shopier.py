@@ -51,8 +51,8 @@ def verify_webhook(raw_body: bytes, signature_header: str, webhook_secret: str) 
     Header: Shopier-Signature  (HMAC-SHA256, hex digest)
     """
     if not webhook_secret:
-        logger.warning("Webhook secret tanimli degil, dogrulama atlaniyor.")
-        return True
+        logger.warning("Webhook secret tanimli degil, dogrulama reddedildi (Fail-Closed).")
+        return False
 
     if not signature_header:
         logger.warning("Webhook isteginde imza headeri yok!")
