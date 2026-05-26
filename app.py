@@ -441,6 +441,8 @@ def auto_reconnect_saved_accounts():
                     if result == EResult.OK:
                         mgr.app_ids = acct.app_ids()
                         mgr.persona_state = acct.persona_state
+                        if acct.is_boosting and mgr.app_ids:
+                            mgr.start_boost(mgr.app_ids, mgr.persona_state)
                         logger.info("[%s] Otomatik reconnect basarili", acct.steam_username)
                         
                         # Eger onceden kalma bir target_stop_time varsa, timer'i canlandir
@@ -669,6 +671,10 @@ def add_security_headers(response):
     response.headers['Content-Security-Policy'] = csp
     if app.config.get('SESSION_COOKIE_SECURE', False):
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    if "text/html" in response.content_type:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, public, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
 
 
@@ -1486,27 +1492,6 @@ def get_accounts():
     for acct in accounts:
         mgr = boost_service.get_or_create(acct.id, acct.steam_username)
 
-        # Hesap bağlı değil ama kayıtlı şifre var → arka planda reconnect tetikle.
-        # Bu sayede sayfa yüklenirken bile bağlantı denemesi başlar;
-        # kullanıcı birkaç saniye sonra yenilediğinde hesap bağlı gelir.
-        if not mgr.logged_in and mgr.has_credentials():
-            if acct.id not in _bg_reconnect_locks:
-                _bg_reconnect_locks.add(acct.id)
-                def _bg_reconnect(m=mgr, a=acct):
-                    try:
-                        result = m.login()
-                        if result == EResult.OK:
-                            m.app_ids = a.app_ids()
-                            m.persona_state = a.persona_state
-                            logger.info("[%s] Arka plan reconnect basarili", a.steam_username)
-                        else:
-                            logger.info("[%s] Arka plan reconnect: %s", a.steam_username, result)
-                    except Exception as e:
-                        logger.warning("[%s] Arka plan reconnect hatasi: %s", a.steam_username, e)
-                    finally:
-                        _bg_reconnect_locks.discard(a.id)
-                gevent.spawn(_bg_reconnect)
-
         if mgr.logged_in:
             s = mgr.summary()
             s["app_ids"] = acct.app_ids()
@@ -1532,6 +1517,8 @@ def account_login():
     data = request.json
     username = sanitize(data.get("username", ""), 100)
     password = data.get("password", "")
+    if password == "_use_saved_":
+        password = ""
     code = sanitize(data.get("code", ""), 10)
     code_type = data.get("code_type", "email")
     acct_id = data.get("acct_id")
@@ -1754,6 +1741,7 @@ def toggle_boost():
 
     if mgr.boosting:
         acct_db.target_stop_time = None
+        acct_db.is_boosting = False
         db.session.commit()
         _clear_timers(acct_id)
         boost_start = mgr.start_time
@@ -2007,6 +1995,136 @@ def game_stats():
     return jsonify({"games": result, "total_tracked": len(game_hours)})
 
 
+@app.route("/stats/detailed")
+@login_required
+def stats_detailed():
+    from sqlalchemy import func
+    user = g.user
+    now_utc = datetime.utcnow()
+
+    # ── Son 7 gün: günlük saat dağılımı ──
+    week_ago = now_utc - timedelta(days=7)
+    daily_rows = (
+        db.session.query(
+            func.date(BoostLog.started_at).label("day"),
+            func.sum(BoostLog.duration_seconds).label("total"),
+        )
+        .filter(BoostLog.user_id == user.id, BoostLog.started_at > week_ago)
+        .group_by(func.date(BoostLog.started_at))
+        .all()
+    )
+    day_names_tr = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"]
+    day_names_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    weekly_hours = []
+    for i in range(6, -1, -1):
+        d = (now_utc - timedelta(days=i)).date()
+        found = 0
+        for row in daily_rows:
+            rd = row.day if isinstance(row.day, type(d)) else datetime.strptime(str(row.day), "%Y-%m-%d").date()
+            if rd == d:
+                found = row.total or 0
+                break
+        wd = d.weekday()
+        weekly_hours.append({
+            "day_tr": day_names_tr[wd],
+            "day_en": day_names_en[wd],
+            "date": str(d),
+            "hours": round(found / 3600, 1),
+        })
+
+    # ── Son 4 hafta: haftalık toplam ──
+    four_weeks_ago = now_utc - timedelta(days=28)
+    monthly_rows = (
+        db.session.query(
+            func.date(BoostLog.started_at).label("day"),
+            func.sum(BoostLog.duration_seconds).label("total"),
+        )
+        .filter(BoostLog.user_id == user.id, BoostLog.started_at > four_weeks_ago)
+        .group_by(func.date(BoostLog.started_at))
+        .all()
+    )
+    monthly_hours = []
+    for w in range(3, -1, -1):
+        w_start = (now_utc - timedelta(days=(w + 1) * 7)).date()
+        w_end = (now_utc - timedelta(days=w * 7)).date()
+        total = 0
+        for row in monthly_rows:
+            rd = row.day if isinstance(row.day, type(w_start)) else datetime.strptime(str(row.day), "%Y-%m-%d").date()
+            if w_start <= rd < w_end:
+                total += (row.total or 0)
+        monthly_hours.append({
+            "week_tr": f"Hafta {4 - w}",
+            "week_en": f"Week {4 - w}",
+            "hours": round(total / 3600, 1),
+        })
+
+    # ── En çok boost edilen 10 oyun ──
+    logs = BoostLog.query.filter_by(user_id=user.id).all()
+    game_secs: dict = {}
+    for log in logs:
+        if not log.app_ids_json or log.duration_seconds <= 0:
+            continue
+        try:
+            aids = json.loads(log.app_ids_json)
+        except Exception:
+            continue
+        if not aids:
+            continue
+        per = log.duration_seconds / len(aids)
+        for aid in aids:
+            game_secs[str(aid)] = game_secs.get(str(aid), 0) + per
+
+    sorted_games = sorted(game_secs.items(), key=lambda x: x[1], reverse=True)[:10]
+    max_secs = sorted_games[0][1] if sorted_games else 1
+    top_games = [
+        {"app_id": int(k), "hours": round(v / 3600, 1), "pct": round((v / max_secs) * 100)}
+        for k, v in sorted_games
+    ]
+
+    # ── Özet istatistikler ──
+    total_seconds = (
+        db.session.query(func.sum(BoostLog.duration_seconds))
+        .filter_by(user_id=user.id).scalar() or 0
+    )
+    total_seconds += _get_active_seconds(user.id)
+
+    total_sessions = BoostLog.query.filter_by(user_id=user.id).count()
+
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_seconds = (
+        db.session.query(func.sum(BoostLog.duration_seconds))
+        .filter(BoostLog.user_id == user.id, BoostLog.started_at >= today_start)
+        .scalar() or 0
+    )
+    today_seconds += _get_active_seconds(user.id, today_start)
+
+    active_days = (
+        db.session.query(func.count(func.distinct(func.date(BoostLog.started_at))))
+        .filter_by(user_id=user.id).scalar() or 0
+    )
+
+    avg_daily = (total_seconds / max(active_days, 1)) if active_days else 0
+
+    longest_log = (
+        db.session.query(func.max(BoostLog.duration_seconds))
+        .filter_by(user_id=user.id).scalar() or 0
+    )
+
+    return jsonify({
+        "weekly_hours": weekly_hours,
+        "monthly_hours": monthly_hours,
+        "top_games": top_games,
+        "summary": {
+            "total_hours": round(total_seconds / 3600, 1),
+            "today_hours": round(today_seconds / 3600, 1),
+            "total_sessions": total_sessions,
+            "avg_daily_hours": round(avg_daily / 3600, 1),
+            "longest_session_hours": round(longest_log / 3600, 1),
+            "active_days": active_days,
+        },
+    })
+
+
 # ───────────────────── Duyurular ─────────────────────
 
 @app.route("/announcements")
@@ -2053,9 +2171,11 @@ def steam_profile():
         steamid = str(client.steam_id)
         name = getattr(me, "name", "") or ""
         avatar_url = ""
-        avatar_hash = getattr(me, "avatar_hash", b"")
-        if avatar_hash and avatar_hash != b"\x00" * 20:
-            avatar_url = f"https://avatars.steamstatic.com/{avatar_hash.hex()}_full.jpg"
+        if hasattr(me, "get_avatar_url"):
+            avatar_url = me.get_avatar_url(2)
+            if avatar_url:
+                filename = avatar_url.split('/')[-1]
+                avatar_url = f"https://avatars.steamstatic.com/{filename}"
 
         if not avatar_url:
             try:

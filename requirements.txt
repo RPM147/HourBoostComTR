@@ -1,55 +1,40 @@
-# ── Web Framework ─────────────────────────────────────────────
+bleach==6.3.0
+blinker==1.9.0
+cachetools==7.0.5
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.5
+click==8.3.1
+cryptography==46.0.5
+Deprecated==1.3.1
 Flask==3.1.3
 Flask-Limiter==4.1.1
 Flask-SQLAlchemy==3.1.1
-Werkzeug==3.1.6
-Jinja2==3.1.6
-MarkupSafe==3.0.3
-blinker==1.9.0
-click==8.3.1
-itsdangerous==2.2.0
-
-# ── Veritabanı ────────────────────────────────────────────────
-SQLAlchemy==2.0.48
-
-# ── Sunucu ────────────────────────────────────────────────────
-gunicorn==25.1.0
 gevent==25.9.1
 gevent-eventemitter==2.1
 greenlet==3.3.2
-zope.event==6.1
-zope.interface==8.2
-
-# ── Steam ─────────────────────────────────────────────────────
-steam==1.4.4
-vdf==3.4
-protobuf==3.20.3
-pycryptodomex==3.23.0
-
-# ── Güvenlik & Şifreleme ──────────────────────────────────────
-cryptography==46.0.5
-PyJWT==2.12.0
-cffi==2.0.0
-pycparser==3.0
-
-# ── Girdi Temizleme ───────────────────────────────────────────
-bleach==6.3.0
-webencodings==0.5.1
-
-# ── HTTP & Ağ ─────────────────────────────────────────────────
-requests==2.32.5
-urllib3==2.6.3
-certifi==2026.2.25
-charset-normalizer==3.4.5
+gunicorn==25.1.0
 idna==3.11
-
-# ── Yardımcılar ───────────────────────────────────────────────
-python-dotenv==1.2.2
+itsdangerous==2.2.0
+Jinja2==3.1.6
 limits==5.8.0
-cachetools==7.0.5
+MarkupSafe==3.0.3
 ordered-set==4.1.0
 packaging==26.0
-Deprecated==1.3.1
-typing_extensions==4.15.0
+protobuf==3.20.3
+pycparser==3.0
+pycryptodomex==3.23.0
+PyJWT==2.12.0
+python-dotenv==1.2.2
+requests==2.32.5
 six==1.17.0
+SQLAlchemy==2.0.48
+steam==1.4.4
+typing_extensions==4.15.0
+urllib3==2.6.3
+vdf==3.4
+webencodings==0.5.1
+Werkzeug==3.1.6
 wrapt==2.1.2
+zope.event==6.1
+zope.interface==8.2

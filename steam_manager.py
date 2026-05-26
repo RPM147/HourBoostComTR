@@ -95,6 +95,7 @@ class SteamAccountManager:
         self.logged_in = False
         self.boosting = False
         self.start_time = None
+        self.original_start_time = None
         self.app_ids = []
         self.persona_state = 1
         self._reconnect_attempts = 0
@@ -322,6 +323,7 @@ class SteamAccountManager:
         self.client.games_played(app_ids)
         self.boosting = True
         self.start_time = time.time()
+        self.original_start_time = time.time()
 
     def stop_boost(self):
         try:
@@ -333,6 +335,7 @@ class SteamAccountManager:
         if self.start_time:
             elapsed = time.time() - self.start_time
         self.start_time = None
+        self.original_start_time = None
         try:
             self.client.change_status(persona_state=EPersonaState.Online)
         except Exception:
@@ -350,6 +353,7 @@ class SteamAccountManager:
     def disconnect(self):
         self.boosting = False
         self.start_time = None
+        self.original_start_time = None
         try:
             self.client.games_played([])
         except Exception:
@@ -370,7 +374,7 @@ class SteamAccountManager:
             "steam_username": self.steam_username,
             "logged_in": self.logged_in,
             "boosting": self.boosting,
-            "start_time": self.start_time,
+            "start_time": self.original_start_time,
             "app_ids": self.app_ids,
             "persona_state": self.persona_state,
             "has_token": self.has_token(),
