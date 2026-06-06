@@ -74,6 +74,41 @@ def is_private_ip(ip_str):
         return True
 
 
+def _resolves_to_private_ip(hostname):
+    """Host adının özel/iç bir IP'ye çözümlenip çözümlenmediğini kontrol et."""
+    if not hostname:
+        return False
+    try:
+        import socket
+        # AF_UNSPEC (0): hem IPv4 hem IPv6 kayıtlarını döndür; ikisi de kontrol edilir.
+        for *_x, sockaddr in socket.getaddrinfo(
+            hostname, None, 0, socket.SOCK_STREAM
+        ):
+            if is_private_ip(sockaddr[0]):
+                return True
+    except OSError:
+        return False  # DNS hatası gerçek istekte başarısız olacak
+    return False
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Yönlendirme (redirect) hedeflerini de SSRF kontrolünden geçirir.
+    İzinli bir host açık-redirect ile iç IP'ye yönlendirse bile engellenir."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_safe_url(newurl):
+            logger.warning("Güvensiz redirect engellendi: %s", newurl)
+            raise ValueError(f"Güvensiz redirect engellendi: {newurl}")
+        host = urlparse(newurl).hostname
+        if _resolves_to_private_ip(host):
+            logger.warning("Redirect özel IP'ye çözümleniyor, engellendi: %s", host)
+            raise ValueError(f"Redirect özel IP'ye çözümleniyor: {host}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_safe_opener = urllib.request.build_opener(_SafeRedirectHandler)
+
+
 def safe_urlopen(url, timeout=10, **kwargs):
     """
     SSRF ve DNS Rebinding korumalı urlopen.
@@ -93,18 +128,12 @@ def safe_urlopen(url, timeout=10, **kwargs):
         raise ValueError(f"Güvensiz URL engellendi: {check_url}")
 
     hostname = urlparse(check_url).hostname
-    try:
-        import socket
-        ip_addresses = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
-        for _family, _socktype, _proto, _canonname, sockaddr in ip_addresses:
-            ip = sockaddr[0]
-            if is_private_ip(ip):
-                logger.warning("URL özel IP'ye çözümleniyor, engellendi: %s -> %s", hostname, ip)
-                raise ValueError(f"URL özel IP'ye çözümleniyor: {ip}")
-    except OSError:
-        pass  # DNS hatası gerçek istekte başarısız olacak
+    if _resolves_to_private_ip(hostname):
+        logger.warning("URL özel IP'ye çözümleniyor, engellendi: %s", hostname)
+        raise ValueError(f"URL özel IP'ye çözümleniyor: {hostname}")
 
-    return urllib.request.urlopen(req, timeout=timeout)
+    # Yönlendirmeler de doğrulanır (bkz. _SafeRedirectHandler).
+    return _safe_opener.open(req, timeout=timeout)
 
 
 # Geriye dönük uyumluluk için sınıf sarmalayıcı
@@ -144,6 +173,43 @@ app.config["WTF_CSRF_CHECK_DEFAULT"] = False
 
 db.init_app(app)
 
+# ── SQLite eşzamanlılık sertleştirme ──────────────────────────────
+# gevent altında çok sayıda greenlet eşzamanlı yazınca SQLite "database is
+# locked" hatası verebilir. WAL modu + busy_timeout bunu büyük ölçüde önler.
+# Listener Engine sınıfına bağlandığından sadece SQLite bağlantılarına
+# uygulanır (isinstance kontrolü); PostgreSQL'de no-op'tur.
+from sqlalchemy import event as _sa_event
+from sqlalchemy.engine import Engine as _SAEngine
+import sqlite3 as _sqlite3
+
+
+@_sa_event.listens_for(_SAEngine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    if isinstance(dbapi_connection, _sqlite3.Connection):
+        try:
+            cur = dbapi_connection.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=5000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.close()
+        except Exception as _e:
+            logger.error("SQLite PRAGMA ayarlanamadi: %s", _e)
+
+
+# ── DB Migration (Flask-Migrate / Alembic) ────────────────────────
+# Şema değişikliklerini düzgün yönetmek için. Kurulum sonrası ilk sefer:
+#   flask db init
+# Her şema değişikliğinde:
+#   flask db migrate -m "açıklama"   &&   flask db upgrade
+# Not: flask_migrate yalnızca CLI içindir, runtime için zorunlu değildir;
+# kurulu değilse uygulama yine de çalışır (aşağıda savunmacı import).
+try:
+    from flask_migrate import Migrate
+    migrate = Migrate(app, db)
+except ImportError:
+    logger.warning("flask_migrate kurulu degil; 'flask db' komutlari kullanilamaz.")
+
+
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -162,14 +228,20 @@ _timer_lock = RLock()
 _bg_reconnect_locks = set()
 
 def _clear_timers(acct_id):
+    # Referansları kilit altında çıkar, kill işlemini kilit dışında yap
+    # (kill context-switch yapabileceği için kilidi tutmamak gerekir).
+    current = gevent.getcurrent()
     with _timer_lock:
-        if acct_id in _active_timers:
-            for t in _active_timers[acct_id]:
-                try:
-                    t.kill()
-                except:
-                    pass
-            _active_timers.pop(acct_id, None)
+        timers = _active_timers.pop(acct_id, None)
+    if not timers:
+        return
+    for t in timers:
+        if t is current:
+            continue  # Bu fonksiyonu çağıran greenlet kendini öldürmesin
+        try:
+            t.kill()
+        except Exception:
+            pass
 
 def _add_timer(acct_id, glet):
     with _timer_lock:
@@ -295,7 +367,24 @@ def verify_api_token(token):
         if token in _token_blacklist:
             return None
 
-    return payload.get("user_id")
+    user_id = payload.get("user_id")
+
+    # Şifre değişimi / toplu oturum iptali sonrası eski token'ları reddet:
+    # token'ın iat'ı kullanıcının tokens_valid_after'ından önceyse geçersizdir.
+    iat = payload.get("iat")
+    if user_id and iat:
+        user = db.session.get(User, user_id)
+        if user is not None and user.tokens_valid_after:
+            try:
+                iat_dt = datetime.utcfromtimestamp(int(iat))
+            except (TypeError, ValueError, OSError):
+                return None
+            # Saniye granülaritesinde karşılaştır: değişimle aynı saniyede
+            # üretilen yeni token yanlışlıkla reddedilmesin.
+            if iat_dt < user.tokens_valid_after.replace(microsecond=0):
+                return None
+
+    return user_id
 
 
 def blacklist_token(token):
@@ -323,6 +412,18 @@ def blacklist_token(token):
         _cleanup_blacklist()
 
 
+def _invalidate_all_user_tokens(user):
+    """Kullanıcının tüm JWT token'larını ve aktif oturumlarını geçersiz kıl.
+    tokens_valid_after güncellenir; çağıran taraf commit etmelidir."""
+    user.tokens_valid_after = datetime.utcnow()
+    try:
+        UserSession.query.filter_by(user_id=user.id, is_active=True).update(
+            {"is_active": False}, synchronize_session=False
+        )
+    except Exception as e:
+        logger.error("Oturum toplu iptal hatasi: %s", e)
+
+
 # ───────────────────── Brute Force Koruması ─────────────────────
 
 _failed_logins: defaultdict = defaultdict(list)
@@ -334,11 +435,16 @@ _LOCKOUT_SECONDS = 300
 def is_locked_out(identifier: str) -> bool:
     now = time.time()
     with _failed_logins_lock:
-        _failed_logins[identifier] = [
-            t for t in _failed_logins[identifier]
+        recent = [
+            t for t in _failed_logins.get(identifier, [])
             if now - t < _LOCKOUT_SECONDS
         ]
-        return len(_failed_logins[identifier]) >= _LOCKOUT_MAX_ATTEMPTS
+        if recent:
+            _failed_logins[identifier] = recent
+        else:
+            # Süresi geçen kayıtlar bittiğinde key'i tamamen sil (bellek sızıntısını önle)
+            _failed_logins.pop(identifier, None)
+        return len(recent) >= _LOCKOUT_MAX_ATTEMPTS
 
 
 def record_failed_login(identifier: str):
@@ -357,10 +463,23 @@ def clear_failed_logins(identifier: str):
 # ───────────────────── Oturum Yardımcıları ─────────────────────
 
 def _get_client_ip() -> str:
+    """Gerçek istemci IP'sini döndür.
+
+    Site Cloudflare arkasında olduğundan, CF'in set ettiği 'CF-Connecting-IP'
+    başlığı gerçek istemciyi verir; yoksa ProxyFix ile düzeltilen
+    request.remote_addr'a düşülür.
+
+    GÜVENLİK NOTU: Bunun taklit edilemez olması için origin (port 5000)
+    yalnızca Cloudflare IP aralıklarından erişime kısıtlanmalıdır (firewall).
+    Aksi halde saldırgan Cloudflare'i atlayıp bu başlığı sahteleyebilir.
     """
-    Gerçek istemci IP'sini döndür.
-    ProxyFix kullandığımız için request.remote_addr güvenlidir.
-    """
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        try:
+            ipaddress.ip_address(cf_ip)
+            return cf_ip
+        except ValueError:
+            pass
     return request.remote_addr or "unknown"
 
 
@@ -499,11 +618,65 @@ def auto_reconnect_saved_accounts():
             _gevent.spawn(_bg_reconnect_single, acct)
 
 
+def _ensure_schema():
+    """Hafif, idempotent şema güncellemesi (Flask-Migrate kurulana dek köprü).
+    Mevcut DB'lerde eksik sütunları ekler; sütun zaten varsa no-op."""
+    try:
+        from sqlalchemy import inspect, text
+        inspector = inspect(db.engine)
+        cols = {c["name"] for c in inspector.get_columns("users")}
+        if "tokens_valid_after" not in cols:
+            col_type = "TIMESTAMP" if db.engine.dialect.name == "postgresql" else "DATETIME"
+            with db.engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN tokens_valid_after {col_type}"))
+            logger.info("Şema güncellendi: users.tokens_valid_after eklendi")
+
+        pcols = {c["name"] for c in inspector.get_columns("payments")}
+        if "match_token" not in pcols:
+            with db.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payments ADD COLUMN match_token VARCHAR(32)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payments_match_token ON payments (match_token)"))
+            logger.info("Şema güncellendi: payments.match_token eklendi")
+    except Exception as e:
+        logger.error("Şema güncelleme hatası: %s", e)
+
+
+def _reconcile_boost_state_on_startup():
+    """Restart sonrası DB'deki boost durumunu gerçeklikle hizala.
+
+    auto_reconnect bilinçli olarak devre dışıdır (kullanıcılara Steam giriş
+    bildirimi gitmemesi için), bu yüzden process yeniden başladığında hiçbir
+    boost gerçekte çalışmaz. is_boosting=True kalan tüm kayıtlar bayattır;
+    DB'nin gerçeklikle tutarlı kalması için temizlenir.
+
+    Not: Son checkpoint ile çökme arasındaki süre (en fazla ~15 dk)
+    güvenilir biçimde bilinemediğinden uydurma BoostLog yazılmaz."""
+    try:
+        stale = SteamAccount.query.filter(
+            db.or_(SteamAccount.is_boosting.is_(True),
+                   SteamAccount.target_stop_time.isnot(None))
+        ).all()
+        if stale:
+            for acct in stale:
+                acct.is_boosting = False
+                acct.target_stop_time = None
+            db.session.commit()
+            logger.info("Restart reconciliation: %d hesabin bayat boost durumu temizlendi", len(stale))
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Restart reconciliation hatasi: %s", e)
+
+
 with app.app_context():
     db.create_all()
+    _ensure_schema()
+    _reconcile_boost_state_on_startup()
 
 import gevent
-# gevent.spawn(auto_reconnect_saved_accounts) # Iptal edildi (Kullanici bildirim gitmemesi icin)
+# Restart davranışı (bkz. FIX.md Phase 5): auto_reconnect DEVRE DIŞI bırakıldı
+# (kullanıcılara Steam giriş bildirimi gitmemesi için). Bunun yerine başlangıçta
+# _reconcile_boost_state_on_startup() ile bayat boost durumu temizlenir.
+# gevent.spawn(auto_reconnect_saved_accounts)
 
 def _checkpoint_loop():
     while True:
@@ -620,35 +793,40 @@ def sanitize(text, maxlen=100):
     return bleach.clean(str(text).strip()[:maxlen])
 
 
-def extract_username_from_note(note: str):
+def resolve_payment_from_note(note: str):
+    """Webhook notundan ödeme sahibini GÜVENLİ biçimde çöz.
+
+    Yalnızca açık eşleştirme kodları kabul edilir:
+      - HB-xxxxxx  → /plan/checkout'ta üretilen benzersiz Payment.match_token
+      - SB-<id>    → kullanıcı ID'si (geriye dönük uyumluluk)
+    Serbest metinden kullanıcı-adı TAHMİNİ YAPILMAZ; bu, nota rastgele bir
+    kelime (ör. "admin") yazıldığında yanlış hesaba plan tanımlanmasını önler.
+
+    Dönüş: (user, payment_or_None)
+    """
     if not note:
-        return None
+        return None, None
     note = note.strip()
-    
-    m = re.search(r"SB-(\d+)", note)
+
+    m = re.search(r"HB-([0-9A-Fa-f]{6})", note, re.IGNORECASE)
+    if m:
+        token = "HB-" + m.group(1).upper()
+        payment = Payment.query.filter_by(match_token=token).first()
+        if payment and payment.user_id:
+            user = db.session.get(User, payment.user_id)
+            if user:
+                return user, payment
+
+    m = re.search(r"SB-(\d+)", note, re.IGNORECASE)
     if m:
         try:
-            user_id = int(m.group(1))
-            user = db.session.get(User, user_id)
+            user = db.session.get(User, int(m.group(1)))
             if user:
-                return user.username
+                return user, None
         except Exception:
             pass
 
-    # 1. Normalize steam names: if someone wrote "steam 123456", "steam-123456", or "steam123456", convert it to "steam_123456"
-    note = re.sub(r'(?i)steam[\s\-_]*(\d+)', r'steam_\1', note)
-
-    words = re.split(r"[\s,;:/\\|]+", note)
-    for word in words:
-        word = word.strip()
-        if len(word) < 3:
-            continue
-        # Case-insensitive exact match for username
-        user = User.query.filter(db.func.lower(User.username) == word.lower()).first()
-        if user:
-            return user.username
-            
-    return None
+    return None, None
 
 
 # ───────────────────── Middleware ─────────────────────
@@ -660,13 +838,21 @@ def add_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # NOT: script-src/style-src'de 'unsafe-inline' KALDI; mevcut arayüz baştan
+    # sona inline onclick/onsubmit handler'ları ve inline style'lar üzerine kurulu.
+    # Bunu nonce tabanlı CSP'ye geçirmek tüm template'lerdeki inline handler'ları
+    # addEventListener'a taşımayı gerektirir (ayrı, büyük bir frontend işi).
+    # Aşağıdaki ek direktifler ('unsafe-inline'ı bozmadan) güvenliği artırır:
     csp = (
         "default-src 'self'; "
-        "script-src 'self' https://cdn.jsdelivr.net https://js.stripe.com 'unsafe-inline'; "
+        "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
         "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
         "font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' data: https:; "
-        "connect-src 'self' https://api.shopier.com https://api.steampowered.com;"
+        "connect-src 'self' https://api.shopier.com https://api.steampowered.com; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'self';"
     )
     response.headers['Content-Security-Policy'] = csp
     if app.config.get('SESSION_COOKIE_SECURE', False):
@@ -699,6 +885,17 @@ def auto_csrf_protect():
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return  # Salt-okunur metodlarda CSRF gerekmez
 
+    # @csrf.exempt ile işaretlenmiş endpoint'leri atla (ör. Shopier webhook).
+    # WTF_CSRF_CHECK_DEFAULT=False olduğundan exempt mantığı otomatik
+    # çalışmaz; csrf.protect() exempt view'ları dikkate almadığı için
+    # burada elle kontrol etmemiz gerekir.
+    if request.endpoint:
+        view = app.view_functions.get(request.endpoint)
+        if view is not None:
+            dest = f"{view.__module__}.{view.__name__}"
+            if view in csrf._exempt_views or dest in csrf._exempt_views:
+                return
+
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:]
@@ -723,6 +920,11 @@ def check_plan_expiry():
     last = _plan_expiry_cache.get(uid, 0)
     if now - last < _PLAN_CHECK_INTERVAL:
         return
+    # Sınırsız büyümeyi önle: cache şiştiğinde aralık dışı (bayat) kayıtları temizle.
+    if len(_plan_expiry_cache) > 5000:
+        cutoff = now - _PLAN_CHECK_INTERVAL
+        for k in [k for k, v in _plan_expiry_cache.items() if v < cutoff]:
+            _plan_expiry_cache.pop(k, None)
     _plan_expiry_cache[uid] = now
     user = db.session.get(User, uid)
     if not user:
@@ -732,6 +934,20 @@ def check_plan_expiry():
             user.plan = "free"
             user.plan_expires = None
             db.session.commit()
+
+    # Oturum "son görülme" güncellemesi (Bearer ile gelen istekler için).
+    # Bu blok 5 dk throttle'lı (fonksiyon başındaki _plan_expiry_cache kontrolü),
+    # dolayısıyla her istekte DB yazımı yapılmaz.
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        hint = auth_header[7:][:16]
+        try:
+            UserSession.query.filter_by(token_hint=hint, is_active=True).update(
+                {"last_seen": datetime.utcnow()}, synchronize_session=False
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
 
 # ───────────────────── Sayfalar (TR) ─────────────────────
@@ -873,6 +1089,8 @@ def session_check():
         "logged_in": True,
         "username": user.username,
         "is_admin": user.is_admin,
+        # Steam ile kayıt olup henüz kendi şifresini belirlememiş kullanıcı
+        "is_steam_only": bool(user.steam_id) and (user.email or "").endswith("@steamlogin.hourboost"),
     })
 
 
@@ -936,10 +1154,12 @@ def register():
 
     gevent.spawn(mailer.send_verification_email, e, u, verification_token, lang=lang)
 
+    # Mail gönderimi async (gevent.spawn) olduğundan başarısını burada bilemeyiz;
+    # frontend yalnızca "verify_email" bayrağını kullanıyor. Yanıltıcı
+    # "mail_sent: true" alanı kaldırıldı.
     return jsonify({
         "ok": True,
         "verify_email": True,
-        "mail_sent": True,
     })
 
 
@@ -1006,10 +1226,9 @@ def resend_verification():
     user.verification_sent_at = datetime.utcnow()
     db.session.commit()
 
-    sent = mailer.send_verification_email(user.email, user.username, token, lang=lang)
-    if sent:
-        return jsonify({"ok": True, "message": "Verification email sent." if lang == "en" else "Dogrulama maili gonderildi."})
-    return jsonify({"ok": False, "error": "Failed to send email. Please try again later." if lang == "en" else "Mail gonderilemedi. Lutfen daha sonra tekrar deneyin."})
+    # Mail gönderimini bloklamadan arka planda yap (register/forgot ile tutarlı).
+    gevent.spawn(mailer.send_verification_email, user.email, user.username, token, lang=lang)
+    return jsonify({"ok": True, "message": "Verification email sent." if lang == "en" else "Dogrulama maili gonderildi."})
 
 
 # ───────────────────── Şifre Sıfırlama ─────────────────────
@@ -1092,6 +1311,7 @@ def reset_password():
     user.set_password(new_password)
     user.reset_token = None
     user.reset_token_expires = None
+    _invalidate_all_user_tokens(user)
     db.session.commit()
     logger.info("Sifre sifirlandi: %s", user.username)
     return jsonify({"ok": True, "message": "Your password has been updated successfully."})
@@ -1115,9 +1335,51 @@ def change_password():
         return jsonify({"ok": False, "error": "Current password is incorrect."})
 
     user.set_password(new_password)
+    _invalidate_all_user_tokens(user)
     db.session.commit()
+
+    # Diğer tüm oturumlar iptal edildi; mevcut cihazın oturumda kalması
+    # için taze bir token üret ve döndür (frontend bunu saklamalı).
+    new_token = generate_api_token(user.id)
+    _create_session_record(user.id, new_token)
+    session["user_id"] = user.id
+
     logger.info("Sifre degistirildi: %s", user.username)
-    return jsonify({"ok": True, "message": "Your password has been updated successfully."})
+    return jsonify({
+        "ok": True,
+        "message": "Your password has been updated successfully.",
+        "token": new_token,
+    })
+
+
+@app.route("/account/set-password", methods=["POST"])
+@login_required
+@limiter.limit("5 per hour")
+def set_initial_password():
+    """Steam ile giriş yapıp henüz şifresi olmayan kullanıcıların, MEVCUT şifre
+    istenmeden ilk şifrelerini belirlemesini sağlar (dead-end çözümü).
+    Yalnızca placeholder e-postalı Steam hesaplarında çalışır; gerçek şifre/
+    e-posta belirlendikten sonra normal /change-password kullanılmalıdır."""
+    user = g.user
+    if not (user.steam_id and (user.email or "").endswith("@steamlogin.hourboost")):
+        return jsonify({"ok": False, "error": "This option is only for Steam-login accounts without a password. Use 'Change Password'."})
+
+    new_password = request.json.get("new_password", "")
+    if len(new_password) < 6 or not any(c.isdigit() for c in new_password) or not any(c.isalpha() for c in new_password):
+        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers."})
+
+    user.set_password(new_password)
+    db.session.commit()
+
+    new_token = generate_api_token(user.id)
+    _create_session_record(user.id, new_token)
+    session["user_id"] = user.id
+    logger.info("Steam kullanicisi ilk sifresini belirledi: %s", user.username)
+    return jsonify({
+        "ok": True,
+        "message": "Password set. You can now also log in with your username and password, then change your email.",
+        "token": new_token,
+    })
 
 
 # ───────────────────── E-posta Değiştirme ─────────────────────
@@ -1155,7 +1417,7 @@ def change_email():
     except Exception as e:
         db.session.rollback()
         logger.error("E-posta degistirme sirasinda veritabani hatasi: %s", e)
-        return jsonify({"ok": False, "error": "An error occurred." if lang == "en" else "Bir hata olustu."})
+        return jsonify({"ok": False, "error": "An error occurred."})
 
     user_lang = getattr(user, "lang", "tr") or "tr"
     gevent.spawn(mailer.send_email_change_email, new_email, user.username, token, user_lang)
@@ -1178,6 +1440,21 @@ def confirm_email_change(token):
         return render_template(template, success=False,
             message="This link has expired. Please create a new request." if lang == "en"
             else "Bu linkin süresi dolmuş. Lütfen yeni talep oluşturun.")
+
+    # İstek ile onay arasında yeni e-posta başkası tarafından alınmış olabilir;
+    # unique constraint'ten kaynaklı 500 yerine temiz hata döndür.
+    taken = User.query.filter(
+        User.email == user.email_change_new,
+        User.id != user.id,
+    ).first()
+    if taken:
+        user.email_change_token = None
+        user.email_change_new = None
+        user.email_change_expires = None
+        db.session.commit()
+        return render_template(template, success=False,
+            message="This email address is now in use by another account. Please try again." if lang == "en"
+            else "Bu e-posta adresi artık başka bir hesap tarafından kullanılıyor. Lütfen tekrar deneyin.")
 
     user.email = user.email_change_new
     user.email_change_token = None
@@ -1229,23 +1506,13 @@ def site_login():
 
 @app.route("/site_logout", methods=["POST"])
 def site_logout():
-    uid = None
     auth_header = request.headers.get("Authorization", "")
     token = None
-
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        uid = verify_api_token(token)
-    if not uid:
-        uid = session.get("user_id")
 
-    if uid:
-        accounts = SteamAccount.query.filter_by(user_id=uid).all()
-        for acct in accounts:
-            mgr = boost_service.get(acct.id)
-            if mgr:
-                mgr.disconnect()
-
+    # Not: Web'den çıkış boost'u DURDURMAZ; boost sunucu tarafında çalışmaya
+    # devam eder. Boost yalnızca /boost/toggle veya hesap silme ile durdurulur.
     if token:
         blacklist_token(token)
         _deactivate_session_by_token(token)
@@ -1394,11 +1661,27 @@ def plan_checkout():
         "basic": "https://www.shopier.com/hourboostcomtr/45175746",
         "premium": "https://www.shopier.com/hourboostcomtr/45175760",
     }
-    logger.info("Checkout baslatildi: user=%s plan=%s", user.username, plan)
+
+    # Ödemeyi kullanıcıya GÜVENLİ eşlemek için benzersiz kodlu pending Payment.
+    # Mevcut (kodlu) pending varsa yeniden kullan; yoksa yeni kod üret.
+    payment = (Payment.query
+               .filter_by(user_id=user.id, status="pending", plan=plan)
+               .order_by(Payment.created_at.desc()).first())
+    if payment and payment.match_token:
+        token = payment.match_token
+    else:
+        token = "HB-" + secrets.token_hex(3).upper()
+        payment = Payment(user_id=user.id, amount=Config.PLANS[plan]["price"],
+                          plan=plan, status="pending", match_token=token)
+        db.session.add(payment)
+        db.session.commit()
+
+    logger.info("Checkout baslatildi: user=%s plan=%s token=%s", user.username, plan, token)
     return jsonify({
         "ok": True,
         "shopier_url": shopier_links[plan],
-        "note": f"Write your HourBoost username in the order note: {user.username}",
+        "match_token": token,
+        "note": f"Order note code: {token}",
     })
 
 
@@ -1433,7 +1716,13 @@ def shopier_webhook():
     event_type = request.headers.get("Shopier-Event", "") or data.get("event", "")
     logger.info("Shopier webhook alindi: event=%s", event_type)
 
-    if event_type != "order.created":
+    # Shopier sürümüne göre event adı değişebiliyor (order.created /
+    # order.fulfilled / payment.completed). Bilinen bir event adı varsa ve
+    # kabul listesinde değilse atla; event adı hiç yoksa (imza zaten
+    # doğrulandığından) işleme devam et.
+    ACCEPTED_EVENTS = {"order.created", "order.fulfilled", "payment.completed"}
+    if event_type and event_type not in ACCEPTED_EVENTS:
+        logger.info("Shopier webhook: islenmeyen event=%s, atlandi", event_type)
         return jsonify({"ok": True}), 200
 
     order = data
@@ -1453,21 +1742,35 @@ def shopier_webhook():
         logger.error("Shopier webhook: bilinmeyen urun ID=%s", product_id)
         return jsonify({"error": "Unknown product"}), 400
 
-    username = extract_username_from_note(buyer_note)
-    user = User.query.filter_by(username=username).first() if username else None
+    user, matched_payment = resolve_payment_from_note(buyer_note)
     prices = {"basic": 29.99, "premium": 59.99}
+
+    from sqlalchemy.exc import IntegrityError
 
     if not user:
         logger.error("Shopier webhook: kullanici bulunamadi note='%s'", buyer_note)
         unmatched = Payment(user_id=None, amount=prices.get(plan, 0), plan=plan,
                            status="unmatched", transaction_id=shopier_txn)
         db.session.add(unmatched)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # Eşzamanlı ikinci webhook aynı txn'i araya girip eklemiş olabilir.
+            db.session.rollback()
+            logger.info("Shopier webhook: eszamanli duplicate txn=%s (unmatched), atlandi", shopier_txn)
+            return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
         return jsonify({"ok": True, "warning": "User not found, saved as unmatched"}), 200
 
-    payment = Payment.query.filter_by(user_id=user.id, status="pending", plan=plan).order_by(Payment.created_at.desc()).first()
+    # Token ile gelen pending ödemeyi tercih et; yoksa user+plan pending ara;
+    # o da yoksa yeni completed kayıt oluştur. (Ürün ID'sinden gelen plan otoriter.)
+    payment = matched_payment
+    if payment is None:
+        payment = (Payment.query
+                   .filter_by(user_id=user.id, status="pending", plan=plan)
+                   .order_by(Payment.created_at.desc()).first())
     if payment:
         payment.status = "completed"
+        payment.plan = plan
         payment.transaction_id = shopier_txn
     else:
         payment = Payment(user_id=user.id, amount=prices[plan], plan=plan,
@@ -1477,7 +1780,13 @@ def shopier_webhook():
     user.plan = plan
     user.plan_expires = datetime.utcnow() + timedelta(days=3650)
     user.plan_activated_at = datetime.utcnow()
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # transaction_id unique kisiti: ayni txn eszamanli islenmis.
+        db.session.rollback()
+        logger.info("Shopier webhook: eszamanli duplicate txn=%s, atlandi", shopier_txn)
+        return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
     logger.info("Shopier webhook: plan aktif edildi user=%s plan=%s txn=%s", user.username, plan, shopier_txn)
     return jsonify({"ok": True}), 200
 
@@ -1797,9 +2106,12 @@ def toggle_boost():
             if mgr2 and mgr2.boosting:
                 boost_start2 = mgr2.start_time
                 elapsed2 = mgr2.stop_boost()
-                if elapsed2 > 0 and boost_start2:
-                    with app.app_context():
-                        acct2 = db.session.get(SteamAccount, acct_id)
+                with app.app_context():
+                    acct2 = db.session.get(SteamAccount, acct_id)
+                    if acct2:
+                        acct2.is_boosting = False
+                        acct2.target_stop_time = None
+                    if elapsed2 > 0 and boost_start2:
                         log2 = BoostLog(
                             account_id=acct_id,
                             user_id=_uid_daily,
@@ -1810,8 +2122,9 @@ def toggle_boost():
                             app_ids_json=json.dumps(acct2.app_ids()) if acct2 else "[]",
                         )
                         db.session.add(log2)
-                        db.session.commit()
+                    db.session.commit()
                 logger.info("[acct:%s] Limit/zamanlayici doldu", acct_id)
+            _clear_timers(acct_id)
 
         _add_timer(acct_id, gevent.spawn(_auto_stop_on_limit))
 
@@ -1827,9 +2140,12 @@ def toggle_boost():
                 if mgr_t and mgr_t.boosting:
                     boost_start_t = mgr_t.start_time
                     elapsed_t = mgr_t.stop_boost()
-                    if elapsed_t > 0 and boost_start_t:
-                        with app.app_context():
-                            acct_t = db.session.get(SteamAccount, acct_id)
+                    with app.app_context():
+                        acct_t = db.session.get(SteamAccount, acct_id)
+                        if acct_t:
+                            acct_t.is_boosting = False
+                            acct_t.target_stop_time = None
+                        if elapsed_t > 0 and boost_start_t:
                             log_t = BoostLog(
                                 account_id=acct_id,
                                 user_id=_uid_timer,
@@ -1840,8 +2156,9 @@ def toggle_boost():
                                 app_ids_json=json.dumps(acct_t.app_ids()) if acct_t else "[]",
                             )
                             db.session.add(log_t)
-                            db.session.commit()
+                        db.session.commit()
                     logger.info("[acct:%s] Timer finished (%.1f hours)", acct_id, timer_hours)
+                _clear_timers(acct_id)
 
             _add_timer(acct_id, gevent.spawn(_auto_stop_on_timer))
 
@@ -1869,9 +2186,12 @@ def toggle_boost():
             if mgr3 and mgr3.boosting:
                 boost_start3 = mgr3.start_time
                 elapsed3 = mgr3.stop_boost()
-                if elapsed3 > 0 and boost_start3:
-                    with app.app_context():
-                        acct3 = db.session.get(SteamAccount, acct_id)
+                with app.app_context():
+                    acct3 = db.session.get(SteamAccount, acct_id)
+                    if acct3:
+                        acct3.is_boosting = False
+                        acct3.target_stop_time = None
+                    if elapsed3 > 0 and boost_start3:
                         log3 = BoostLog(
                             account_id=acct_id,
                             user_id=_uid_total,
@@ -1882,8 +2202,9 @@ def toggle_boost():
                             app_ids_json=json.dumps(acct3.app_ids()) if acct3 else "[]",
                         )
                         db.session.add(log3)
-                        db.session.commit()
+                    db.session.commit()
                 logger.info("[acct:%s] Total limit reached", acct_id)
+            _clear_timers(acct_id)
 
         _add_timer(acct_id, gevent.spawn(_auto_stop_on_total_limit))
 
@@ -1902,6 +2223,7 @@ def toggle_boost():
     else:
         acct_db.target_stop_time = None
         
+    acct_db.is_boosting = True
     db.session.commit()
 
     mgr.start_boost(ids, acct_db.persona_state)
@@ -2210,6 +2532,7 @@ def steam_profile():
 
 
 @app.route("/game_search")
+@limiter.limit("30 per minute")
 def game_search():
     term = request.args.get("q", "").strip()
     if not term:
@@ -2231,6 +2554,7 @@ def game_search():
 
 
 @app.route("/game_info", methods=["POST"])
+@limiter.limit("30 per minute")
 def game_info():
     app_ids = request.json.get("app_ids", [])
     results = {}
@@ -2324,7 +2648,14 @@ def admin_users():
     search = request.args.get("q", "").strip()
     query = User.query
     if search:
-        query = query.filter(db.or_(User.username.ilike(f"%{search}%"), User.email.ilike(f"%{search}%")))
+        # LIKE özel karakterlerini (\ % _) escape et; aksi halde "%"/"_" wildcard
+        # olarak çalışıp tüm tabloyu tarayabilir.
+        safe = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{safe}%"
+        query = query.filter(db.or_(
+            User.username.ilike(like, escape="\\"),
+            User.email.ilike(like, escape="\\"),
+        ))
     users = query.order_by(User.created_at.desc()).paginate(page=page, per_page=20, error_out=False)
     return jsonify({
         "users": [{
@@ -2352,6 +2683,8 @@ def admin_update_user():
         return jsonify({"ok": False, "error": "User not found."})
 
     if "plan" in data:
+        if data["plan"] not in ("free", "basic", "premium"):
+            return jsonify({"ok": False, "error": "Invalid plan."})
         user.plan = data["plan"]
         if data["plan"] != "free":
             user.plan_expires = datetime.utcnow() + timedelta(days=3650)

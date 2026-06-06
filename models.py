@@ -18,6 +18,9 @@ class User(db.Model):
     is_admin = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime)
+    # Bu tarihten ÖNCE üretilmiş JWT token'lar geçersiz sayılır
+    # (şifre değişimi / oturum iptali sonrası set edilir).
+    tokens_valid_after = db.Column(db.DateTime, nullable=True)
     lang = db.Column(db.String(5), default="tr", nullable=True)
     steam_id = db.Column(db.String(20), nullable=True, unique=True)
     steam_avatar = db.Column(db.String(256), nullable=True)
@@ -92,6 +95,8 @@ class Payment(db.Model):
     plan = db.Column(db.String(20))
     status = db.Column(db.String(20), default="pending")
     transaction_id = db.Column(db.String(100), unique=True, nullable=True)
+    # Webhook'ta ödemeyi kullanıcıya güvenli eşlemek için benzersiz kod (HB-xxxxxx)
+    match_token = db.Column(db.String(32), nullable=True, index=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 

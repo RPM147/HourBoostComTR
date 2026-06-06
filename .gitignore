@@ -1,17 +1,16 @@
-```
-# Database files
-*.db
-
-# Environment
 .env
-.env.local
-.env.*
+*.db
+__pycache__/
 
-# Logs
+# Sanal ortam
+venv/
+env/
+
+# Gizli veriler — ASLA commit etme
+tokens/
+sentry/
+.cred_key
+
+# Loglar
+logs/
 *.log
-
-# Temporary files
-*.tmp
-*.swp
-*~
-```

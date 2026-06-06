@@ -1,6 +1,7 @@
 """
 Shopier entegrasyonu — PAT tabanlı yeni yöntem.
-Musteri Shopier dukkanindan satin alir -> order.fulfilled webhook gelir ->
+Musteri Shopier dukkanindan satin alir -> siparis webhook'u gelir
+(order.created / order.fulfilled / payment.completed) ->
 kullanici adi alinip plan aktif edilir.
 """
 import hmac
@@ -9,6 +10,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,12 @@ API_BASE = "https://api.shopier.com/v1"
 
 def _api_request(pat, method, path, body=None):
     url = API_BASE + path
+    # SSRF/path-injection savunması: nihai URL yalnızca https://api.shopier.com
+    # olmalı (app.py'deki safe_urlopen ile tutarlı niyet).
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "api.shopier.com":
+        logger.error("Shopier API guvensiz URL engellendi: %s", url)
+        return None
     headers = {
         "Authorization": f"Bearer {pat}",
         "Content-Type": "application/json",
@@ -42,7 +50,8 @@ def _api_request(pat, method, path, body=None):
 
 def get_order(pat, order_id):
     """Tek siparis detayi."""
-    return _api_request(pat, "GET", f"/orders/{order_id}")
+    safe_id = urllib.parse.quote(str(order_id), safe="")
+    return _api_request(pat, "GET", f"/orders/{safe_id}")
 
 
 def verify_webhook(raw_body: bytes, signature_header: str, webhook_secret: str) -> bool:
