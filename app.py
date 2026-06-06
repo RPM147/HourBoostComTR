@@ -1663,18 +1663,28 @@ def plan_checkout():
     }
 
     # Ödemeyi kullanıcıya GÜVENLİ eşlemek için benzersiz kodlu pending Payment.
-    # Mevcut (kodlu) pending varsa yeniden kullan; yoksa yeni kod üret.
-    payment = (Payment.query
-               .filter_by(user_id=user.id, status="pending", plan=plan)
-               .order_by(Payment.created_at.desc()).first())
-    if payment and payment.match_token:
-        token = payment.match_token
-    else:
+    # TEK AKTİF PENDING kuralı: kullanıcının bu plandaki pending'ini yeniden kullan,
+    # DİĞER tüm pending ödemelerini "cancelled" yap. Böylece admin onay kuyruğunda
+    # aynı kullanıcı için birden fazla plan (örn. hem basic hem premium) görünmez.
+    # Not: iptal edilen kayıtların match_token'ı durur; kullanıcı eski bir kodla
+    # ödese bile webhook token ile eşleştirmeye devam eder.
+    pendings = (Payment.query
+                .filter_by(user_id=user.id, status="pending")
+                .order_by(Payment.created_at.desc()).all())
+    payment = None
+    for p in pendings:
+        if payment is None and p.plan == plan and p.match_token:
+            payment = p          # bu plandaki en güncel kodlu pending'i koru
+        else:
+            p.status = "cancelled"   # diğer planlar + fazlalık duplikeler
+    if payment is None:
         token = "HB-" + secrets.token_hex(3).upper()
         payment = Payment(user_id=user.id, amount=Config.PLANS[plan]["price"],
                           plan=plan, status="pending", match_token=token)
         db.session.add(payment)
-        db.session.commit()
+    else:
+        token = payment.match_token
+    db.session.commit()
 
     logger.info("Checkout baslatildi: user=%s plan=%s token=%s", user.username, plan, token)
     return jsonify({
@@ -1703,6 +1713,24 @@ def shopier_webhook():
 
     raw_body = request.get_data()
     signature = request.headers.get("Shopier-Signature", "")
+
+    # ── GEÇİCİ TANI LOGU (webhook teşhisi — sorun çözülünce KALDIRILACAK) ──
+    # Amaç: webhook app'e ulaşıyor mu, hangi imza başlığıyla geliyor, bizim
+    # hesapladığımız HMAC ile eşleşiyor mu? (Gövde içeriği/PII loglanmaz.)
+    try:
+        _all_hdrs = list(request.headers.keys())
+        _sig_like = {k: v for k, v in request.headers.items()
+                     if any(s in k.lower() for s in ("sign", "hmac", "shopier"))}
+        _expected = hmac.new(Config.SHOPIER_WEBHOOK_SECRET.encode("utf-8"),
+                             raw_body, hashlib.sha256).hexdigest()
+        logger.warning(
+            "WEBHOOK-TANI ip=%s ua=%r body_len=%d gelen_imza=%r hesaplanan=%r imza_basliklari=%r tum_basliklar=%r",
+            _get_client_ip(), request.headers.get("User-Agent", ""),
+            len(raw_body), signature, _expected, _sig_like, _all_hdrs,
+        )
+    except Exception as _e:
+        logger.warning("WEBHOOK-TANI log hatasi: %s", _e)
+    # ── /GEÇİCİ TANI LOGU ──
 
     if not shopier_lib.verify_webhook(raw_body, signature, Config.SHOPIER_WEBHOOK_SECRET):
         logger.warning("Shopier webhook: IMZA HATASI!")
@@ -2709,7 +2737,9 @@ def admin_payments():
         return jsonify({"error": "Unauthorized"}), 403
 
     payments = (
-        Payment.query.order_by(db.case((Payment.status == "unmatched", 0), else_=1), Payment.created_at.desc())
+        Payment.query
+        .filter(Payment.status != "cancelled")
+        .order_by(db.case((Payment.status == "unmatched", 0), else_=1), Payment.created_at.desc())
         .limit(50).all()
     )
 
