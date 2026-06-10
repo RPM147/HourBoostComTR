@@ -35,6 +35,10 @@ class Config:
     WTF_CSRF_ENABLED = True
     WTF_CSRF_TIME_LIMIT = 3600
 
+    # duration_days: ödeme/onay sonrası planın geçerlilik süresi (gün).
+    # None = süresiz (plan_expires hiç set edilmez). Eskiden kod içinde
+    # sabit 3650 gün (~10 yıl) kullanılıyordu; gerçek fatura dönemi burada
+    # tek yerden yönetilir (bkz. FIX.md Phase 2 minor 3).
     PLANS = {
         "free": {
             "max_accounts": 1,
@@ -42,6 +46,7 @@ class Config:
             "daily_hours": 8,
             "total_hours": None,
             "price": 0,
+            "duration_days": None,
         },
         "basic": {
             "max_accounts": 3,
@@ -49,6 +54,7 @@ class Config:
             "daily_hours": None,
             "total_hours": 1500,
             "price": 29.99,
+            "duration_days": None,
         },
         "premium": {
             "max_accounts": 10,
@@ -56,6 +62,7 @@ class Config:
             "daily_hours": None,
             "total_hours": 3500,
             "price": 59.99,
+            "duration_days": None,
         },
     }
 

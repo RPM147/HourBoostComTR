@@ -11,8 +11,6 @@ import re
 import bleach
 import mailer
 import jwt as pyjwt
-import hmac
-import hashlib
 import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
@@ -149,7 +147,6 @@ from collections import defaultdict
 from flask import Flask, request, jsonify, session, g, render_template
 from flask import redirect as flask_redirect
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from steam.enums import EResult
 from flask_wtf.csrf import CSRFProtect
 
@@ -172,6 +169,14 @@ csrf = CSRFProtect(app)
 app.config["WTF_CSRF_CHECK_DEFAULT"] = False
 
 db.init_app(app)
+
+# Üretim ortamı kontrolü (ISSUES.md #16): SQLite tek-worker gunicorn altında
+# çalışır ama ödeme alan bir uygulama için PostgreSQL önerilir. Sesli uyar.
+if not app.debug and "sqlite" in app.config["SQLALCHEMY_DATABASE_URI"].lower():
+    logger.warning(
+        "SQLite veritabani kullaniliyor (DATABASE_URL ayarlanmamis olabilir). "
+        "Uretimde PostgreSQL onerilir; bkz. .env.example"
+    )
 
 # ── SQLite eşzamanlılık sertleştirme ──────────────────────────────
 # gevent altında çok sayıda greenlet eşzamanlı yazınca SQLite "database is
@@ -210,8 +215,15 @@ except ImportError:
     logger.warning("flask_migrate kurulu degil; 'flask db' komutlari kullanilamaz.")
 
 
+def _limiter_key_func():
+    # Rate limiter ile brute-force kilidi AYNI istemci IP tanımını kullanmalı
+    # (ISSUES.md #4); ikisi de _get_client_ip()'e dayanır. Fonksiyon aşağıda
+    # tanımlıdır; isim istek anında çözüldüğü için sorun olmaz.
+    return _get_client_ip()
+
+
 limiter = Limiter(
-    get_remote_address,
+    _limiter_key_func,
     app=app,
     default_limits=["200 per hour"],
     storage_uri=app.config.get("LIMITER_STORAGE_URI", "memory://"),
@@ -428,7 +440,11 @@ def _invalidate_all_user_tokens(user):
 
 _failed_logins: defaultdict = defaultdict(list)
 _failed_logins_lock = RLock()
-_LOCKOUT_MAX_ATTEMPTS = 5
+# Kilit YALNIZCA IP bazlıdır. Kullanıcı-adı bazlı kilit kaldırıldı: saldırgan
+# kurbanın kullanıcı adıyla bilerek yanlış şifre göndererek hesabı sürekli
+# kilitleyebiliyordu (hedefli DoS, ISSUES.md #3). Buna karşılık IP eşiği
+# 5'ten 10'a çıkarıldı.
+_LOCKOUT_MAX_ATTEMPTS = 10
 _LOCKOUT_SECONDS = 300
 
 
@@ -545,79 +561,6 @@ def _get_request_lang() -> str:
 
 # ───────────────────── Sunucu Başlangıcı ─────────────────────
 
-def auto_reconnect_saved_accounts():
-    import gevent as _gevent
-    _gevent.sleep(3)
-    with app.app_context():
-        accounts = SteamAccount.query.all()
-        logger.info("Otomatik reconnect baslatiliyor: %d hesap", len(accounts))
-        
-        def _bg_reconnect_single(acct):
-            mgr = boost_service.get_or_create(acct.id, acct.steam_username)
-            if mgr.has_credentials():
-                try:
-                    result = mgr.login()
-                    if result == EResult.OK:
-                        mgr.app_ids = acct.app_ids()
-                        mgr.persona_state = acct.persona_state
-                        if acct.is_boosting and mgr.app_ids:
-                            mgr.start_boost(mgr.app_ids, mgr.persona_state)
-                        logger.info("[%s] Otomatik reconnect basarili", acct.steam_username)
-                        
-                        # Eger onceden kalma bir target_stop_time varsa, timer'i canlandir
-                        if acct.target_stop_time:
-                            now = datetime.utcnow()
-                            if acct.target_stop_time > now:
-                                rem_sec = (acct.target_stop_time - now).total_seconds()
-                                def _resume_timer(a_id=acct.id, u_id=acct.user_id, rem=rem_sec):
-                                    _gevent.sleep(rem)
-                                    m = boost_service.get(a_id)
-                                    if m and m.boosting:
-                                        bs = m.start_time
-                                        el = m.stop_boost()
-                                        if el > 0 and bs:
-                                            with app.app_context():
-                                                a2 = db.session.get(SteamAccount, a_id)
-                                                if a2:
-                                                    a2.target_stop_time = None
-                                                    lg = BoostLog(
-                                                        account_id=a_id, user_id=u_id,
-                                                        started_at=datetime.utcfromtimestamp(bs),
-                                                        stopped_at=datetime.utcnow(), duration_seconds=int(el),
-                                                        games_count=len(a2.app_ids()), app_ids_json=json.dumps(a2.app_ids())
-                                                    )
-                                                    db.session.add(lg)
-                                                    db.session.commit()
-                                        logger.info("[%s] Reconnect sonrasi timer doldu", a_id)
-                                _add_timer(acct.id, _gevent.spawn(_resume_timer))
-                            else:
-                                # Süre geçmiş, doğrudan kapat logla
-                                logger.info("[%s] Reconnect sirasinda timer suresi coktan dolmus, kapatiliyor.", acct.steam_username)
-                                bs = mgr.start_time or time.time()
-                                mgr.stop_boost()
-                                acct.target_stop_time = None
-                                lg = BoostLog(
-                                    account_id=acct.id, user_id=acct.user_id,
-                                    started_at=datetime.utcfromtimestamp(bs),
-                                    stopped_at=datetime.utcnow(), duration_seconds=1,
-                                    games_count=len(acct.app_ids()), app_ids_json=json.dumps(acct.app_ids())
-                                )
-                                db.session.add(lg)
-                                db.session.commit()
-                    elif result in (
-                        EResult.AccountLoginDeniedNeedTwoFactor,
-                        EResult.TwoFactorCodeMismatch,
-                    ):
-                        logger.info("[%s] 2FA gerekiyor, manuel giris bekleniyor", acct.steam_username)
-                    else:
-                        logger.warning("[%s] Otomatik reconnect basarisiz: %s", acct.steam_username, result)
-                except Exception as e:
-                    logger.warning("[%s] Otomatik reconnect hatasi: %s", acct.steam_username, e)
-
-        for acct in accounts:
-            _gevent.spawn(_bg_reconnect_single, acct)
-
-
 def _ensure_schema():
     """Hafif, idempotent şema güncellemesi (Flask-Migrate kurulana dek köprü).
     Mevcut DB'lerde eksik sütunları ekler; sütun zaten varsa no-op."""
@@ -673,10 +616,11 @@ with app.app_context():
     _reconcile_boost_state_on_startup()
 
 import gevent
-# Restart davranışı (bkz. FIX.md Phase 5): auto_reconnect DEVRE DIŞI bırakıldı
-# (kullanıcılara Steam giriş bildirimi gitmemesi için). Bunun yerine başlangıçta
-# _reconcile_boost_state_on_startup() ile bayat boost durumu temizlenir.
-# gevent.spawn(auto_reconnect_saved_accounts)
+# Restart davranışı: auto_reconnect BİLİNÇLİ olarak yoktur (kullanıcılara Steam
+# giriş bildirimi gitmemesi için; ürün kararı). Restart sonrası boostlar
+# otomatik devam etmez; başlangıçta _reconcile_boost_state_on_startup() bayat
+# boost durumunu temizler. Ölü auto_reconnect_saved_accounts() fonksiyonu
+# kaldırıldı (ISSUES.md #19).
 
 def _checkpoint_loop():
     while True:
@@ -767,13 +711,8 @@ gevent.spawn(periodic_token_cleanup)
 def login_required(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        user_id = None
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            user_id = verify_api_token(token)
-        if not user_id:
-            user_id = session.get("user_id")
+        # JWT istek başında _resolve_bearer_token ile TEK SEFER doğrulandı.
+        user_id = g.get("_jwt_user_id") or session.get("user_id")
         if not user_id:
             if request.method != 'GET' or request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
                 return jsonify({"ok": False, "error": "Not logged in."}), 401
@@ -791,6 +730,17 @@ def sanitize(text, maxlen=100):
     if not text:
         return ""
     return bleach.clean(str(text).strip()[:maxlen])
+
+
+# Parola politikası (ISSUES.md #13): en az 10 karakter, en az 1 küçük harf,
+# 1 büyük harf ve 1 rakam. Tüm parola belirleyen endpoint'ler bunu kullanır.
+_PW_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{10,}$")
+PASSWORD_POLICY_MSG_EN = "Password must be at least 10 characters and include uppercase and lowercase letters and a number."
+PASSWORD_POLICY_MSG_TR = "Sifre en az 10 karakter olmali; buyuk harf, kucuk harf ve rakam icermelidir."
+
+
+def is_strong_password(pw) -> bool:
+    return bool(pw) and bool(_PW_RE.match(str(pw)))
 
 
 def resolve_payment_from_note(note: str):
@@ -829,7 +779,37 @@ def resolve_payment_from_note(note: str):
     return None, None
 
 
+def _activate_plan(user, plan: str):
+    """Kullanıcıya planı tanımla; süre Config.PLANS[plan]['duration_days']'ten
+    okunur. None ise plan süresizdir (plan_expires=None). Çağıran commit eder."""
+    user.plan = plan
+    duration_days = Config.PLANS.get(plan, {}).get("duration_days")
+    user.plan_expires = (
+        datetime.utcnow() + timedelta(days=duration_days) if duration_days else None
+    )
+    user.plan_activated_at = datetime.utcnow()
+
+
 # ───────────────────── Middleware ─────────────────────
+
+# Nonce tabanlı KATI CSP'ye geçirilmiş endpoint'ler (FIX.md Phase 4).
+# Bir sayfanın template'i inline onclick/onsubmit handler'lardan arındırılıp
+# <script> etiketleri nonce="{{ csp_nonce }}" aldığında endpoint adı buraya
+# eklenir. Kalan sayfalar taşınana kadar eski (unsafe-inline) politikada kalır.
+# Not: nonce ile 'unsafe-inline' aynı politikada birleştirilemez — nonce varsa
+# tarayıcı 'unsafe-inline'ı yok sayar; bu yüzden geçiş sayfa-bazlı yapılır.
+_STRICT_CSP_ENDPOINTS = {"admin_page"}
+
+
+@app.before_request
+def _generate_csp_nonce():
+    g.csp_nonce = secrets.token_hex(16)
+
+
+@app.context_processor
+def _inject_csp_nonce():
+    return {"csp_nonce": g.get("csp_nonce", "")}
+
 
 @app.after_request
 def add_security_headers(response):
@@ -838,14 +818,20 @@ def add_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
-    # NOT: script-src/style-src'de 'unsafe-inline' KALDI; mevcut arayüz baştan
-    # sona inline onclick/onsubmit handler'ları ve inline style'lar üzerine kurulu.
-    # Bunu nonce tabanlı CSP'ye geçirmek tüm template'lerdeki inline handler'ları
-    # addEventListener'a taşımayı gerektirir (ayrı, büyük bir frontend işi).
-    # Aşağıdaki ek direktifler ('unsafe-inline'ı bozmadan) güvenliği artırır:
+    # _STRICT_CSP_ENDPOINTS'teki sayfalarda script-src nonce tabanlıdır
+    # ('unsafe-inline' yok); inline <script> blokları nonce taşımak zorundadır
+    # ve inline onclick/onsubmit handler'ları ÇALIŞMAZ. Henüz taşınmamış
+    # sayfalar eski (unsafe-inline) politikayla devam eder (ISSUES.md #9).
+    # style-src'de 'unsafe-inline' bilinçli olarak KALIYOR: arayüz yaygın
+    # biçimde inline style attribute kullanıyor; asıl XSS riski (script
+    # çalıştırma / JWT çalma) script-src katılaştırmasıyla kapanır.
+    if request.endpoint in _STRICT_CSP_ENDPOINTS:
+        script_src = f"'self' https://cdn.jsdelivr.net 'nonce-{g.get('csp_nonce', '')}'"
+    else:
+        script_src = "'self' https://cdn.jsdelivr.net 'unsafe-inline'"
     csp = (
         "default-src 'self'; "
-        "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+        f"script-src {script_src}; "
         "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
         "font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' data: https:; "
@@ -866,6 +852,27 @@ def add_security_headers(response):
 
 _plan_expiry_cache: dict = {}
 _PLAN_CHECK_INTERVAL = 300
+
+
+@app.before_request
+def _resolve_bearer_token():
+    """JWT'yi istek başına TEK SEFER doğrula (ISSUES.md #6).
+
+    Önceden auto_csrf_protect, check_plan_expiry ve login_required ayrı ayrı
+    verify_api_token() çağırıyordu (3x decode + RevokedToken/User sorgusu).
+    Sonuç g üzerinde saklanır; diğerleri yalnızca bunu okur. Bu handler'ın
+    diğer before_request'lerden ÖNCE tanımlanmış olması gerekir (Flask,
+    handler'ları kayıt sırasıyla çalıştırır).
+    """
+    g._jwt_user_id = None
+    g._jwt_token = None
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        uid = verify_api_token(token)
+        if uid:
+            g._jwt_user_id = uid
+            g._jwt_token = token
 
 
 @app.before_request
@@ -896,12 +903,9 @@ def auto_csrf_protect():
             if view in csrf._exempt_views or dest in csrf._exempt_views:
                 return
 
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        token = auth[7:]
-        if verify_api_token(token):
-            # Geçerli JWT → CSRF kontrolünü atla
-            return
+    if g.get("_jwt_user_id"):
+        # Geçerli JWT (istek başında tek sefer doğrulandı) → CSRF kontrolünü atla
+        return
 
     # JWT yoksa veya geçersizse standart CSRF doğrulaması yap
     csrf.protect()
@@ -909,11 +913,7 @@ def auto_csrf_protect():
 
 @app.before_request
 def check_plan_expiry():
-    uid = session.get("user_id")
-    if not uid:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            uid = verify_api_token(auth_header[7:])
+    uid = session.get("user_id") or g.get("_jwt_user_id")
     if not uid:
         return
     now = time.time()
@@ -938,9 +938,8 @@ def check_plan_expiry():
     # Oturum "son görülme" güncellemesi (Bearer ile gelen istekler için).
     # Bu blok 5 dk throttle'lı (fonksiyon başındaki _plan_expiry_cache kontrolü),
     # dolayısıyla her istekte DB yazımı yapılmaz.
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        hint = auth_header[7:][:16]
+    if g.get("_jwt_token"):
+        hint = g._jwt_token[:16]
         try:
             UserSession.query.filter_by(token_hint=hint, is_active=True).update(
                 {"last_seen": datetime.utcnow()}, synchronize_session=False
@@ -1074,12 +1073,7 @@ def ads_txt():
 
 @app.route("/session_check")
 def session_check():
-    user_id = None
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        user_id = verify_api_token(auth_header[7:])
-    if not user_id:
-        user_id = session.get("user_id")
+    user_id = g.get("_jwt_user_id") or session.get("user_id")
     if not user_id:
         return jsonify({"logged_in": False})
     user = db.session.get(User, user_id)
@@ -1127,13 +1121,11 @@ def register():
 
     if not u or not e or not p:
         return jsonify({"ok": False, "error": "All fields are required." if lang == "en" else "Tum alanlar gerekli."})
-    if len(p) < 6 or not any(char.isdigit() for char in p) or not any(char.isalpha() for char in p):
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers." if lang == "en" else "Sifre en az 6 karakter olmali ve hem harf hem rakam icermelidir."})
-    if User.query.filter_by(username=u).first():
-        return jsonify({"ok": False, "error": "This username is already taken." if lang == "en" else "Bu kullanici adi alinmis."})
-    if User.query.filter_by(email=e).first():
-        return jsonify({"ok": False, "error": "This email address is already in use." if lang == "en" else "Bu e-posta adresi alinmis."})
-
+    if not is_strong_password(p):
+        return jsonify({"ok": False, "error": PASSWORD_POLICY_MSG_EN if lang == "en" else PASSWORD_POLICY_MSG_TR})
+    # "Kullanıcı adı/e-posta alınmış" ön kontrolleri KALDIRILDI (enumeration,
+    # ISSUES.md #5): benzersizlik DB unique kısıtlarına bırakılır ve aşağıda
+    # hangi alanın çakıştığını açık etmeyen tek bir genel mesajla yanıtlanır.
     verification_token = secrets.token_urlsafe(32)
     user = User(
         username=u,
@@ -1143,14 +1135,24 @@ def register():
         verification_sent_at=datetime.utcnow(),
         lang=lang,
     )
+    from sqlalchemy.exc import IntegrityError
+    _generic_reg_err = jsonify({
+        "ok": False,
+        "error": "Registration could not be completed. Please check your details."
+        if lang == "en" else "Kayit tamamlanamadi. Lutfen bilgilerinizi kontrol edin.",
+    })
     try:
         user.set_password(p)
         db.session.add(user)
         db.session.commit()
-    except Exception as e:
+    except IntegrityError:
+        # Kullanıcı adı veya e-posta zaten kayıtlı; hangisi olduğunu söyleme.
         db.session.rollback()
-        logger.error("Kullanici kayit sirasinda veritabani hatasi: %s", e)
-        return jsonify({"ok": False, "error": "This username or email is already taken or an error occurred." if lang == "en" else "Bu kullanici adi veya e-posta alinmis veya bir hata olustu."})
+        return _generic_reg_err
+    except Exception as exc:
+        db.session.rollback()
+        logger.error("Kullanici kayit sirasinda veritabani hatasi: %s", exc)
+        return _generic_reg_err
 
     gevent.spawn(mailer.send_verification_email, e, u, verification_token, lang=lang)
 
@@ -1198,7 +1200,8 @@ def verify_email(token):
     db.session.commit()
 
     user_lang = getattr(user, "lang", "tr") or "tr"
-    mailer.send_welcome_email(user.email, user.username, lang=user_lang)
+    # SMTP'yi bloklamadan arka planda gönder (register/forgot ile tutarlı).
+    gevent.spawn(mailer.send_welcome_email, user.email, user.username, lang=user_lang)
 
     return render_template(template, success=True,
         message="Your email has been verified! You can now add Steam accounts." if lang == "en"
@@ -1299,8 +1302,8 @@ def reset_password():
 
     if not token or not new_password:
         return jsonify({"ok": False, "error": "Missing information."})
-    if len(new_password) < 6 or not any(char.isdigit() for char in new_password) or not any(char.isalpha() for char in new_password):
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers."})
+    if not is_strong_password(new_password):
+        return jsonify({"ok": False, "error": PASSWORD_POLICY_MSG_EN})
 
     user = User.query.filter_by(reset_token=token).first()
     if not user or not user.reset_token_expires:
@@ -1327,8 +1330,8 @@ def change_password():
 
     if not current_password or not new_password:
         return jsonify({"ok": False, "error": "All fields are required."})
-    if len(new_password) < 6 or not any(char.isdigit() for char in new_password) or not any(char.isalpha() for char in new_password):
-        return jsonify({"ok": False, "error": "New password must be at least 6 characters and contain letters and numbers."})
+    if not is_strong_password(new_password):
+        return jsonify({"ok": False, "error": PASSWORD_POLICY_MSG_EN})
 
     user = g.user
     if not user.check_password(current_password):
@@ -1365,8 +1368,8 @@ def set_initial_password():
         return jsonify({"ok": False, "error": "This option is only for Steam-login accounts without a password. Use 'Change Password'."})
 
     new_password = request.json.get("new_password", "")
-    if len(new_password) < 6 or not any(c.isdigit() for c in new_password) or not any(c.isalpha() for c in new_password):
-        return jsonify({"ok": False, "error": "Password must be at least 6 characters and contain letters and numbers."})
+    if not is_strong_password(new_password):
+        return jsonify({"ok": False, "error": PASSWORD_POLICY_MSG_EN})
 
     user.set_password(new_password)
     db.session.commit()
@@ -1400,13 +1403,18 @@ def change_email():
         return jsonify({"ok": False, "error": "Current password is incorrect."})
     if new_email == user.email:
         return jsonify({"ok": False, "error": "This is already your current email address."})
-    if User.query.filter_by(email=new_email).first():
-        return jsonify({"ok": False, "error": "This email address is already in use by another account."})
 
     if user.email_change_expires:
         remaining = (user.email_change_expires - datetime.utcnow()).total_seconds()
         if remaining > 0:
             return jsonify({"ok": False, "error": "Please wait."})
+
+    # Enumeration önlemi (ISSUES.md #5): e-posta başka bir hesapta kayıtlıysa
+    # bunu AÇIK ETME — gerçek akışla birebir aynı yanıtı döndür ama mail
+    # gönderme/token üretme. Benzersizlik onay adımında (confirm_email_change)
+    # zaten yeniden kontrol ediliyor.
+    if User.query.filter_by(email=new_email).first():
+        return jsonify({"ok": True, "message": f"A verification email has been sent to {new_email}."})
 
     token = secrets.token_urlsafe(32)
     user.email_change_token = token
@@ -1476,21 +1484,16 @@ def site_login():
 
     ip = _get_client_ip()
     ip_key = f"ip:{ip}"
-    user_key = f"user:{u}"
 
     if is_locked_out(ip_key):
         return jsonify({"ok": False, "error": "Too many failed attempts. Please wait 5 minutes."}), 429
-    if is_locked_out(user_key):
-        return jsonify({"ok": False, "error": "This account is temporarily locked. Please try again in 5 minutes."}), 429
 
     user = User.query.filter_by(username=u).first()
     if not user or not user.check_password(p):
         record_failed_login(ip_key)
-        record_failed_login(user_key)
         return jsonify({"ok": False, "error": "Invalid username or password."})
 
     clear_failed_logins(ip_key)
-    clear_failed_logins(user_key)
 
     user.last_login = db.func.now()
     db.session.commit()
@@ -1616,8 +1619,7 @@ def plan_upgrade():
     if user.plan == plan:
         return jsonify({"ok": False, "error": "You are already on this plan."})
 
-    user.plan = plan
-    user.plan_activated_at = datetime.utcnow()
+    _activate_plan(user, plan)
     db.session.commit()
     return jsonify({"ok": True, "plan": plan, "message": f"Switched to {plan.title()} plan!"})
 
@@ -1633,14 +1635,14 @@ def plan_request():
     if existing:
         return jsonify({"ok": False, "error": "You already have a pending request."})
 
-    prices = {"basic": 29.99, "premium": 59.99}
-    payment = Payment(user_id=g.user.id, amount=prices[plan], plan=plan, status="pending")
+    price = Config.PLANS[plan]["price"]
+    payment = Payment(user_id=g.user.id, amount=price, plan=plan, status="pending")
     db.session.add(payment)
     db.session.commit()
     return jsonify({
         "ok": True,
-        "message": f"Your request has been received. It will be activated within 1 hour after payment of ${prices[plan]}.",
-        "payment_info": {"amount": prices[plan], "note": f"SB-{g.user.id}"},
+        "message": f"Your request has been received. It will be activated within 1 hour after payment of ${price}.",
+        "payment_info": {"amount": price, "note": f"SB-{g.user.id}"},
     })
 
 
@@ -1657,9 +1659,11 @@ def plan_checkout():
     if user.plan == plan:
         return jsonify({"ok": False, "error": "You are already on this plan."})
 
+    # Ürün ID'leri Config'ten (SHOPIER_*_PRODUCT_ID) gelir; URL burada türetilir
+    # ki ID değişikliği tek yerden yönetilsin (ISSUES.md #12).
     shopier_links = {
-        "basic": "https://www.shopier.com/hourboostcomtr/45175746",
-        "premium": "https://www.shopier.com/hourboostcomtr/45175760",
+        "basic": f"https://www.shopier.com/hourboostcomtr/{Config.SHOPIER_BASIC_PRODUCT_ID}",
+        "premium": f"https://www.shopier.com/hourboostcomtr/{Config.SHOPIER_PREMIUM_PRODUCT_ID}",
     }
 
     # Ödemeyi kullanıcıya GÜVENLİ eşlemek için benzersiz kodlu pending Payment.
@@ -1714,24 +1718,6 @@ def shopier_webhook():
     raw_body = request.get_data()
     signature = request.headers.get("Shopier-Signature", "")
 
-    # ── GEÇİCİ TANI LOGU (webhook teşhisi — sorun çözülünce KALDIRILACAK) ──
-    # Amaç: webhook app'e ulaşıyor mu, hangi imza başlığıyla geliyor, bizim
-    # hesapladığımız HMAC ile eşleşiyor mu? (Gövde içeriği/PII loglanmaz.)
-    try:
-        _all_hdrs = list(request.headers.keys())
-        _sig_like = {k: v for k, v in request.headers.items()
-                     if any(s in k.lower() for s in ("sign", "hmac", "shopier"))}
-        _expected = hmac.new(Config.SHOPIER_WEBHOOK_SECRET.encode("utf-8"),
-                             raw_body, hashlib.sha256).hexdigest()
-        logger.warning(
-            "WEBHOOK-TANI ip=%s ua=%r body_len=%d gelen_imza=%r hesaplanan=%r imza_basliklari=%r tum_basliklar=%r",
-            _get_client_ip(), request.headers.get("User-Agent", ""),
-            len(raw_body), signature, _expected, _sig_like, _all_hdrs,
-        )
-    except Exception as _e:
-        logger.warning("WEBHOOK-TANI log hatasi: %s", _e)
-    # ── /GEÇİCİ TANI LOGU ──
-
     if not shopier_lib.verify_webhook(raw_body, signature, Config.SHOPIER_WEBHOOK_SECRET):
         logger.warning("Shopier webhook: IMZA HATASI!")
         return jsonify({"error": "Invalid signature"}), 401
@@ -1757,13 +1743,17 @@ def shopier_webhook():
     line_items = order.get("lineItems", [])
     product_id = str(line_items[0].get("productId", "")) if line_items else ""
     buyer_note = (order.get("note") or "").strip()
-    shopier_txn = str(order.get("id", ""))
+    shopier_txn = str(order.get("id") or "").strip()
 
-    if shopier_txn:
-        existing_txn = Payment.query.filter_by(transaction_id=shopier_txn).first()
-        if existing_txn:
-            logger.info("Shopier webhook: duplicate transaction_id=%s, atlanıyor", shopier_txn)
-            return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
+    # transaction_id olmadan duplicate koruması çalışmaz; plan aktive etmeden reddet.
+    if not shopier_txn:
+        logger.error("Shopier webhook: bos transaction_id, istek reddedildi")
+        return jsonify({"error": "Missing transaction id"}), 400
+
+    existing_txn = Payment.query.filter_by(transaction_id=shopier_txn).first()
+    if existing_txn:
+        logger.info("Shopier webhook: duplicate transaction_id=%s, atlanıyor", shopier_txn)
+        return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
 
     plan = shopier_lib.extract_plan(product_id, Config.SHOPIER_BASIC_PRODUCT_ID, Config.SHOPIER_PREMIUM_PRODUCT_ID)
     if not plan:
@@ -1771,13 +1761,13 @@ def shopier_webhook():
         return jsonify({"error": "Unknown product"}), 400
 
     user, matched_payment = resolve_payment_from_note(buyer_note)
-    prices = {"basic": 29.99, "premium": 59.99}
+    plan_price = Config.PLANS.get(plan, {}).get("price", 0)
 
     from sqlalchemy.exc import IntegrityError
 
     if not user:
         logger.error("Shopier webhook: kullanici bulunamadi note='%s'", buyer_note)
-        unmatched = Payment(user_id=None, amount=prices.get(plan, 0), plan=plan,
+        unmatched = Payment(user_id=None, amount=plan_price, plan=plan,
                            status="unmatched", transaction_id=shopier_txn)
         db.session.add(unmatched)
         try:
@@ -1801,13 +1791,11 @@ def shopier_webhook():
         payment.plan = plan
         payment.transaction_id = shopier_txn
     else:
-        payment = Payment(user_id=user.id, amount=prices[plan], plan=plan,
+        payment = Payment(user_id=user.id, amount=plan_price, plan=plan,
                          status="completed", transaction_id=shopier_txn)
         db.session.add(payment)
 
-    user.plan = plan
-    user.plan_expires = datetime.utcnow() + timedelta(days=3650)
-    user.plan_activated_at = datetime.utcnow()
+    _activate_plan(user, plan)
     try:
         db.session.commit()
     except IntegrityError:
@@ -1892,8 +1880,25 @@ def account_login():
 
     acct_db = db.session.get(SteamAccount, acct_id)
     if not acct_db:
+        # GÜVENLİK: istemci var olmayan bir acct_id gönderdiğinde de yeni hesap
+        # oluşturuluyor; doğrulama ve plan limiti kontrolleri yukarıdaki
+        # (acct_id'siz) dal ile AYNI şekilde uygulanmak zorundadır. Aksi halde
+        # rastgele acct_id göndererek limitler atlanabilirdi (ISSUES.md #1).
         if not username:
             return jsonify({"ok": False, "error": "Username is required."})
+        if not user.is_verified:
+            return jsonify({
+                "ok": False,
+                "error": "Please verify your email address before adding a Steam account.",
+                "need_verify": True,
+            })
+        current = SteamAccount.query.filter_by(user_id=user.id).count()
+        if current >= limits["max_accounts"]:
+            return jsonify({
+                "ok": False,
+                "error": f"Your plan supports a maximum of {limits['max_accounts']} accounts.",
+                "upgrade": True,
+            })
         acct_db = SteamAccount(id=acct_id, user_id=user.id, steam_username=username)
         db.session.add(acct_db)
         db.session.commit()
@@ -2251,10 +2256,20 @@ def toggle_boost():
     else:
         acct_db.target_stop_time = None
         
+    # start_boost başarısız olursa (örn. login bu arada düştüyse) DB'de
+    # is_boosting=True kalmasın diye önce boost başlatılır, sonra commit edilir.
+    try:
+        mgr.start_boost(ids, acct_db.persona_state)
+    except Exception as e:
+        logger.error("[acct:%s] start_boost hatasi: %s", acct_id, e)
+        acct_db.is_boosting = False
+        acct_db.target_stop_time = None
+        db.session.commit()
+        _clear_timers(acct_id)
+        return jsonify({"ok": False, "error": "Steam connection lost. Please reconnect."})
+
     acct_db.is_boosting = True
     db.session.commit()
-
-    mgr.start_boost(ids, acct_db.persona_state)
     return jsonify({
         "boosting": True,
         "start_time": mgr.start_time,
@@ -2713,11 +2728,10 @@ def admin_update_user():
     if "plan" in data:
         if data["plan"] not in ("free", "basic", "premium"):
             return jsonify({"ok": False, "error": "Invalid plan."})
-        user.plan = data["plan"]
         if data["plan"] != "free":
-            user.plan_expires = datetime.utcnow() + timedelta(days=3650)
-            user.plan_activated_at = datetime.utcnow()
+            _activate_plan(user, data["plan"])
         else:
+            user.plan = "free"
             user.plan_expires = None
             user.plan_activated_at = None
 
@@ -2783,9 +2797,7 @@ def admin_approve_payment():
             return jsonify({"ok": False, "error": "User not found."})
 
     payment.status = "completed"
-    user.plan = payment.plan
-    user.plan_expires = datetime.utcnow() + timedelta(days=3650)
-    user.plan_activated_at = datetime.utcnow()
+    _activate_plan(user, payment.plan)
     db.session.commit()
     return jsonify({"ok": True, "message": f"{user.username} upgraded to {payment.plan} plan."})
 
