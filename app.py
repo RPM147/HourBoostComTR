@@ -708,13 +708,22 @@ gevent.spawn(periodic_token_cleanup)
 
 # ───────────────────── Yardımcılar ─────────────────────
 
+def _auth_error_should_be_json():
+    return (
+        request.path.startswith("/admin/")
+        or request.method != 'GET'
+        or request.is_json
+        or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+    )
+
+
 def login_required(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
         # JWT istek başında _resolve_bearer_token ile TEK SEFER doğrulandı.
         user_id = g.get("_jwt_user_id") or session.get("user_id")
         if not user_id:
-            if request.method != 'GET' or request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            if _auth_error_should_be_json():
                 return jsonify({"ok": False, "error": "Not logged in."}), 401
             return flask_redirect("/")
         user = db.session.get(User, user_id)
