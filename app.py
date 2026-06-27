@@ -799,6 +799,30 @@ def _activate_plan(user, plan: str):
     user.plan_activated_at = datetime.utcnow()
 
 
+# ───────────────────── Bakım Modu ─────────────────────
+# Bakım modu bayrağı DOSYA tabanlıdır (instance/maintenance.flag). Böylece durum
+# gunicorn yeniden başlasa bile KORUNUR (global değişken restart'ta sıfırlanırdı)
+# ve gerekirse SSH ile elle açılıp kapatılabilir. workers=1 olduğundan dosya
+# kontrolü ucuzdur; ileride çok worker'a geçilse bile dosya paylaşımı sorunsuzdur.
+MAINTENANCE_FLAG_PATH = os.path.join(app.instance_path, "maintenance.flag")
+
+
+def is_maintenance_mode() -> bool:
+    return os.path.exists(MAINTENANCE_FLAG_PATH)
+
+
+def set_maintenance_mode(enabled: bool) -> None:
+    if enabled:
+        os.makedirs(app.instance_path, exist_ok=True)
+        with open(MAINTENANCE_FLAG_PATH, "w") as f:
+            f.write(datetime.utcnow().isoformat() + "\n")
+    else:
+        try:
+            os.remove(MAINTENANCE_FLAG_PATH)
+        except FileNotFoundError:
+            pass
+
+
 # ───────────────────── Middleware ─────────────────────
 
 # Nonce tabanlı KATI CSP'ye geçirilmiş endpoint'ler (FIX.md Phase 4).
@@ -956,6 +980,50 @@ def check_plan_expiry():
             db.session.commit()
         except Exception:
             db.session.rollback()
+
+
+# Bakım modunda dahi her zaman erişilebilen yollar: oturum açma uçları (yönetici
+# tekrar giriş yapıp modu kapatabilsin diye), oturum kontrolü ve ads.txt.
+# Statik dosyalar ve /admin* yolları gate içinde ayrıca muaf tutulur.
+_MAINTENANCE_ALLOWED_EXACT = {
+    "/site_login",
+    "/site_logout",
+    "/session_check",
+    "/favicon.ico",
+    "/ads.txt",
+}
+
+
+@app.before_request
+def maintenance_gate():
+    """Bakım modu açıkken yöneticiler hariç herkese bakım sayfasını göster.
+
+    _resolve_bearer_token'dan SONRA çalışır (g._jwt_user_id hazır). Yöneticiler
+    siteyi normal kullanmaya devam eder; statik dosyalar, admin paneli ve oturum
+    açma uçları her zaman erişilebilir kalır ki kilitlenme yaşanmasın.
+    """
+    if not is_maintenance_mode():
+        return
+
+    path = request.path or "/"
+    if path.startswith("/static/") or path.startswith("/admin"):
+        return
+    if path in _MAINTENANCE_ALLOWED_EXACT:
+        return
+
+    uid = g.get("_jwt_user_id") or session.get("user_id")
+    if uid:
+        u = db.session.get(User, uid)
+        if u and u.is_admin:
+            return
+
+    if request.method in ("GET", "HEAD"):
+        return render_template("development.html"), 503
+    return jsonify({
+        "ok": False,
+        "maintenance": True,
+        "error": "Site şu anda bakım modunda. Lütfen daha sonra tekrar deneyin.",
+    }), 503
 
 
 # ───────────────────── Sayfalar (TR) ─────────────────────
@@ -2688,6 +2756,29 @@ def admin_stats():
         ),
         "pending_payments": Payment.query.filter_by(status="pending").count(),
     })
+
+
+@app.route("/admin/maintenance")
+@login_required
+def admin_maintenance_status():
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+    return jsonify({"enabled": is_maintenance_mode()})
+
+
+@app.route("/admin/maintenance/toggle", methods=["POST"])
+@login_required
+def admin_maintenance_toggle():
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+    new_state = not is_maintenance_mode()
+    set_maintenance_mode(new_state)
+    logger.info(
+        "Bakim modu %s (admin=%s)",
+        "ACILDI" if new_state else "KAPANDI",
+        g.user.username,
+    )
+    return jsonify({"ok": True, "enabled": new_state})
 
 
 @app.route("/admin/users")

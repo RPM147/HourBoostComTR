@@ -203,6 +203,12 @@ class SteamAccountManager:
                         self.steam_username,
                     )
                     return
+                if result == EResult.InvalidPassword:
+                    logger.warning(
+                        "[%s] Sifre/rate-limit hatasi (EResult.5), reconnect durduruluyor",
+                        self.steam_username,
+                    )
+                    return
             self.client.reconnect(maxdelay=30)
         except Exception as e:
             logger.error("[%s] Reconnect hatasi: %s", self.steam_username, e)
