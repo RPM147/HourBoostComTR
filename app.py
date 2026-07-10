@@ -147,7 +147,7 @@ from collections import defaultdict
 from flask import Flask, request, jsonify, session, g, render_template
 from flask import redirect as flask_redirect
 from flask_limiter import Limiter
-from steam.enums import EResult
+from steam_compat import EResult
 from flask_wtf.csrf import CSRFProtect
 
 from config import Config
@@ -1998,8 +1998,12 @@ def account_login():
                 mgr.app_ids = acct_db.app_ids()
                 mgr.persona_state = acct_db.persona_state
                 return jsonify({"ok": True, "acct_id": acct_id})
-            elif result in (EResult.AccountLoginDeniedNeedTwoFactor, EResult.TwoFactorCodeMismatch, EResult.InvalidLoginAuthCode):
+            elif result == EResult.AccountLogonDenied:
+                return jsonify({"ok": False, "need_code": True, "code_type": "email", "msg": "Email Guard code required."})
+            elif result in (EResult.AccountLoginDeniedNeedTwoFactor, EResult.TwoFactorCodeMismatch):
                 return jsonify({"ok": False, "need_code": True, "code_type": "2fa", "msg": "Invalid or expired 2FA code."})
+            elif result == EResult.InvalidLoginAuthCode:
+                return jsonify({"ok": False, "need_code": True, "code_type": code_type or "email", "msg": "Invalid code, please try again."})
             else:
                 return jsonify({"ok": False, "error": str(result)})
 
@@ -2014,6 +2018,8 @@ def account_login():
             mgr.app_ids = acct_db.app_ids()
             mgr.persona_state = acct_db.persona_state
             return jsonify({"ok": True, "acct_id": acct_id, "method": "token"})
+        elif result == EResult.AccountLogonDenied:
+            return jsonify({"ok": False, "need_code": True, "code_type": "email", "acct_id": acct_id, "msg": "Email Guard code required."})
         elif result in (EResult.AccountLoginDeniedNeedTwoFactor, EResult.TwoFactorCodeMismatch):
             return jsonify({"ok": False, "need_2fa": True, "acct_id": acct_id, "msg": "2FA code required."})
         elif not password:

@@ -1,0 +1,16 @@
+{
+  "name": "hourboost-steam-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Steam CM worker for HourBoost",
+  "main": "steam_worker.js",
+  "dependencies": {
+    "steam-user": "5.3.0"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
