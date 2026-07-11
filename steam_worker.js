@@ -308,6 +308,14 @@ class SteamWorker {
 const worker = new SteamWorker();
 const rl = readline.createInterface({input: process.stdin});
 
+function shutdown() {
+  try {
+    worker.client.logOff();
+  } catch (_) {
+  }
+  process.exit(0);
+}
+
 rl.on('line', (line) => {
   if (!line.trim()) {
     return;
@@ -357,10 +365,7 @@ rl.on('line', (line) => {
   }
 });
 
-process.on('SIGTERM', () => {
-  try {
-    worker.client.logOff();
-  } catch (_) {
-  }
-  process.exit(0);
-});
+process.stdin.on('end', shutdown);
+process.stdin.on('close', shutdown);
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

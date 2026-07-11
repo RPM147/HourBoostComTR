@@ -95,8 +95,12 @@ class Payment(db.Model):
     plan = db.Column(db.String(20))
     status = db.Column(db.String(20), default="pending")
     transaction_id = db.Column(db.String(100), unique=True, nullable=True)
-    # Webhook'ta ödemeyi kullanıcıya güvenli eşlemek için benzersiz kod (HB-xxxxxx)
-    match_token = db.Column(db.String(32), nullable=True, index=True)
+    # Webhook'ta odemeyi kullaniciya guvenli eslemek icin benzersiz 128-bit HB kodu.
+    match_token = db.Column(db.String(64), nullable=True, index=True)
+    # Admin panelinden gizlemek içindir; ödeme/audit kaydı fiziksel olarak silinmez.
+    admin_hidden = db.Column(
+        db.Boolean, nullable=False, default=False, server_default=db.false()
+    )
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 

@@ -8,6 +8,7 @@ import logging
 import urllib.request
 import urllib.parse
 import re
+import xml.etree.ElementTree as ET
 import bleach
 import mailer
 import jwt as pyjwt
@@ -561,6 +562,22 @@ def _get_request_lang() -> str:
 
 # ───────────────────── Sunucu Başlangıcı ─────────────────────
 
+HB_TOKEN_BYTES = 16
+HB_TOKEN_RE = re.compile(r"\bHB-([0-9A-Fa-f]{32})\b", re.IGNORECASE)
+
+
+def _new_match_token() -> str:
+    return "HB-" + secrets.token_hex(HB_TOKEN_BYTES).upper()
+
+
+def _generate_match_token() -> str:
+    for _ in range(32):
+        token = _new_match_token()
+        if not Payment.query.filter_by(match_token=token).first():
+            return token
+    raise RuntimeError("Unique payment token could not be generated.")
+
+
 def _ensure_schema():
     """Hafif, idempotent şema güncellemesi (Flask-Migrate kurulana dek köprü).
     Mevcut DB'lerde eksik sütunları ekler; sütun zaten varsa no-op."""
@@ -577,9 +594,94 @@ def _ensure_schema():
         pcols = {c["name"] for c in inspector.get_columns("payments")}
         if "match_token" not in pcols:
             with db.engine.begin() as conn:
-                conn.execute(text("ALTER TABLE payments ADD COLUMN match_token VARCHAR(32)"))
+                conn.execute(text("ALTER TABLE payments ADD COLUMN match_token VARCHAR(64)"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payments_match_token ON payments (match_token)"))
             logger.info("Şema güncellendi: payments.match_token eklendi")
+
+        elif db.engine.dialect.name == "postgresql":
+            with db.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE payments ALTER COLUMN match_token TYPE VARCHAR(64)"))
+
+        if "admin_hidden" not in pcols:
+            false_literal = "FALSE" if db.engine.dialect.name == "postgresql" else "0"
+            with db.engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE payments ADD COLUMN admin_hidden "
+                    f"BOOLEAN NOT NULL DEFAULT {false_literal}"
+                ))
+            logger.info("Şema güncellendi: payments.admin_hidden eklendi")
+
+        # Eski sürümde yalnızca checkout butonuna basmak status=pending üretiyordu.
+        # match_token içeren ve henüz işlem görmemiş bu kayıtlar ödeme değil,
+        # checkout niyetidir; idempotent biçimde admin kuyruğundan çıkarılır.
+        with db.engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT id, match_token, status FROM payments "
+                "WHERE match_token IS NOT NULL ORDER BY id"
+            )).mappings().all()
+            used_tokens = set()
+            for row in rows:
+                token = str(row["match_token"] or "").strip().upper()
+                if not token:
+                    conn.execute(
+                        text("UPDATE payments SET match_token = NULL WHERE id = :id"),
+                        {"id": row["id"]},
+                    )
+                    continue
+                status = row["status"]
+                is_checkout_intent = status in ("checkout_started", "pending")
+                needs_new_active_token = (
+                    is_checkout_intent
+                    and not re.fullmatch(r"HB-[0-9A-F]{32}", token)
+                )
+                duplicate = token in used_tokens
+
+                if is_checkout_intent and (needs_new_active_token or duplicate):
+                    new_token = _new_match_token()
+                    while new_token in used_tokens:
+                        new_token = _new_match_token()
+                    conn.execute(
+                        text("UPDATE payments SET match_token = :token WHERE id = :id"),
+                        {"token": new_token, "id": row["id"]},
+                    )
+                    used_tokens.add(new_token)
+                elif duplicate:
+                    conn.execute(
+                        text("UPDATE payments SET match_token = NULL WHERE id = :id"),
+                        {"id": row["id"]},
+                    )
+                else:
+                    if token != row["match_token"]:
+                        conn.execute(
+                            text("UPDATE payments SET match_token = :token WHERE id = :id"),
+                            {"token": token, "id": row["id"]},
+                        )
+                    used_tokens.add(token)
+
+        with db.engine.begin() as conn:
+            if db.engine.dialect.name in ("sqlite", "postgresql"):
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_match_token "
+                    "ON payments (match_token) WHERE match_token IS NOT NULL"
+                ))
+            else:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX ux_payments_match_token "
+                    "ON payments (match_token)"
+                ))
+
+        with db.engine.begin() as conn:
+            migrated = conn.execute(text(
+                "UPDATE payments SET status = 'checkout_started' "
+                "WHERE status = 'pending' "
+                "AND match_token IS NOT NULL "
+                "AND transaction_id IS NULL"
+            ))
+        if migrated.rowcount:
+            logger.info(
+                "Şema veri düzeltmesi: %d checkout kaydı checkout_started yapıldı",
+                migrated.rowcount,
+            )
     except Exception as e:
         logger.error("Şema güncelleme hatası: %s", e)
 
@@ -753,37 +855,23 @@ def is_strong_password(pw) -> bool:
 
 
 def resolve_payment_from_note(note: str):
-    """Webhook notundan ödeme sahibini GÜVENLİ biçimde çöz.
-
-    Yalnızca açık eşleştirme kodları kabul edilir:
-      - HB-xxxxxx  → /plan/checkout'ta üretilen benzersiz Payment.match_token
-      - SB-<id>    → kullanıcı ID'si (geriye dönük uyumluluk)
-    Serbest metinden kullanıcı-adı TAHMİNİ YAPILMAZ; bu, nota rastgele bir
-    kelime (ör. "admin") yazıldığında yanlış hesaba plan tanımlanmasını önler.
-
-    Dönüş: (user, payment_or_None)
-    """
+    """Resolve a Shopier note only through an active HB checkout token."""
     if not note:
         return None, None
     note = note.strip()
 
-    m = re.search(r"HB-([0-9A-Fa-f]{6})", note, re.IGNORECASE)
+    m = HB_TOKEN_RE.search(note)
     if m:
         token = "HB-" + m.group(1).upper()
-        payment = Payment.query.filter_by(match_token=token).first()
+        payment = Payment.query.filter_by(
+            match_token=token,
+            status="checkout_started",
+            transaction_id=None,
+        ).first()
         if payment and payment.user_id:
             user = db.session.get(User, payment.user_id)
             if user:
                 return user, payment
-
-    m = re.search(r"SB-(\d+)", note, re.IGNORECASE)
-    if m:
-        try:
-            user = db.session.get(User, int(m.group(1)))
-            if user:
-                return user, None
-        except Exception:
-            pass
 
     return None, None
 
@@ -1704,23 +1792,10 @@ def plan_upgrade():
 @app.route("/plan/request", methods=["POST"])
 @login_required
 def plan_request():
-    plan = request.json.get("plan")
-    if plan not in ("basic", "premium"):
-        return jsonify({"ok": False, "error": "Invalid plan."})
-
-    existing = Payment.query.filter_by(user_id=g.user.id, status="pending").first()
-    if existing:
-        return jsonify({"ok": False, "error": "You already have a pending request."})
-
-    price = Config.PLANS[plan]["price"]
-    payment = Payment(user_id=g.user.id, amount=price, plan=plan, status="pending")
-    db.session.add(payment)
-    db.session.commit()
     return jsonify({
-        "ok": True,
-        "message": f"Your request has been received. It will be activated within 1 hour after payment of ${price}.",
-        "payment_info": {"amount": price, "note": f"SB-{g.user.id}"},
-    })
+        "ok": False,
+        "error": "Manual payment requests are no longer supported. Use checkout.",
+    }), 410
 
 
 # ───────────────────── Shopier ─────────────────────
@@ -1743,25 +1818,23 @@ def plan_checkout():
         "premium": f"https://www.shopier.com/hourboostcomtr/{Config.SHOPIER_PREMIUM_PRODUCT_ID}",
     }
 
-    # Ödemeyi kullanıcıya GÜVENLİ eşlemek için benzersiz kodlu pending Payment.
-    # TEK AKTİF PENDING kuralı: kullanıcının bu plandaki pending'ini yeniden kullan,
-    # DİĞER tüm pending ödemelerini "cancelled" yap. Böylece admin onay kuyruğunda
-    # aynı kullanıcı için birden fazla plan (örn. hem basic hem premium) görünmez.
-    # Not: iptal edilen kayıtların match_token'ı durur; kullanıcı eski bir kodla
-    # ödese bile webhook token ile eşleştirmeye devam eder.
-    pendings = (Payment.query
-                .filter_by(user_id=user.id, status="pending")
-                .order_by(Payment.created_at.desc()).all())
+    # Ödemeyi kullanıcıya güvenli eşlemek için benzersiz kodlu checkout intent'i.
+    # Bu kayıt ödeme yapıldığı anlamına gelmez ve admin onay kuyruğunda gösterilmez.
+    # Tek aktif checkout kurali: ayni plandaki intent'i yeniden kullan, digerlerini
+    # iptal et. Iptal edilen veya tamamlanan token tekrar plan aktive edemez.
+    checkout_intents = (Payment.query
+                        .filter_by(user_id=user.id, status="checkout_started")
+                        .order_by(Payment.created_at.desc()).all())
     payment = None
-    for p in pendings:
+    for p in checkout_intents:
         if payment is None and p.plan == plan and p.match_token:
-            payment = p          # bu plandaki en güncel kodlu pending'i koru
+            payment = p          # bu plandaki en güncel checkout kodunu koru
         else:
             p.status = "cancelled"   # diğer planlar + fazlalık duplikeler
     if payment is None:
-        token = "HB-" + secrets.token_hex(3).upper()
+        token = _generate_match_token()
         payment = Payment(user_id=user.id, amount=Config.PLANS[plan]["price"],
-                          plan=plan, status="pending", match_token=token)
+                          plan=plan, status="checkout_started", match_token=token)
         db.session.add(payment)
     else:
         token = payment.match_token
@@ -1856,21 +1929,26 @@ def shopier_webhook():
             return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
         return jsonify({"ok": True, "warning": "User not found, saved as unmatched"}), 200
 
-    # Token ile gelen pending ödemeyi tercih et; yoksa user+plan pending ara;
-    # o da yoksa yeni completed kayıt oluştur. (Ürün ID'sinden gelen plan otoriter.)
+    # Sadece aktif checkout intent tamamlanir. Urun ID'sinden gelen plan ve tutar
+    # otoriterdir; eski pending/finished/cancelled kayitlar mutate edilmez.
     payment = matched_payment
     if payment is None:
-        payment = (Payment.query
-                   .filter_by(user_id=user.id, status="pending", plan=plan)
-                   .order_by(Payment.created_at.desc()).first())
-    if payment:
-        payment.status = "completed"
-        payment.plan = plan
-        payment.transaction_id = shopier_txn
-    else:
-        payment = Payment(user_id=user.id, amount=plan_price, plan=plan,
-                         status="completed", transaction_id=shopier_txn)
-        db.session.add(payment)
+        logger.error("Shopier webhook: aktif checkout token bulunamadi note='%s'", buyer_note)
+        unmatched = Payment(user_id=None, amount=plan_price, plan=plan,
+                           status="unmatched", transaction_id=shopier_txn)
+        db.session.add(unmatched)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            logger.info("Shopier webhook: eszamanli duplicate txn=%s (unmatched), atlandi", shopier_txn)
+            return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
+        return jsonify({"ok": True, "warning": "Active checkout token not found, saved as unmatched"}), 200
+
+    payment.status = "completed"
+    payment.plan = plan
+    payment.amount = plan_price
+    payment.transaction_id = shopier_txn
 
     _activate_plan(user, plan)
     try:
@@ -2610,51 +2688,26 @@ def steam_profile():
     if not mgr or not mgr.logged_in:
         return jsonify({"ok": False})
 
-    try:
-        client = mgr.client
-        me = client.user
-        if not me:
-            return jsonify({"ok": False})
-
-        steamid = str(client.steam_id)
-        name = getattr(me, "name", "") or ""
-        avatar_url = ""
-        if hasattr(me, "get_avatar_url"):
-            avatar_url = me.get_avatar_url(2)
-            if avatar_url:
-                filename = avatar_url.split('/')[-1]
-                avatar_url = f"https://avatars.steamstatic.com/{filename}"
-
-        if not avatar_url:
-            try:
-                if Config.STEAM_API_KEY:
-                    api_url = f"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={Config.STEAM_API_KEY}&steamids={steamid}"
-                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with safe_urlopen(req, timeout=5) as r:
-                        data = json.loads(r.read().decode())
-                    players = data.get("response", {}).get("players", [])
-                    if players:
-                        avatar_url = players[0].get("avatarfull", "")
-                
-                if not avatar_url:
-                    api_url = f"https://steamcommunity.com/profiles/{steamid}/?xml=1"
-                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with safe_urlopen(req, timeout=5) as r:
-                        xml = r.read().decode()
-                    m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", xml)
-                    if m:
-                        avatar_url = m.group(1)
-            except Exception:
-                pass
-
-        return jsonify({
-            "ok": True, "name": name, "avatar": avatar_url,
-            "profile_url": f"https://steamcommunity.com/profiles/{steamid}",
-            "steamid": steamid,
-        })
-    except Exception as e:
-        logger.error("Profile error: %s", e)
+    steamid = str(
+        acct_db.steam_id or getattr(mgr.client, "steam_id", "") or ""
+    ).strip()
+    if not re.fullmatch(r"\d{17}", steamid):
+        logger.warning("Steam profili için geçersiz SteamID: account=%s", acct_id)
         return jsonify({"ok": False})
+
+    # Worker SteamID'yi biliyor fakat eski kayıtta DB alanı boşsa kalıcılaştır.
+    if acct_db.steam_id != steamid:
+        acct_db.steam_id = steamid
+        db.session.commit()
+
+    profile = _get_steam_profile(steamid)
+    return jsonify({
+        "ok": True,
+        "name": profile.get("name") or acct_db.steam_username or steamid,
+        "avatar": profile.get("avatar") or "",
+        "profile_url": f"https://steamcommunity.com/profiles/{steamid}",
+        "steamid": steamid,
+    })
 
 
 @app.route("/game_search")
@@ -2858,7 +2911,11 @@ def admin_payments():
 
     payments = (
         Payment.query
-        .filter(Payment.status != "cancelled")
+        .filter(
+            Payment.status != "cancelled",
+            Payment.status != "checkout_started",
+            Payment.admin_hidden.is_(False),
+        )
         .order_by(db.case((Payment.status == "unmatched", 0), else_=1), Payment.created_at.desc())
         .limit(50).all()
     )
@@ -2888,6 +2945,11 @@ def admin_approve_payment():
     payment = db.session.get(Payment, payment_id)
     if not payment:
         return jsonify({"ok": False, "error": "Payment not found."})
+    if payment.admin_hidden or payment.status not in ("pending", "unmatched"):
+        return jsonify({
+            "ok": False,
+            "error": "This payment is not awaiting manual approval.",
+        }), 409
 
     if payment.status == "unmatched":
         username = request.json.get("username", "").strip()
@@ -2906,6 +2968,27 @@ def admin_approve_payment():
     _activate_plan(user, payment.plan)
     db.session.commit()
     return jsonify({"ok": True, "message": f"{user.username} upgraded to {payment.plan} plan."})
+
+
+@app.route("/admin/payments/hide", methods=["POST"])
+@login_required
+def admin_hide_payment():
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    payment = db.session.get(Payment, data.get("payment_id"))
+    if not payment:
+        return jsonify({"ok": False, "error": "Payment not found."}), 404
+
+    payment.admin_hidden = True
+    db.session.commit()
+    logger.info(
+        "Ödeme admin panelinden gizlendi: payment_id=%s admin=%s",
+        payment.id,
+        g.user.username,
+    )
+    return jsonify({"ok": True, "message": "Payment hidden from the admin panel."})
 
 
 @app.route("/admin/users/delete", methods=["POST"])
@@ -3017,29 +3100,47 @@ def _verify_steam_callback(params: dict):
 
 
 def _get_steam_profile(steam_id: str) -> dict:
+    steam_id = str(steam_id or "").strip()
+    if not re.fullmatch(r"\d{17}", steam_id):
+        return {}
+
+    api_key = Config.STEAM_API_KEY
+    if api_key:
+        try:
+            url = (
+                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+                f"?key={urllib.parse.quote(api_key)}&steamids={steam_id}"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with safe_urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            players = data.get("response", {}).get("players", [])
+            if players:
+                player = players[0]
+                return {
+                    "steam_id": steam_id,
+                    "name": player.get("personaname", ""),
+                    "avatar": player.get("avatarfull", ""),
+                    "profile_url": player.get("profileurl", ""),
+                }
+        except Exception as e:
+            logger.warning("Steam Web API profil isteği başarısız: %s", e)
+
+    # API anahtarı yoksa veya Web API geçici olarak başarısızsa public XML
+    # profili kullan. Bu fallback başarısız olsa bile caller hesap adını gösterir.
     try:
-        api_key = Config.STEAM_API_KEY
-        if not api_key:
-            return {}
-        url = (
-            f"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-            f"?key={api_key}&steamids={steam_id}"
-        )
+        url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with safe_urlopen(req, timeout=10) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        players = data.get("response", {}).get("players", [])
-        if not players:
-            return {}
-        p = players[0]
+        with safe_urlopen(req, timeout=5) as r:
+            root = ET.fromstring(r.read().decode("utf-8"))
         return {
             "steam_id": steam_id,
-            "name": p.get("personaname", ""),
-            "avatar": p.get("avatarfull", ""),
-            "profile_url": p.get("profileurl", ""),
+            "name": (root.findtext("steamID") or "").strip(),
+            "avatar": (root.findtext("avatarFull") or "").strip(),
+            "profile_url": f"https://steamcommunity.com/profiles/{steam_id}",
         }
     except Exception as e:
-        logger.error("Steam profil bilgisi alinamadi: %s", e)
+        logger.warning("Steam Community profil isteği başarısız: %s", e)
         return {}
 
 
