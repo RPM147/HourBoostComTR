@@ -5,6 +5,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 class Config:
     # SECRET_KEY zorunlu; env'de yoksa RuntimeError fırlat
     SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -72,6 +79,17 @@ class Config:
     # ── Shopier ───────────────────────────────────────
     SHOPIER_PAT = os.environ.get("SHOPIER_PAT")
     SHOPIER_WEBHOOK_SECRET = os.environ.get("SHOPIER_WEBHOOK_SECRET")
+    SHOPIER_ACCOUNT_ID = os.environ.get("SHOPIER_ACCOUNT_ID")
+    # Shopier-Webhook-Id, delivery ID değil webhook subscription ID'sidir.
+    SHOPIER_WEBHOOK_ID = os.environ.get("SHOPIER_WEBHOOK_ID")
+    SHOPIER_API_VERIFY_ENABLED = _env_bool("SHOPIER_API_VERIFY_ENABLED", False)
+    SHOPIER_VERIFICATION_WORKER_ENABLED = _env_bool(
+        "SHOPIER_VERIFICATION_WORKER_ENABLED",
+        SHOPIER_API_VERIFY_ENABLED,
+    )
+    SHOPIER_CHECKOUT_TTL_HOURS = max(
+        1, int(os.environ.get("SHOPIER_CHECKOUT_TTL_HOURS", "24"))
+    )
     SHOPIER_BASIC_PRODUCT_ID = os.environ.get(
         "SHOPIER_BASIC_PRODUCT_ID", "45175746"
     )

@@ -93,7 +93,7 @@ class Payment(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     amount = db.Column(db.Float)
     plan = db.Column(db.String(20))
-    status = db.Column(db.String(20), default="pending")
+    status = db.Column(db.String(32), default="pending")
     transaction_id = db.Column(db.String(100), unique=True, nullable=True)
     # Webhook'ta odemeyi kullaniciya guvenli eslemek icin benzersiz 128-bit HB kodu.
     match_token = db.Column(db.String(64), nullable=True, index=True)
@@ -101,7 +101,42 @@ class Payment(db.Model):
     admin_hidden = db.Column(
         db.Boolean, nullable=False, default=False, server_default=db.false()
     )
+    # Shopier-Webhook-Id bir subscription ID'sidir; farklı siparişlerde aynı
+    # kalabileceğinden unique OLAMAZ. Asıl idempotency transaction_id üzerindedir.
+    shopier_webhook_id = db.Column(db.String(100), nullable=True)
+    shopier_event = db.Column(db.String(50), nullable=True)
+    shopier_account_id = db.Column(db.String(100), nullable=True)
+    shopier_timestamp = db.Column(db.BigInteger, nullable=True)
+    webhook_body_sha256 = db.Column(db.String(64), nullable=True)
+    webhook_received_at = db.Column(db.DateTime, nullable=True)
+    verification_attempts = db.Column(
+        db.Integer, nullable=False, default=0, server_default="0"
+    )
+    verification_error = db.Column(db.String(255), nullable=True)
+    verification_last_http_status = db.Column(db.Integer, nullable=True)
+    next_verification_at = db.Column(db.DateTime, nullable=True)
+    verification_lock_until = db.Column(db.DateTime, nullable=True)
+    verified_at = db.Column(db.DateTime, nullable=True)
+    # Finansal doğrulamanın tam sayı kuruş karşılığı; amount yalnız gösterim ve
+    # eski raporlarla uyumluluk içindir.
+    verified_amount_minor = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PaymentAuditLog(db.Model):
+    """Append-only audit trail for exceptional admin payment actions."""
+
+    __tablename__ = "payment_audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    payment_id = db.Column(db.Integer, nullable=False, index=True)
+    actor_user_id = db.Column(db.Integer, nullable=True)
+    actor_username = db.Column(db.String(80), nullable=False)
+    action = db.Column(db.String(50), nullable=False)
+    from_status = db.Column(db.String(32), nullable=True)
+    to_status = db.Column(db.String(32), nullable=True)
+    reason = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
 class BoostLog(db.Model):

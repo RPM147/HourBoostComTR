@@ -4,6 +4,8 @@ import os
 import json
 import time
 import secrets
+import hashlib
+import hmac
 import logging
 import urllib.request
 import urllib.parse
@@ -150,12 +152,25 @@ from flask import redirect as flask_redirect
 from flask_limiter import Limiter
 from steam_compat import EResult
 from flask_wtf.csrf import CSRFProtect
+from sqlalchemy import and_, or_, update
+from sqlalchemy.exc import IntegrityError
 
 from config import Config
-from models import db, User, SteamAccount, BoostGame, Payment, BoostLog, Announcement, UserSession, RevokedToken
+from models import (
+    db, User, SteamAccount, BoostGame, Payment, PaymentAuditLog, BoostLog,
+    Announcement, UserSession, RevokedToken,
+)
 from steam_manager import boost_service
 import shopier as shopier_lib
+from payment_verification import (
+    HB_TOKEN_RE,
+    OrderValidationError,
+    extract_single_token,
+    token_fingerprint,
+    validate_canonical_order,
+)
 
+from gevent.event import Event
 from gevent.lock import RLock
 
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -563,7 +578,6 @@ def _get_request_lang() -> str:
 # ───────────────────── Sunucu Başlangıcı ─────────────────────
 
 HB_TOKEN_BYTES = 16
-HB_TOKEN_RE = re.compile(r"\bHB-([0-9A-Fa-f]{32})\b", re.IGNORECASE)
 
 
 def _new_match_token() -> str:
@@ -579,10 +593,15 @@ def _generate_match_token() -> str:
 
 
 def _ensure_schema():
-    """Hafif, idempotent şema güncellemesi (Flask-Migrate kurulana dek köprü).
-    Mevcut DB'lerde eksik sütunları ekler; sütun zaten varsa no-op."""
+    """Idempotent runtime bridge until Alembic migrations are established.
+
+    Payment schema errors are fatal.  Booting an apparently healthy service
+    with a partially migrated payment table would be more dangerous than an
+    explicit outage because it could lose or mis-assign paid orders.
+    """
     try:
         from sqlalchemy import inspect, text
+
         inspector = inspect(db.engine)
         cols = {c["name"] for c in inspector.get_columns("users")}
         if "tokens_valid_after" not in cols:
@@ -591,25 +610,43 @@ def _ensure_schema():
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN tokens_valid_after {col_type}"))
             logger.info("Şema güncellendi: users.tokens_valid_after eklendi")
 
+        dialect = db.engine.dialect.name
+        datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
+        false_literal = "FALSE" if dialect == "postgresql" else "0"
         pcols = {c["name"] for c in inspector.get_columns("payments")}
-        if "match_token" not in pcols:
-            with db.engine.begin() as conn:
-                conn.execute(text("ALTER TABLE payments ADD COLUMN match_token VARCHAR(64)"))
-                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_payments_match_token ON payments (match_token)"))
-            logger.info("Şema güncellendi: payments.match_token eklendi")
+        payment_columns = {
+            "match_token": "VARCHAR(64)",
+            "admin_hidden": f"BOOLEAN NOT NULL DEFAULT {false_literal}",
+            "shopier_webhook_id": "VARCHAR(100)",
+            "shopier_event": "VARCHAR(50)",
+            "shopier_account_id": "VARCHAR(100)",
+            "shopier_timestamp": "BIGINT",
+            "webhook_body_sha256": "VARCHAR(64)",
+            "webhook_received_at": datetime_type,
+            "verification_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "verification_error": "VARCHAR(255)",
+            "verification_last_http_status": "INTEGER",
+            "next_verification_at": datetime_type,
+            "verification_lock_until": datetime_type,
+            "verified_at": datetime_type,
+            "verified_amount_minor": "INTEGER",
+        }
+        with db.engine.begin() as conn:
+            for column_name, column_type in payment_columns.items():
+                if column_name not in pcols:
+                    conn.execute(text(
+                        f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
+                    ))
+                    logger.info("Şema güncellendi: payments.%s eklendi", column_name)
 
-        elif db.engine.dialect.name == "postgresql":
-            with db.engine.begin() as conn:
-                conn.execute(text("ALTER TABLE payments ALTER COLUMN match_token TYPE VARCHAR(64)"))
-
-        if "admin_hidden" not in pcols:
-            false_literal = "FALSE" if db.engine.dialect.name == "postgresql" else "0"
+        if dialect == "postgresql":
             with db.engine.begin() as conn:
                 conn.execute(text(
-                    "ALTER TABLE payments ADD COLUMN admin_hidden "
-                    f"BOOLEAN NOT NULL DEFAULT {false_literal}"
+                    "ALTER TABLE payments ALTER COLUMN match_token TYPE VARCHAR(64)"
                 ))
-            logger.info("Şema güncellendi: payments.admin_hidden eklendi")
+                conn.execute(text(
+                    "ALTER TABLE payments ALTER COLUMN status TYPE VARCHAR(32)"
+                ))
 
         # Eski sürümde yalnızca checkout butonuna basmak status=pending üretiyordu.
         # match_token içeren ve henüz işlem görmemiş bu kayıtlar ödeme değil,
@@ -636,6 +673,13 @@ def _ensure_schema():
                 )
                 duplicate = token in used_tokens
 
+                if status == "verification_pending" and (
+                    not re.fullmatch(r"HB-[0-9A-F]{32}", token) or duplicate
+                ):
+                    raise RuntimeError(
+                        "verification_pending kaydında geçersiz/duplicate HB token bulundu"
+                    )
+
                 if is_checkout_intent and (needs_new_active_token or duplicate):
                     new_token = _new_match_token()
                     while new_token in used_tokens:
@@ -659,18 +703,6 @@ def _ensure_schema():
                     used_tokens.add(token)
 
         with db.engine.begin() as conn:
-            if db.engine.dialect.name in ("sqlite", "postgresql"):
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_match_token "
-                    "ON payments (match_token) WHERE match_token IS NOT NULL"
-                ))
-            else:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX ux_payments_match_token "
-                    "ON payments (match_token)"
-                ))
-
-        with db.engine.begin() as conn:
             migrated = conn.execute(text(
                 "UPDATE payments SET status = 'checkout_started' "
                 "WHERE status = 'pending' "
@@ -682,8 +714,78 @@ def _ensure_schema():
                 "Şema veri düzeltmesi: %d checkout kaydı checkout_started yapıldı",
                 migrated.rowcount,
             )
+
+        # Tek kullanıcı için yalnızca bir açık checkout/payment verification
+        # bulunabilir. Eski checkout duplikelerinde en yeni kayıt korunur;
+        # birden fazla verification_pending varsa güvenli otomatik karar yoktur.
+        with db.engine.begin() as conn:
+            open_rows = conn.execute(text(
+                "SELECT id, user_id, status FROM payments "
+                "WHERE user_id IS NOT NULL "
+                "AND status IN ('checkout_started', 'verification_pending') "
+                "ORDER BY user_id, id DESC"
+            )).mappings().all()
+            by_user = {}
+            for row in open_rows:
+                by_user.setdefault(row["user_id"], []).append(row)
+            for user_id, rows in by_user.items():
+                pending = [r for r in rows if r["status"] == "verification_pending"]
+                if len(pending) > 1:
+                    raise RuntimeError(
+                        f"user_id={user_id} için birden fazla verification_pending bulundu"
+                    )
+                keep_id = pending[0]["id"] if pending else rows[0]["id"]
+                for row in rows:
+                    if row["id"] != keep_id and row["status"] == "checkout_started":
+                        conn.execute(text(
+                            "UPDATE payments SET status = 'cancelled' WHERE id = :id"
+                        ), {"id": row["id"]})
+
+        with db.engine.begin() as conn:
+            duplicates = conn.execute(text(
+                "SELECT transaction_id, COUNT(*) AS n FROM payments "
+                "WHERE transaction_id IS NOT NULL GROUP BY transaction_id HAVING COUNT(*) > 1"
+            )).mappings().all()
+            if duplicates:
+                raise RuntimeError(
+                    f"payments.transaction_id duplicate kayıt sayısı: {len(duplicates)}"
+                )
+
+            if dialect in ("sqlite", "postgresql"):
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_match_token "
+                    "ON payments (match_token) WHERE match_token IS NOT NULL"
+                ))
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_transaction_id "
+                    "ON payments (transaction_id) WHERE transaction_id IS NOT NULL"
+                ))
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_one_open_checkout "
+                    "ON payments (user_id) WHERE user_id IS NOT NULL "
+                    "AND status IN ('checkout_started', 'verification_pending')"
+                ))
+            else:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX ux_payments_match_token ON payments (match_token)"
+                ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_payments_shopier_webhook_id "
+                "ON payments (shopier_webhook_id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_payments_verification_due "
+                "ON payments (status, next_verification_at, verification_lock_until)"
+            ))
     except Exception as e:
-        logger.error("Şema güncelleme hatası: %s", e)
+        try:
+            db.session.rollback()
+        except RuntimeError:
+            # _ensure_schema normalde app context içinde çağrılır. Hatalı bir
+            # CLI/test çağrısı asli migration hatasını gölgelememelidir.
+            pass
+        logger.critical("Ödeme şeması güncelleme hatası; başlangıç durduruldu: %s", e)
+        raise
 
 
 def _reconcile_boost_state_on_startup():
@@ -854,25 +956,34 @@ def is_strong_password(pw) -> bool:
     return bool(pw) and bool(_PW_RE.match(str(pw)))
 
 
-def resolve_payment_from_note(note: str):
-    """Resolve a Shopier note only through an active HB checkout token."""
-    if not note:
+def _checkout_cutoff(reference_time=None):
+    reference_time = reference_time or datetime.utcnow()
+    return reference_time - timedelta(hours=Config.SHOPIER_CHECKOUT_TTL_HOURS)
+
+
+def _find_active_checkout_by_token(token: str, reference_time=None):
+    if not token:
+        return None
+    return Payment.query.filter(
+        Payment.match_token == token,
+        Payment.status == "checkout_started",
+        Payment.transaction_id.is_(None),
+        Payment.created_at >= _checkout_cutoff(reference_time),
+    ).first()
+
+
+def resolve_payment_from_note(note: str, reference_time=None):
+    """Resolve exactly one unexpired HB token to an active checkout."""
+    try:
+        token = extract_single_token(note)
+    except OrderValidationError:
         return None, None
-    note = note.strip()
 
-    m = HB_TOKEN_RE.search(note)
-    if m:
-        token = "HB-" + m.group(1).upper()
-        payment = Payment.query.filter_by(
-            match_token=token,
-            status="checkout_started",
-            transaction_id=None,
-        ).first()
-        if payment and payment.user_id:
-            user = db.session.get(User, payment.user_id)
-            if user:
-                return user, payment
-
+    payment = _find_active_checkout_by_token(token, reference_time)
+    if payment and payment.user_id:
+        user = db.session.get(User, payment.user_id)
+        if user:
+            return user, payment
     return None, None
 
 
@@ -885,6 +996,397 @@ def _activate_plan(user, plan: str):
         datetime.utcnow() + timedelta(days=duration_days) if duration_days else None
     )
     user.plan_activated_at = datetime.utcnow()
+
+
+_PLAN_RANK = {"free": 0, "basic": 1, "premium": 2}
+
+
+def _activate_paid_plan(user, plan: str) -> bool:
+    """Apply a paid plan without allowing out-of-order payment downgrades."""
+    current_rank = _PLAN_RANK.get(user.plan, 0)
+    if user.plan_expires and user.plan_expires <= datetime.utcnow():
+        current_rank = 0
+    if current_rank > _PLAN_RANK.get(plan, -1):
+        return False
+    _activate_plan(user, plan)
+    return True
+
+
+# ───────────────────── Shopier Kalıcı Doğrulama Kuyruğu ─────────────────────
+
+SHOPIER_WEBHOOK_MAX_BYTES = 512 * 1024
+SHOPIER_VERIFICATION_BATCH_SIZE = 10
+SHOPIER_VERIFICATION_LOCK_SECONDS = 60
+SHOPIER_RETRY_DELAYS = (5, 30, 120, 600, 3600)
+SHOPIER_MAX_ATTEMPTS = len(SHOPIER_RETRY_DELAYS) + 1
+
+_payment_verification_wakeup = Event()
+_payment_verification_greenlet = None
+
+
+def _shopier_products():
+    return {
+        str(Config.SHOPIER_BASIC_PRODUCT_ID): (
+            "basic", Config.PLANS["basic"]["price"]
+        ),
+        str(Config.SHOPIER_PREMIUM_PRODUCT_ID): (
+            "premium", Config.PLANS["premium"]["price"]
+        ),
+    }
+
+
+def _safe_verification_reason(reason) -> str:
+    value = re.sub(r"[^a-zA-Z0-9_.:-]", "_", str(reason or "unknown_error"))
+    return value[:255]
+
+
+def _verification_retry_delay(attempt: int, retry_after=None) -> int:
+    if retry_after is not None:
+        try:
+            return max(1, min(3600, int(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    index = max(0, min(attempt - 1, len(SHOPIER_RETRY_DELAYS) - 1))
+    base = SHOPIER_RETRY_DELAYS[index]
+    jitter = secrets.randbelow(max(2, (base // 5) + 1))
+    return base + jitter
+
+
+def _claim_due_payment(now=None):
+    """Atomically lease one due row. Requires an active Flask app context."""
+    now = now or datetime.utcnow()
+    candidate = (
+        Payment.query
+        .filter(
+            Payment.status == "verification_pending",
+            Payment.transaction_id.isnot(None),
+            or_(
+                Payment.next_verification_at.is_(None),
+                Payment.next_verification_at <= now,
+            ),
+            or_(
+                Payment.verification_lock_until.is_(None),
+                Payment.verification_lock_until <= now,
+            ),
+        )
+        .order_by(Payment.next_verification_at.asc(), Payment.id.asc())
+        .with_entities(Payment.id)
+        .first()
+    )
+    if not candidate:
+        return None
+
+    payment_id = candidate[0]
+    lock_until = now + timedelta(seconds=SHOPIER_VERIFICATION_LOCK_SECONDS)
+    result = db.session.execute(
+        update(Payment)
+        .where(
+            Payment.id == payment_id,
+            Payment.status == "verification_pending",
+            or_(
+                Payment.next_verification_at.is_(None),
+                Payment.next_verification_at <= now,
+            ),
+            or_(
+                Payment.verification_lock_until.is_(None),
+                Payment.verification_lock_until <= now,
+            ),
+        )
+        .values(
+            verification_attempts=Payment.verification_attempts + 1,
+            verification_lock_until=lock_until,
+        )
+    )
+    if result.rowcount != 1:
+        db.session.rollback()
+        return None
+    db.session.commit()
+
+    payment = db.session.get(Payment, payment_id)
+    if not payment:
+        return None
+    return {
+        "payment_id": payment.id,
+        "order_id": payment.transaction_id,
+        "attempt": payment.verification_attempts,
+    }
+
+
+def _mark_verification_failed(payment_id, attempt, reason, http_status=None):
+    payment = db.session.get(Payment, payment_id)
+    if (
+        not payment
+        or payment.status != "verification_pending"
+        or payment.verification_attempts != attempt
+    ):
+        return False
+    payment.status = "verification_failed"
+    payment.verification_error = _safe_verification_reason(reason)
+    payment.verification_last_http_status = http_status
+    payment.next_verification_at = None
+    payment.verification_lock_until = None
+    db.session.commit()
+    logger.warning(
+        "shopier.verification.failed payment_id=%s order_id=%s reason=%s attempt=%s",
+        payment.id,
+        payment.transaction_id,
+        payment.verification_error,
+        attempt,
+    )
+    return True
+
+
+def _schedule_verification_retry(payment_id, attempt, error):
+    payment = db.session.get(Payment, payment_id)
+    if (
+        not payment
+        or payment.status != "verification_pending"
+        or payment.verification_attempts != attempt
+    ):
+        return False
+
+    reason = _safe_verification_reason(getattr(error, "reason", "api_error"))
+    http_status = getattr(error, "status_code", None)
+    retryable = bool(getattr(error, "retryable", False))
+    if not retryable or attempt >= SHOPIER_MAX_ATTEMPTS:
+        terminal_reason = f"retry_exhausted:{reason}" if retryable else reason
+        return _mark_verification_failed(
+            payment_id, attempt, terminal_reason, http_status
+        )
+
+    delay = _verification_retry_delay(
+        attempt, getattr(error, "retry_after", None)
+    )
+    payment.verification_error = reason
+    payment.verification_last_http_status = http_status
+    payment.next_verification_at = datetime.utcnow() + timedelta(seconds=delay)
+    payment.verification_lock_until = None
+    db.session.commit()
+    logger.warning(
+        "shopier.verification.retry payment_id=%s order_id=%s reason=%s "
+        "attempt=%s delay=%s",
+        payment.id,
+        payment.transaction_id,
+        reason,
+        attempt,
+        delay,
+    )
+    return True
+
+
+def _mark_financially_verified_unmatched(payment, canonical, reason):
+    payment.user_id = None
+    payment.match_token = None
+    payment.plan = canonical.plan
+    payment.amount = float(canonical.amount)
+    payment.verified_amount_minor = canonical.amount_minor
+    payment.verified_at = datetime.utcnow()
+    payment.status = "unmatched"
+    payment.verification_error = _safe_verification_reason(reason)
+    payment.verification_last_http_status = 200
+    payment.next_verification_at = None
+    payment.verification_lock_until = None
+
+
+def _finalize_canonical_order(payment_id, attempt, canonical):
+    """Finalize payment and plan in one DB transaction."""
+    payment = db.session.get(Payment, payment_id)
+    if (
+        not payment
+        or payment.status != "verification_pending"
+        or payment.verification_attempts != attempt
+        or payment.transaction_id != canonical.order_id
+    ):
+        return False
+
+    if canonical.token_error:
+        if payment.match_token:
+            return _mark_verification_failed(
+                payment_id, attempt, canonical.token_error, 200
+            )
+        _mark_financially_verified_unmatched(
+            payment, canonical, canonical.token_error
+        )
+        db.session.commit()
+        logger.warning(
+            "shopier.verification.unmatched payment_id=%s order_id=%s reason=%s",
+            payment.id,
+            payment.transaction_id,
+            payment.verification_error,
+        )
+        return True
+
+    target = payment
+    if payment.match_token:
+        if payment.match_token != canonical.token or not payment.user_id:
+            return _mark_verification_failed(
+                payment_id, attempt, "token_mismatch", 200
+            )
+    else:
+        target = _find_active_checkout_by_token(
+            canonical.token,
+            payment.webhook_received_at or datetime.utcnow(),
+        )
+        if not target or not target.user_id:
+            _mark_financially_verified_unmatched(
+                payment, canonical, "active_token_not_found"
+            )
+            db.session.commit()
+            logger.warning(
+                "shopier.verification.unmatched payment_id=%s order_id=%s "
+                "reason=active_token_not_found token_fp=%s",
+                payment.id,
+                payment.transaction_id,
+                token_fingerprint(canonical.token),
+            )
+            return True
+
+        metadata = {
+            "transaction_id": payment.transaction_id,
+            "shopier_webhook_id": payment.shopier_webhook_id,
+            "shopier_event": payment.shopier_event,
+            "shopier_account_id": payment.shopier_account_id,
+            "shopier_timestamp": payment.shopier_timestamp,
+            "webhook_body_sha256": payment.webhook_body_sha256,
+            "webhook_received_at": payment.webhook_received_at,
+            "verification_attempts": payment.verification_attempts,
+        }
+        db.session.delete(payment)
+        db.session.flush()
+        for field, value in metadata.items():
+            setattr(target, field, value)
+
+    user = db.session.get(User, target.user_id)
+    if not user:
+        db.session.rollback()
+        return False
+
+    target.status = "completed"
+    target.plan = canonical.plan
+    target.amount = float(canonical.amount)
+    target.verified_amount_minor = canonical.amount_minor
+    target.verified_at = datetime.utcnow()
+    target.verification_error = None
+    target.verification_last_http_status = 200
+    target.next_verification_at = None
+    target.verification_lock_until = None
+    plan_changed = _activate_paid_plan(user, canonical.plan)
+    db.session.commit()
+
+    logger.info(
+        "shopier.payment.completed payment_id=%s order_id=%s plan=%s "
+        "amount_minor=%s plan_changed=%s",
+        target.id,
+        target.transaction_id,
+        canonical.plan,
+        canonical.amount_minor,
+        plan_changed,
+    )
+    return True
+
+
+def _process_payment_claim(claim):
+    try:
+        order = shopier_lib.get_order(Config.SHOPIER_PAT, claim["order_id"])
+    except shopier_lib.ShopierAPIError as exc:
+        with app.app_context():
+            _schedule_verification_retry(
+                claim["payment_id"], claim["attempt"], exc
+            )
+        return False
+
+    try:
+        canonical = validate_canonical_order(
+            order,
+            expected_order_id=claim["order_id"],
+            products=_shopier_products(),
+        )
+    except OrderValidationError as exc:
+        with app.app_context():
+            _mark_verification_failed(
+                claim["payment_id"], claim["attempt"], exc.reason, 200
+            )
+        return False
+
+    try:
+        with app.app_context():
+            return _finalize_canonical_order(
+                claim["payment_id"], claim["attempt"], canonical
+            )
+    except IntegrityError:
+        with app.app_context():
+            db.session.rollback()
+        logger.warning(
+            "shopier.verification.concurrent_conflict payment_id=%s order_id=%s",
+            claim["payment_id"],
+            claim["order_id"],
+        )
+        return False
+    except Exception:
+        with app.app_context():
+            db.session.rollback()
+            synthetic = shopier_lib.ShopierAPIError(
+                "internal_finalize_error", retryable=True
+            )
+            _schedule_verification_retry(
+                claim["payment_id"], claim["attempt"], synthetic
+            )
+        logger.exception(
+            "shopier.verification.internal_error payment_id=%s order_id=%s",
+            claim["payment_id"],
+            claim["order_id"],
+        )
+        return False
+
+
+def process_due_payment_verifications(limit=SHOPIER_VERIFICATION_BATCH_SIZE):
+    """Process a bounded number of due jobs; deterministic entrypoint for tests."""
+    processed = 0
+    for _ in range(max(1, min(int(limit), 50))):
+        with app.app_context():
+            claim = _claim_due_payment()
+        if not claim:
+            break
+        processed += 1
+        _process_payment_claim(claim)
+        gevent.sleep(0)
+    return processed
+
+
+def _payment_verification_loop():
+    logger.info("shopier.verification.worker_started")
+    while True:
+        _payment_verification_wakeup.clear()
+        try:
+            processed = process_due_payment_verifications()
+        except Exception:
+            logger.exception("shopier.verification.worker_iteration_failed")
+            processed = 0
+        if processed:
+            gevent.sleep(0.25)
+            continue
+        _payment_verification_wakeup.wait(timeout=5)
+
+
+def _payment_worker_failed(greenlet):
+    logger.critical(
+        "shopier.verification.worker_died exception=%s",
+        type(greenlet.exception).__name__ if greenlet.exception else "unknown",
+    )
+
+
+def _start_payment_verification_worker():
+    global _payment_verification_greenlet
+    if not Config.SHOPIER_API_VERIFY_ENABLED:
+        logger.warning("Shopier API doğrulaması feature flag ile kapalı")
+        return
+    if not Config.SHOPIER_VERIFICATION_WORKER_ENABLED:
+        logger.warning("Shopier verification worker feature flag ile kapalı")
+        return
+    if _payment_verification_greenlet and not _payment_verification_greenlet.dead:
+        return
+    _payment_verification_greenlet = gevent.spawn(_payment_verification_loop)
+    _payment_verification_greenlet.link_exception(_payment_worker_failed)
 
 
 # ───────────────────── Bakım Modu ─────────────────────
@@ -1803,13 +2305,30 @@ def plan_request():
 @app.route("/plan/checkout", methods=["POST"])
 @login_required
 def plan_checkout():
-    plan = request.json.get("plan")
+    data = request.get_json(silent=True) or {}
+    plan = data.get("plan")
     if plan not in ("basic", "premium"):
         return jsonify({"ok": False, "error": "Invalid plan."})
 
     user = g.user
     if user.plan == plan:
         return jsonify({"ok": False, "error": "You are already on this plan."})
+    if _PLAN_RANK.get(user.plan, 0) > _PLAN_RANK[plan]:
+        return jsonify({
+            "ok": False,
+            "error": "A paid plan cannot be downgraded through checkout.",
+        }), 409
+
+    pending_verification = Payment.query.filter_by(
+        user_id=user.id,
+        status="verification_pending",
+    ).first()
+    if pending_verification:
+        return jsonify({
+            "ok": False,
+            "error": "A payment is already being verified. Please wait.",
+            "payment_id": pending_verification.id,
+        }), 409
 
     # Ürün ID'leri Config'ten (SHOPIER_*_PRODUCT_ID) gelir; URL burada türetilir
     # ki ID değişikliği tek yerden yönetilsin (ISSUES.md #12).
@@ -1822,12 +2341,17 @@ def plan_checkout():
     # Bu kayıt ödeme yapıldığı anlamına gelmez ve admin onay kuyruğunda gösterilmez.
     # Tek aktif checkout kurali: ayni plandaki intent'i yeniden kullan, digerlerini
     # iptal et. Iptal edilen veya tamamlanan token tekrar plan aktive edemez.
-    checkout_intents = (Payment.query
-                        .filter_by(user_id=user.id, status="checkout_started")
-                        .order_by(Payment.created_at.desc()).all())
+    checkout_intents = (
+        Payment.query
+        .filter_by(user_id=user.id, status="checkout_started")
+        .order_by(Payment.created_at.desc())
+        .all()
+    )
     payment = None
+    cutoff = _checkout_cutoff()
     for p in checkout_intents:
-        if payment is None and p.plan == plan and p.match_token:
+        is_fresh = p.created_at is not None and p.created_at >= cutoff
+        if payment is None and is_fresh and p.plan == plan and p.match_token:
             payment = p          # bu plandaki en güncel checkout kodunu koru
         else:
             p.status = "cancelled"   # diğer planlar + fazlalık duplikeler
@@ -1838,11 +2362,33 @@ def plan_checkout():
         db.session.add(payment)
     else:
         token = payment.match_token
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        active = Payment.query.filter_by(
+            user_id=user.id,
+            status="checkout_started",
+        ).first()
+        if active and active.plan == plan and active.match_token:
+            payment = active
+            token = active.match_token
+        else:
+            return jsonify({
+                "ok": False,
+                "error": "Another checkout is already active. Please retry.",
+            }), 409
 
-    logger.info("Checkout baslatildi: user=%s plan=%s token=%s", user.username, plan, token)
+    logger.info(
+        "Checkout baslatildi: user_id=%s payment_id=%s plan=%s token_fp=%s",
+        user.id,
+        payment.id,
+        plan,
+        token_fingerprint(token),
+    )
     return jsonify({
         "ok": True,
+        "payment_id": payment.id,
         "shopier_url": shopier_links[plan],
         "match_token": token,
         "note": f"Order note code: {token}",
@@ -1859,107 +2405,159 @@ def payment_check(payment_id):
 
 
 @app.route("/shopier/webhook", methods=["POST"])
+@limiter.exempt
 @csrf.exempt
 def shopier_webhook():
+    if not Config.SHOPIER_API_VERIFY_ENABLED:
+        logger.error("shopier.webhook.disabled")
+        return jsonify({"error": "Payment verification unavailable"}), 503
+    if not Config.SHOPIER_VERIFICATION_WORKER_ENABLED:
+        logger.error("shopier.webhook.worker_disabled")
+        return jsonify({"error": "Payment verification unavailable"}), 503
     if not Config.SHOPIER_WEBHOOK_SECRET:
-        logger.error("SHOPIER_WEBHOOK_SECRET ayarlanmamış! Webhook reddedildi.")
-        return jsonify({"error": "Server configuration error"}), 500
+        logger.error("shopier.webhook.missing_secret")
+        return jsonify({"error": "Payment verification unavailable"}), 503
+    if not Config.SHOPIER_PAT:
+        logger.error("shopier.webhook.missing_pat")
+        return jsonify({"error": "Payment verification unavailable"}), 503
+    if not Config.SHOPIER_ACCOUNT_ID or not Config.SHOPIER_WEBHOOK_ID:
+        logger.error("shopier.webhook.missing_identity_config")
+        return jsonify({"error": "Payment verification unavailable"}), 503
 
-    raw_body = request.get_data()
+    if request.content_length and request.content_length > SHOPIER_WEBHOOK_MAX_BYTES:
+        return jsonify({"error": "Payload too large"}), 413
+
+    raw_body = request.get_data(cache=True, as_text=False)
+    if len(raw_body) > SHOPIER_WEBHOOK_MAX_BYTES:
+        return jsonify({"error": "Payload too large"}), 413
     signature = request.headers.get("Shopier-Signature", "")
 
     if not shopier_lib.verify_webhook(raw_body, signature, Config.SHOPIER_WEBHOOK_SECRET):
-        logger.warning("Shopier webhook: IMZA HATASI!")
+        logger.warning("shopier.webhook.invalid_signature")
         return jsonify({"error": "Invalid signature"}), 401
 
+    event_type = request.headers.get("Shopier-Event", "").strip()
+    webhook_id = request.headers.get("Shopier-Webhook-Id", "").strip()
+    account_id = request.headers.get("Shopier-Account-Id", "").strip()
+    timestamp_raw = request.headers.get("Shopier-Timestamp", "").strip()
+
+    if not event_type or not re.fullmatch(r"[a-z][a-zA-Z0-9_.-]{0,99}", event_type):
+        return jsonify({"error": "Invalid event"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", webhook_id):
+        return jsonify({"error": "Invalid webhook id"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", account_id):
+        return jsonify({"error": "Invalid account id"}), 400
     try:
-        data = request.json or {}
-    except Exception:
+        shopier_timestamp = int(timestamp_raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid timestamp"}), 400
+    if shopier_timestamp <= 0 or shopier_timestamp > int(time.time()) + 300:
+        return jsonify({"error": "Invalid timestamp"}), 400
+
+    if not hmac.compare_digest(account_id, str(Config.SHOPIER_ACCOUNT_ID)):
+        logger.warning("shopier.webhook.account_mismatch")
+        return jsonify({"error": "Account mismatch"}), 403
+    if not hmac.compare_digest(webhook_id, str(Config.SHOPIER_WEBHOOK_ID)):
+        logger.warning("shopier.webhook.subscription_mismatch")
+        return jsonify({"error": "Webhook mismatch"}), 403
+
+    if event_type != "order.created":
+        logger.info("shopier.webhook.ignored event=%s", event_type)
+        return jsonify({"ok": True, "ignored": True}), 200
+
+    try:
+        data = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return jsonify({"error": "Invalid JSON"}), 400
+    if not isinstance(data, dict):
         return jsonify({"error": "Invalid data"}), 400
 
-    event_type = request.headers.get("Shopier-Event", "") or data.get("event", "")
-    logger.info("Shopier webhook alindi: event=%s", event_type)
+    shopier_txn = str(data.get("id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", shopier_txn):
+        return jsonify({"error": "Invalid transaction id"}), 400
 
-    # Shopier sürümüne göre event adı değişebiliyor (order.created /
-    # order.fulfilled / payment.completed). Bilinen bir event adı varsa ve
-    # kabul listesinde değilse atla; event adı hiç yoksa (imza zaten
-    # doğrulandığından) işleme devam et.
-    ACCEPTED_EVENTS = {"order.created", "order.fulfilled", "payment.completed"}
-    if event_type and event_type not in ACCEPTED_EVENTS:
-        logger.info("Shopier webhook: islenmeyen event=%s, atlandi", event_type)
-        return jsonify({"ok": True}), 200
+    existing = Payment.query.filter_by(transaction_id=shopier_txn).first()
+    if existing:
+        logger.info(
+            "shopier.webhook.duplicate order_id=%s payment_id=%s",
+            shopier_txn,
+            existing.id,
+        )
+        return jsonify({"ok": True, "duplicate": True}), 200
 
-    order = data
-    line_items = order.get("lineItems", [])
-    product_id = str(line_items[0].get("productId", "")) if line_items else ""
-    buyer_note = (order.get("note") or "").strip()
-    shopier_txn = str(order.get("id") or "").strip()
+    received_at = datetime.utcnow()
+    body_sha256 = hashlib.sha256(raw_body).hexdigest()
+    _user, matched_payment = resolve_payment_from_note(
+        data.get("note"), received_at
+    )
+    metadata = {
+        "status": "verification_pending",
+        "transaction_id": shopier_txn,
+        "shopier_webhook_id": webhook_id,
+        "shopier_event": event_type,
+        "shopier_account_id": account_id,
+        "shopier_timestamp": shopier_timestamp,
+        "webhook_body_sha256": body_sha256,
+        "webhook_received_at": received_at,
+        "verification_attempts": 0,
+        "verification_error": None,
+        "verification_last_http_status": None,
+        "next_verification_at": received_at,
+        "verification_lock_until": None,
+    }
 
-    # transaction_id olmadan duplicate koruması çalışmaz; plan aktive etmeden reddet.
-    if not shopier_txn:
-        logger.error("Shopier webhook: bos transaction_id, istek reddedildi")
-        return jsonify({"error": "Missing transaction id"}), 400
-
-    existing_txn = Payment.query.filter_by(transaction_id=shopier_txn).first()
-    if existing_txn:
-        logger.info("Shopier webhook: duplicate transaction_id=%s, atlanıyor", shopier_txn)
-        return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
-
-    plan = shopier_lib.extract_plan(product_id, Config.SHOPIER_BASIC_PRODUCT_ID, Config.SHOPIER_PREMIUM_PRODUCT_ID)
-    if not plan:
-        logger.error("Shopier webhook: bilinmeyen urun ID=%s", product_id)
-        return jsonify({"error": "Unknown product"}), 400
-
-    user, matched_payment = resolve_payment_from_note(buyer_note)
-    plan_price = Config.PLANS.get(plan, {}).get("price", 0)
-
-    from sqlalchemy.exc import IntegrityError
-
-    if not user:
-        logger.error("Shopier webhook: kullanici bulunamadi note='%s'", buyer_note)
-        unmatched = Payment(user_id=None, amount=plan_price, plan=plan,
-                           status="unmatched", transaction_id=shopier_txn)
-        db.session.add(unmatched)
-        try:
-            db.session.commit()
-        except IntegrityError:
-            # Eşzamanlı ikinci webhook aynı txn'i araya girip eklemiş olabilir.
-            db.session.rollback()
-            logger.info("Shopier webhook: eszamanli duplicate txn=%s (unmatched), atlandi", shopier_txn)
-            return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
-        return jsonify({"ok": True, "warning": "User not found, saved as unmatched"}), 200
-
-    # Sadece aktif checkout intent tamamlanir. Urun ID'sinden gelen plan ve tutar
-    # otoriterdir; eski pending/finished/cancelled kayitlar mutate edilmez.
-    payment = matched_payment
-    if payment is None:
-        logger.error("Shopier webhook: aktif checkout token bulunamadi note='%s'", buyer_note)
-        unmatched = Payment(user_id=None, amount=plan_price, plan=plan,
-                           status="unmatched", transaction_id=shopier_txn)
-        db.session.add(unmatched)
-        try:
-            db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            logger.info("Shopier webhook: eszamanli duplicate txn=%s (unmatched), atlandi", shopier_txn)
-            return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
-        return jsonify({"ok": True, "warning": "Active checkout token not found, saved as unmatched"}), 200
-
-    payment.status = "completed"
-    payment.plan = plan
-    payment.amount = plan_price
-    payment.transaction_id = shopier_txn
-
-    _activate_plan(user, plan)
+    payment_id = None
     try:
+        if matched_payment:
+            result = db.session.execute(
+                update(Payment)
+                .where(
+                    Payment.id == matched_payment.id,
+                    Payment.status == "checkout_started",
+                    Payment.transaction_id.is_(None),
+                )
+                .values(**metadata)
+            )
+            if result.rowcount == 1:
+                payment_id = matched_payment.id
+            else:
+                db.session.rollback()
+
+        if payment_id is None:
+            placeholder = Payment(user_id=None, amount=None, plan=None, **metadata)
+            db.session.add(placeholder)
+            db.session.flush()
+            payment_id = placeholder.id
+
         db.session.commit()
     except IntegrityError:
-        # transaction_id unique kisiti: ayni txn eszamanli islenmis.
         db.session.rollback()
-        logger.info("Shopier webhook: eszamanli duplicate txn=%s, atlandi", shopier_txn)
-        return jsonify({"ok": True, "message": "Duplicate ignored"}), 200
-    logger.info("Shopier webhook: plan aktif edildi user=%s plan=%s txn=%s", user.username, plan, shopier_txn)
-    return jsonify({"ok": True}), 200
+        duplicate = Payment.query.filter_by(transaction_id=shopier_txn).first()
+        if duplicate:
+            logger.info(
+                "shopier.webhook.duplicate order_id=%s payment_id=%s",
+                shopier_txn,
+                duplicate.id,
+            )
+            return jsonify({"ok": True, "duplicate": True}), 200
+        logger.exception("shopier.webhook.persistence_conflict order_id=%s", shopier_txn)
+        return jsonify({"error": "Persistence failure"}), 500
+    except Exception:
+        db.session.rollback()
+        logger.exception("shopier.webhook.persistence_failed order_id=%s", shopier_txn)
+        return jsonify({"error": "Persistence failure"}), 500
+
+    _payment_verification_wakeup.set()
+    logger.info(
+        "shopier.verification.pending payment_id=%s order_id=%s webhook_id=%s",
+        payment_id,
+        shopier_txn,
+        webhook_id,
+    )
+    return jsonify({
+        "ok": True,
+        "status": "verification_pending",
+    }), 200
 
 
 # ───────────────────── Steam Hesaplar ─────────────────────
@@ -2813,7 +3411,15 @@ def admin_stats():
             db.session.query(db.func.sum(Payment.amount))
             .filter(Payment.status == "completed").scalar() or 0
         ),
-        "pending_payments": Payment.query.filter_by(status="pending").count(),
+        "pending_payments": Payment.query.filter(Payment.status.in_((
+            "pending", "verification_pending", "verification_failed", "unmatched"
+        ))).count(),
+        "verifications_pending": Payment.query.filter_by(
+            status="verification_pending"
+        ).count(),
+        "manual_review_payments": Payment.query.filter(Payment.status.in_((
+            "verification_failed", "unmatched"
+        ))).count(),
     })
 
 
@@ -2916,7 +3522,15 @@ def admin_payments():
             Payment.status != "checkout_started",
             Payment.admin_hidden.is_(False),
         )
-        .order_by(db.case((Payment.status == "unmatched", 0), else_=1), Payment.created_at.desc())
+        .order_by(
+            db.case(
+                (Payment.status == "verification_failed", 0),
+                (Payment.status == "unmatched", 1),
+                (Payment.status == "verification_pending", 2),
+                else_=3,
+            ),
+            Payment.created_at.desc(),
+        )
         .limit(50).all()
     )
 
@@ -2931,7 +3545,18 @@ def admin_payments():
         "username": user_map.get(p.user_id, "unmatched"),
         "amount": p.amount, "plan": p.plan, "status": p.status,
         "transaction_id": p.transaction_id or "",
-        "created_at": p.created_at.isoformat(),
+        "verification_error": p.verification_error or "",
+        "verification_attempts": p.verification_attempts or 0,
+        "verified_at": p.verified_at.isoformat() if p.verified_at else None,
+        "can_match": bool(
+            p.status == "unmatched"
+            and p.verified_at
+            and p.transaction_id
+            and p.verified_amount_minor is not None
+            and p.plan in ("basic", "premium")
+        ),
+        "can_retry": bool(p.status == "verification_failed" and p.transaction_id),
+        "created_at": p.created_at.isoformat() if p.created_at else None,
     } for p in payments]})
 
 
@@ -2941,33 +3566,110 @@ def admin_approve_payment():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    payment_id = request.json.get("payment_id")
+    data = request.get_json(silent=True) or {}
+    payment_id = data.get("payment_id")
     payment = db.session.get(Payment, payment_id)
     if not payment:
-        return jsonify({"ok": False, "error": "Payment not found."})
-    if payment.admin_hidden or payment.status not in ("pending", "unmatched"):
+        return jsonify({"ok": False, "error": "Payment not found."}), 404
+    if (
+        payment.admin_hidden
+        or payment.status != "unmatched"
+        or not payment.verified_at
+        or not payment.transaction_id
+        or payment.verified_amount_minor is None
+        or payment.plan not in ("basic", "premium")
+    ):
         return jsonify({
             "ok": False,
-            "error": "This payment is not awaiting manual approval.",
+            "error": "This order has not passed canonical payment verification.",
         }), 409
 
-    if payment.status == "unmatched":
-        username = request.json.get("username", "").strip()
-        if not username:
-            return jsonify({"ok": False, "error": "Username is required."})
-        user = User.query.filter_by(username=username).first()
-        if not user:
-            return jsonify({"ok": False, "error": f"'{username}' not found."})
-        payment.user_id = user.id
-    else:
-        user = db.session.get(User, payment.user_id)
-        if not user:
-            return jsonify({"ok": False, "error": "User not found."})
+    username = str(data.get("username") or "").strip()
+    reason = str(data.get("reason") or "").strip()
+    if not username:
+        return jsonify({"ok": False, "error": "Username is required."}), 400
+    if len(reason) < 5 or len(reason) > 255:
+        return jsonify({
+            "ok": False,
+            "error": "An audit reason between 5 and 255 characters is required.",
+        }), 400
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({"ok": False, "error": f"'{username}' not found."}), 404
 
+    old_status = payment.status
+    payment.user_id = user.id
     payment.status = "completed"
-    _activate_plan(user, payment.plan)
+    payment.verification_error = "manual_match"
+    plan_changed = _activate_paid_plan(user, payment.plan)
+    db.session.add(PaymentAuditLog(
+        payment_id=payment.id,
+        actor_user_id=g.user.id,
+        actor_username=g.user.username,
+        action="manual_match",
+        from_status=old_status,
+        to_status="completed",
+        reason=reason,
+    ))
     db.session.commit()
-    return jsonify({"ok": True, "message": f"{user.username} upgraded to {payment.plan} plan."})
+    logger.warning(
+        "shopier.payment.manual_match payment_id=%s order_id=%s admin_id=%s",
+        payment.id,
+        payment.transaction_id,
+        g.user.id,
+    )
+    return jsonify({
+        "ok": True,
+        "message": f"{user.username} matched to verified {payment.plan} order.",
+        "plan_changed": plan_changed,
+    })
+
+
+@app.route("/admin/payments/retry", methods=["POST"])
+@login_required
+def admin_retry_payment():
+    if not g.user.is_admin:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    payment = db.session.get(Payment, data.get("payment_id"))
+    reason = str(data.get("reason") or "").strip()
+    if not payment:
+        return jsonify({"ok": False, "error": "Payment not found."}), 404
+    if (
+        payment.admin_hidden
+        or payment.status != "verification_failed"
+        or not payment.transaction_id
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "This payment cannot be retried.",
+        }), 409
+    if len(reason) < 5 or len(reason) > 255:
+        return jsonify({
+            "ok": False,
+            "error": "An audit reason between 5 and 255 characters is required.",
+        }), 400
+
+    old_status = payment.status
+    payment.status = "verification_pending"
+    payment.verification_attempts = 0
+    payment.verification_error = None
+    payment.verification_last_http_status = None
+    payment.next_verification_at = datetime.utcnow()
+    payment.verification_lock_until = None
+    db.session.add(PaymentAuditLog(
+        payment_id=payment.id,
+        actor_user_id=g.user.id,
+        actor_username=g.user.username,
+        action="verification_retry",
+        from_status=old_status,
+        to_status="verification_pending",
+        reason=reason,
+    ))
+    db.session.commit()
+    _payment_verification_wakeup.set()
+    return jsonify({"ok": True, "message": "Payment verification queued."})
 
 
 @app.route("/admin/payments/hide", methods=["POST"])
@@ -2982,6 +3684,15 @@ def admin_hide_payment():
         return jsonify({"ok": False, "error": "Payment not found."}), 404
 
     payment.admin_hidden = True
+    db.session.add(PaymentAuditLog(
+        payment_id=payment.id,
+        actor_user_id=g.user.id,
+        actor_username=g.user.username,
+        action="admin_hide",
+        from_status=payment.status,
+        to_status=payment.status,
+        reason="Admin panel cleanup; payment record retained.",
+    ))
     db.session.commit()
     logger.info(
         "Ödeme admin panelinden gizlendi: payment_id=%s admin=%s",
@@ -3239,6 +3950,8 @@ def steam_unlink():
 
 
 # ───────────────────── Başlat ─────────────────────
+
+_start_payment_verification_worker()
 
 if __name__ == "__main__":
     print("Hour Boost calisiyor -> http://0.0.0.0:5000")
