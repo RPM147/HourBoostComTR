@@ -1,7 +1,7 @@
 import multiprocessing
 import os
 
-bind = "0.0.0.0:5000"
+bind = "127.0.0.1:5000"
 # UYARI: Boost durumu, timer'lar, JWT blacklist, brute-force sayaçları,
 # game_cache ve "memory://" rate limiter PROCESS-İÇİ bellekte tutulur.
 # Bu yüzden worker sayısı 1 OLMAK ZORUNDADIR. Aksi halde çift loglama ve

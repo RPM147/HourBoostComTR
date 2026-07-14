@@ -153,7 +153,7 @@ from flask_limiter import Limiter
 from steam_compat import EResult
 from flask_wtf.csrf import CSRFProtect
 from sqlalchemy import and_, or_, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from config import Config
 from models import (
@@ -361,7 +361,13 @@ def generate_api_token(user_id, expires_hours=24 * 30):
     return pyjwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
 
 
-def verify_api_token(token):
+def _verified_token_session(token):
+    """Return ``(user_id, session_id, jti)`` for an active signed JWT.
+
+    A valid signature is not sufficient: every JWT must also map to one active
+    server-side UserSession row. This makes single-device revocation durable and
+    prevents the Flask session cookie from bypassing a revoked JWT.
+    """
     # Tek decode — önce imza + süre doğrulaması yap.
     # verify_exp=False ile yapılan önceki iki aşamalı tasarım
     # süresi dolmuş token'ların revoke kontrolünden geçip
@@ -374,82 +380,187 @@ def verify_api_token(token):
     except pyjwt.InvalidTokenError:
         return None
 
-    # İmza ve süre geçerliyse revoke/blacklist kontrolü yap.
     jti = payload.get("jti")
-    if jti:
-        revoked = RevokedToken.query.filter_by(token_jti=jti).first()
-        if revoked:
-            # Kayıt hâlâ geçerliyse reddet; süresi gectiyse temizle.
-            if revoked.expires_at > datetime.utcnow():
-                logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
-                return None
-            else:
-                try:
-                    db.session.delete(revoked)
-                    db.session.commit()
-                except Exception as e:
-                    db.session.rollback()
-                    logger.error("Revoked token temizleme hatasi: %s", e)
+    user_id = payload.get("user_id")
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+        or not isinstance(jti, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", jti)
+    ):
+        return None
+
+    # İmza ve süre geçerliyse revoke/blacklist kontrolü yap.
+    revoked = RevokedToken.query.filter_by(token_jti=jti).first()
+    if revoked:
+        # Kayıt hâlâ geçerliyse reddet; süresi gectiyse temizle.
+        if revoked.expires_at > datetime.utcnow():
+            logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
+            return None
+        try:
+            db.session.delete(revoked)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.error("Revoked token temizleme hatasi: %s", e)
 
     with _blacklist_lock:
         if token in _token_blacklist:
             return None
 
-    user_id = payload.get("user_id")
+    active_session = UserSession.query.filter_by(
+        user_id=user_id,
+        token_jti=jti,
+        is_active=True,
+    ).filter(
+        UserSession.expires_at.isnot(None),
+        UserSession.expires_at > datetime.utcnow(),
+    ).first()
+    if active_session is None:
+        return None
 
-    # Şifre değişimi / toplu oturum iptali sonrası eski token'ları reddet:
-    # token'ın iat'ı kullanıcının tokens_valid_after'ından önceyse geçersizdir.
     iat = payload.get("iat")
-    if user_id and iat:
-        user = db.session.get(User, user_id)
-        if user is not None and user.tokens_valid_after:
-            try:
-                iat_dt = datetime.utcfromtimestamp(int(iat))
-            except (TypeError, ValueError, OSError):
-                return None
-            # Saniye granülaritesinde karşılaştır: değişimle aynı saniyede
-            # üretilen yeni token yanlışlıkla reddedilmesin.
-            if iat_dt < user.tokens_valid_after.replace(microsecond=0):
-                return None
+    try:
+        iat_dt = datetime.utcfromtimestamp(int(iat))
+    except (TypeError, ValueError, OSError):
+        return None
+    user = db.session.get(User, user_id)
+    if user is None:
+        return None
+    # Şifre değişimi / toplu oturum iptali sonrası eski token'ları reddet.
+    if (
+        user.tokens_valid_after
+        and iat_dt < user.tokens_valid_after.replace(microsecond=0)
+    ):
+        return None
 
-    return user_id
+    return user_id, active_session.id, jti
+
+
+def verify_api_token(token):
+    verified = _verified_token_session(token)
+    return verified[0] if verified else None
+
+
+def _decode_token_for_revocation(token):
+    if not token:
+        return None
+    try:
+        payload = pyjwt.decode(
+            token,
+            Config.SECRET_KEY,
+            algorithms=["HS256"],
+            options={"verify_exp": False},
+        )
+        user_id = payload.get("user_id")
+        jti = payload.get("jti")
+        expires_at = datetime.utcfromtimestamp(int(payload.get("exp")))
+    except (pyjwt.InvalidTokenError, TypeError, ValueError, OSError):
+        return None
+    if (
+        not isinstance(user_id, int)
+        or isinstance(user_id, bool)
+        or user_id <= 0
+        or not isinstance(jti, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", jti)
+    ):
+        return None
+    return {
+        "user_id": user_id,
+        "jti": jti,
+        "expires_at": expires_at,
+    }
+
+
+def _stage_session_revocations(session_records, token_identities=()):
+    """Stage durable token revocations and session deactivation atomically."""
+    records = {record.id: record for record in session_records if record}
+    identities = {}
+    for record in records.values():
+        if record.token_jti and record.expires_at:
+            identities[record.token_jti] = {
+                "user_id": record.user_id,
+                "jti": record.token_jti,
+                "expires_at": record.expires_at,
+            }
+    for identity in token_identities:
+        if identity:
+            identities[identity["jti"]] = identity
+
+    now = datetime.utcnow()
+    valid_user_ids = set()
+    if identities:
+        valid_user_ids = {
+            item[0] for item in db.session.query(User.id).filter(
+                User.id.in_({
+                    identity["user_id"] for identity in identities.values()
+                })
+            ).all()
+        }
+    durable = {
+        jti: identity
+        for jti, identity in identities.items()
+        if (
+            identity["expires_at"] > now
+            and identity["user_id"] in valid_user_ids
+        )
+    }
+    existing = set()
+    if durable:
+        existing = {
+            item[0] for item in db.session.query(RevokedToken.token_jti).filter(
+                RevokedToken.token_jti.in_(durable.keys())
+            ).all()
+        }
+    for jti, identity in durable.items():
+        if jti not in existing:
+            db.session.add(RevokedToken(
+                token_jti=jti,
+                user_id=identity["user_id"],
+                expires_at=identity["expires_at"],
+            ))
+    for record in records.values():
+        record.is_active = False
+
+
+def _revoke_session_records(session_records, token_identities=()):
+    try:
+        _stage_session_revocations(session_records, token_identities)
+        db.session.commit()
+        return True
+    except Exception as e:
+        db.session.rollback()
+        logger.error("Oturum iptali kalıcılaştırılamadı: %s", e)
+        return False
 
 
 def blacklist_token(token):
-    if token:
-        try:
-            payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"], options={"verify_exp": False})
-            jti = payload.get("jti")
-            exp_timestamp = payload.get("exp", time.time() + 3600)
-            exp_datetime = datetime.utcfromtimestamp(exp_timestamp)
-
-            if jti:
-                revoked = RevokedToken(
-                    token_jti=jti,
-                    user_id=payload.get("user_id"),
-                    expires_at=exp_datetime
-                )
-                db.session.add(revoked)
-                db.session.commit()
-                logger.info("Token kalıcı olarak blacklist'e eklendi: jti=%s", jti)
-        except pyjwt.InvalidTokenError:
-            logger.warning("Token blacklist için decode edilemedi")
-
+    """Backward-compatible helper; persist revocation and return success."""
+    identity = _decode_token_for_revocation(token)
+    if identity is None:
+        return False
+    record = UserSession.query.filter_by(
+        user_id=identity["user_id"],
+        token_jti=identity["jti"],
+    ).first()
+    success = _revoke_session_records([record] if record else [], [identity])
+    if success:
         with _blacklist_lock:
             _token_blacklist.add(token)
         _cleanup_blacklist()
+    return success
 
 
 def _invalidate_all_user_tokens(user):
     """Kullanıcının tüm JWT token'larını ve aktif oturumlarını geçersiz kıl.
     tokens_valid_after güncellenir; çağıran taraf commit etmelidir."""
     user.tokens_valid_after = datetime.utcnow()
-    try:
-        UserSession.query.filter_by(user_id=user.id, is_active=True).update(
-            {"is_active": False}, synchronize_session=False
-        )
-    except Exception as e:
-        logger.error("Oturum toplu iptal hatasi: %s", e)
+    active_sessions = UserSession.query.filter_by(
+        user_id=user.id,
+        is_active=True,
+    ).all()
+    _stage_session_revocations(active_sessions)
 
 
 # ───────────────────── Brute Force Koruması ─────────────────────
@@ -522,6 +633,24 @@ def _get_user_agent() -> str:
 
 def _create_session_record(user_id: int, token: str):
     try:
+        payload = pyjwt.decode(token, Config.SECRET_KEY, algorithms=["HS256"])
+        token_user_id = payload.get("user_id")
+        token_jti = payload.get("jti")
+        try:
+            expires_at = datetime.utcfromtimestamp(int(payload.get("exp")))
+            datetime.utcfromtimestamp(int(payload.get("iat")))
+        except (TypeError, ValueError, OSError):
+            raise ValueError("JWT timestamps are invalid")
+        if (
+            not isinstance(token_user_id, int)
+            or isinstance(token_user_id, bool)
+            or token_user_id != user_id
+            or not isinstance(token_jti, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token_jti)
+            or expires_at <= datetime.utcnow()
+        ):
+            raise ValueError("JWT session identity is invalid")
+
         old_sessions = (
             UserSession.query
             .filter_by(user_id=user_id, is_active=True)
@@ -529,39 +658,63 @@ def _create_session_record(user_id: int, token: str):
             .all()
         )
         if len(old_sessions) >= 10:
-            for s in old_sessions[:len(old_sessions) - 9]:
-                s.is_active = False
+            _stage_session_revocations(
+                old_sessions[:len(old_sessions) - 9]
+            )
 
         ip = _get_client_ip()
         ua = (request.headers.get("User-Agent", "") or "")[:256]
 
         sess = UserSession(
             user_id=user_id,
-            token_hint=token[:16] if token else None,
+            token_jti=token_jti,
+            token_hint=token_jti[:12],
+            expires_at=expires_at,
             ip_address=ip,
             user_agent=ua,
         )
         db.session.add(sess)
         db.session.commit()
         logger.info("Oturum kaydı oluşturuldu: user_id=%s ip=%s", user_id, ip)
-        return sess.id
+        return sess
     except Exception as e:
         logger.error("Oturum kaydı oluşturulamadı: %s", e)
         db.session.rollback()
         return None
 
 
-def _deactivate_session_by_token(token: str):
-    if not token:
-        return
-    hint = token[:16]
-    try:
-        sess = UserSession.query.filter_by(token_hint=hint, is_active=True).first()
-        if sess:
-            sess.is_active = False
-            db.session.commit()
-    except Exception as e:
-        logger.error("Oturum kapatma hatasi: %s", e)
+def _establish_authenticated_session(user_id: int, token: str):
+    """Persist the server-side session before issuing browser credentials."""
+    session_record = _create_session_record(user_id, token)
+    if session_record is None:
+        session.clear()
+        return None
+    session.permanent = True
+    # Sayısal DB kimlikleri SQLite'ta silme sonrası yeniden kullanılabilir.
+    # Cookie yalnız kriptografik rastgele JTI taşır; user_id yetki kaynağı olmaz.
+    session["auth_jti"] = session_record.token_jti
+    return session_record.id
+
+
+def _active_cookie_session():
+    cookie_jti = session.get("auth_jti")
+    if (
+        not isinstance(cookie_jti, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", cookie_jti)
+    ):
+        return None
+    record = UserSession.query.filter_by(
+        token_jti=cookie_jti,
+        is_active=True,
+    ).filter(
+        UserSession.expires_at.isnot(None),
+        UserSession.expires_at > datetime.utcnow(),
+    ).first()
+    if record is None:
+        return None
+    if RevokedToken.query.filter_by(token_jti=cookie_jti).first():
+        return None
+    return record
 
 
 # ───────────────────── Dil Yardımcısı ─────────────────────
@@ -595,24 +748,87 @@ def _generate_match_token() -> str:
 def _ensure_schema():
     """Idempotent runtime bridge until Alembic migrations are established.
 
-    Payment schema errors are fatal.  Booting an apparently healthy service
-    with a partially migrated payment table would be more dangerous than an
-    explicit outage because it could lose or mis-assign paid orders.
+    Auth/payment schema errors are fatal. Booting with a partially migrated
+    security or financial table is more dangerous than an explicit outage.
     """
     try:
         from sqlalchemy import inspect, text
 
         inspector = inspect(db.engine)
+        dialect = db.engine.dialect.name
+        false_literal = "FALSE" if dialect == "postgresql" else "0"
+        true_literal = "TRUE" if dialect == "postgresql" else "1"
         cols = {c["name"] for c in inspector.get_columns("users")}
         if "tokens_valid_after" not in cols:
-            col_type = "TIMESTAMP" if db.engine.dialect.name == "postgresql" else "DATETIME"
+            col_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
             with db.engine.begin() as conn:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN tokens_valid_after {col_type}"))
             logger.info("Şema güncellendi: users.tokens_valid_after eklendi")
 
-        dialect = db.engine.dialect.name
+        session_cols = {
+            c["name"] for c in inspector.get_columns("user_sessions")
+        }
+        with db.engine.begin() as conn:
+            if "token_jti" not in session_cols:
+                conn.execute(text(
+                    "ALTER TABLE user_sessions ADD COLUMN token_jti VARCHAR(64)"
+                ))
+                logger.info("Şema güncellendi: user_sessions.token_jti eklendi")
+            if "expires_at" not in session_cols:
+                session_datetime_type = (
+                    "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
+                )
+                conn.execute(text(
+                    "ALTER TABLE user_sessions ADD COLUMN expires_at "
+                    + session_datetime_type
+                ))
+                logger.info("Şema güncellendi: user_sessions.expires_at eklendi")
+
+        session_indexes = {
+            item["name"]: item
+            for item in inspect(db.engine).get_indexes("user_sessions")
+        }
+        jti_index = session_indexes.get("ix_user_sessions_token_jti")
+        if jti_index is not None and not jti_index.get("unique", False):
+            raise RuntimeError(
+                "ix_user_sessions_token_jti exists but is not unique"
+            )
+        if jti_index is None:
+            with db.engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX ix_user_sessions_token_jti "
+                    "ON user_sessions (token_jti)"
+                ))
+            logger.info(
+                "Şema güncellendi: ix_user_sessions_token_jti oluşturuldu"
+            )
+
+        # Eski token_hint değerlerinden JWT jti geri üretilemez. Kullanıcı
+        # cutoff'u eski kodun da bu JWT'leri reddetmesini sağlar; ardından satır
+        # kapatılır. Böylece auth migration sonrası güvenli kod rollback'i
+        # iptal edilmiş legacy oturumları yeniden canlandırmaz.
+        legacy_cutoff = datetime.utcnow()
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE users SET tokens_valid_after = :cutoff "
+                "WHERE id IN ("
+                "SELECT DISTINCT user_id FROM user_sessions "
+                "WHERE is_active = " + true_literal + " "
+                "AND (token_jti IS NULL OR expires_at IS NULL)"
+                ") AND (tokens_valid_after IS NULL OR tokens_valid_after < :cutoff)"
+            ), {"cutoff": legacy_cutoff})
+            legacy_sessions = conn.execute(text(
+                "UPDATE user_sessions SET is_active = " + false_literal + " "
+                "WHERE is_active = " + true_literal + " "
+                "AND (token_jti IS NULL OR expires_at IS NULL)"
+            ))
+        if legacy_sessions.rowcount:
+            logger.warning(
+                "Güvenli oturum migration'ı: %d legacy oturum kapatıldı",
+                legacy_sessions.rowcount,
+            )
+
         datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-        false_literal = "FALSE" if dialect == "postgresql" else "0"
         pcols = {c["name"] for c in inspector.get_columns("payments")}
         payment_columns = {
             "match_token": "VARCHAR(64)",
@@ -784,7 +1000,7 @@ def _ensure_schema():
             # _ensure_schema normalde app context içinde çağrılır. Hatalı bir
             # CLI/test çağrısı asli migration hatasını gölgelememelidir.
             pass
-        logger.critical("Ödeme şeması güncelleme hatası; başlangıç durduruldu: %s", e)
+        logger.critical("Kritik şema güncelleme hatası; başlangıç durduruldu: %s", e)
         raise
 
 
@@ -924,8 +1140,8 @@ def _auth_error_should_be_json():
 def login_required(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        # JWT istek başında _resolve_bearer_token ile TEK SEFER doğrulandı.
-        user_id = g.get("_jwt_user_id") or session.get("user_id")
+        # JWT veya Flask cookie istek başında aynı UserSession kaydına çözüldü.
+        user_id = g.get("_auth_user_id")
         if not user_id:
             if _auth_error_should_be_json():
                 return jsonify({"ok": False, "error": "Not logged in."}), 401
@@ -1478,24 +1694,51 @@ _PLAN_CHECK_INTERVAL = 300
 
 
 @app.before_request
-def _resolve_bearer_token():
-    """JWT'yi istek başına TEK SEFER doğrula (ISSUES.md #6).
+def _resolve_request_auth():
+    """Bearer JWT veya Flask cookie'yi aktif UserSession kaydına çöz.
 
-    Önceden auto_csrf_protect, check_plan_expiry ve login_required ayrı ayrı
-    verify_api_token() çağırıyordu (3x decode + RevokedToken/User sorgusu).
-    Sonuç g üzerinde saklanır; diğerleri yalnızca bunu okur. Bu handler'ın
-    diğer before_request'lerden ÖNCE tanımlanmış olması gerekir (Flask,
-    handler'ları kayıt sırasıyla çalıştırır).
+    Authorization başlığı varsa yalnızca o kimlik bilgisi değerlendirilir;
+    geçersiz/revoked Bearer'ın cookie'ye sessizce düşmesine izin verilmez.
     """
+    g._auth_user_id = None
+    g._auth_session_id = None
+    g._auth_jti = None
     g._jwt_user_id = None
     g._jwt_token = None
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        token = auth[7:]
-        uid = verify_api_token(token)
-        if uid:
-            g._jwt_user_id = uid
+        token = auth[7:].strip()
+        verified = _verified_token_session(token)
+        if verified:
+            user_id, session_id, jti = verified
+            g._auth_user_id = user_id
+            g._auth_session_id = session_id
+            g._auth_jti = jti
+            g._jwt_user_id = user_id
             g._jwt_token = token
+        return
+
+    cookie_jti = session.get("auth_jti")
+    has_legacy_auth = (
+        "user_id" in session or "auth_session_id" in session
+    )
+    if cookie_jti is None and not has_legacy_auth:
+        return
+    if (
+        not isinstance(cookie_jti, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", cookie_jti)
+    ):
+        session.clear()
+        return
+
+    active_session = _active_cookie_session()
+    if active_session is None:
+        session.clear()
+        return
+
+    g._auth_user_id = active_session.user_id
+    g._auth_session_id = active_session.id
+    g._auth_jti = active_session.token_jti
 
 
 @app.before_request
@@ -1526,8 +1769,10 @@ def auto_csrf_protect():
             if view in csrf._exempt_views or dest in csrf._exempt_views:
                 return
 
-    if g.get("_jwt_user_id"):
-        # Geçerli JWT (istek başında tek sefer doğrulandı) → CSRF kontrolünü atla
+    if request.headers.get("Authorization", "").startswith("Bearer "):
+        # Authorization başlığı tarayıcı tarafından cross-site isteklere
+        # otomatik eklenmez. Token geçersiz/revoked olsa bile CSRF yerine ilgili
+        # endpoint'in tutarlı 401/200 cevabını üretmesine izin ver.
         return
 
     # JWT yoksa veya geçersizse standart CSRF doğrulaması yap
@@ -1536,7 +1781,7 @@ def auto_csrf_protect():
 
 @app.before_request
 def check_plan_expiry():
-    uid = session.get("user_id") or g.get("_jwt_user_id")
+    uid = g.get("_auth_user_id")
     if not uid:
         return
     now = time.time()
@@ -1561,10 +1806,13 @@ def check_plan_expiry():
     # Oturum "son görülme" güncellemesi (Bearer ile gelen istekler için).
     # Bu blok 5 dk throttle'lı (fonksiyon başındaki _plan_expiry_cache kontrolü),
     # dolayısıyla her istekte DB yazımı yapılmaz.
-    if g.get("_jwt_token"):
-        hint = g._jwt_token[:16]
+    if g.get("_auth_session_id"):
         try:
-            UserSession.query.filter_by(token_hint=hint, is_active=True).update(
+            UserSession.query.filter_by(
+                id=g._auth_session_id,
+                user_id=uid,
+                is_active=True,
+            ).update(
                 {"last_seen": datetime.utcnow()}, synchronize_session=False
             )
             db.session.commit()
@@ -1574,7 +1822,8 @@ def check_plan_expiry():
 
 # Bakım modunda dahi her zaman erişilebilen yollar: oturum açma uçları (yönetici
 # tekrar giriş yapıp modu kapatabilsin diye), oturum kontrolü ve ads.txt.
-# Statik dosyalar ve /admin* yolları gate içinde ayrıca muaf tutulur.
+# Statik dosyalar ayrıca muaf tutulur; /admin* erişimi doğrulanmış admin kimliği
+# üzerinden aşağıdaki ortak yetki kontrolünden geçer.
 _MAINTENANCE_ALLOWED_EXACT = {
     "/site_login",
     "/site_logout",
@@ -1582,13 +1831,17 @@ _MAINTENANCE_ALLOWED_EXACT = {
     "/favicon.ico",
     "/ads.txt",
 }
+_MAINTENANCE_BLOCKED_AUTH_EXACT = {
+    "/steam/login",
+    "/steam/callback",
+}
 
 
 @app.before_request
 def maintenance_gate():
     """Bakım modu açıkken yöneticiler hariç herkese bakım sayfasını göster.
 
-    _resolve_bearer_token'dan SONRA çalışır (g._jwt_user_id hazır). Yöneticiler
+    _resolve_request_auth'dan SONRA çalışır (g._auth_user_id hazır). Yöneticiler
     siteyi normal kullanmaya devam eder; statik dosyalar, admin paneli ve oturum
     açma uçları her zaman erişilebilir kalır ki kilitlenme yaşanmasın.
     """
@@ -1596,12 +1849,15 @@ def maintenance_gate():
         return
 
     path = request.path or "/"
-    if path.startswith("/static/") or path.startswith("/admin"):
+    if path in _MAINTENANCE_BLOCKED_AUTH_EXACT:
+        session.pop("steam_state", None)
+        return render_template("development.html"), 503
+    if path.startswith("/static/"):
         return
     if path in _MAINTENANCE_ALLOWED_EXACT:
         return
 
-    uid = g.get("_jwt_user_id") or session.get("user_id")
+    uid = g.get("_auth_user_id")
     if uid:
         u = db.session.get(User, uid)
         if u and u.is_admin:
@@ -1620,7 +1876,7 @@ def maintenance_gate():
 
 @app.route("/")
 def index():
-    uid = session.get("user_id")
+    uid = g.get("_auth_user_id")
     if uid and db.session.get(User, uid):
         return render_template("index.html")
     return render_template("landing.html")
@@ -1676,7 +1932,7 @@ def cerez_politikasi():
 @app.route("/en/")
 @app.route("/en")
 def index_en():
-    uid = session.get("user_id")
+    uid = g.get("_auth_user_id")
     if uid and db.session.get(User, uid):
         return render_template("en/index.html")
     return render_template("en/landing.html")
@@ -1740,7 +1996,7 @@ def ads_txt():
 
 @app.route("/session_check")
 def session_check():
-    user_id = g.get("_jwt_user_id") or session.get("user_id")
+    user_id = g.get("_auth_user_id")
     if not user_id:
         return jsonify({"logged_in": False})
     user = db.session.get(User, user_id)
@@ -2011,8 +2267,16 @@ def change_password():
     # Diğer tüm oturumlar iptal edildi; mevcut cihazın oturumda kalması
     # için taze bir token üret ve döndür (frontend bunu saklamalı).
     new_token = generate_api_token(user.id)
-    _create_session_record(user.id, new_token)
-    session["user_id"] = user.id
+    if _establish_authenticated_session(user.id, new_token) is None:
+        logger.error(
+            "Sifre degisti ancak yeni oturum olusturulamadi: user_id=%s",
+            user.id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Password changed, but a secure session could not be created. Please log in again.",
+            "reauth_required": True,
+        }), 503
 
     logger.info("Sifre degistirildi: %s", user.username)
     return jsonify({
@@ -2042,8 +2306,16 @@ def set_initial_password():
     db.session.commit()
 
     new_token = generate_api_token(user.id)
-    _create_session_record(user.id, new_token)
-    session["user_id"] = user.id
+    if _establish_authenticated_session(user.id, new_token) is None:
+        logger.error(
+            "Ilk sifre kaydedildi ancak yeni oturum olusturulamadi: user_id=%s",
+            user.id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Password was saved, but a secure session could not be created. Please log in again.",
+            "reauth_required": True,
+        }), 503
     logger.info("Steam kullanicisi ilk sifresini belirledi: %s", user.username)
     return jsonify({
         "ok": True,
@@ -2160,16 +2432,30 @@ def site_login():
         record_failed_login(ip_key)
         return jsonify({"ok": False, "error": "Invalid username or password."})
 
+    if is_maintenance_mode() and not user.is_admin:
+        logger.info(
+            "Bakim modunda non-admin girisi engellendi: user_id=%s ip=%s",
+            user.id,
+            ip,
+        )
+        return jsonify({
+            "ok": False,
+            "maintenance": True,
+            "error": "The service is temporarily unavailable due to maintenance.",
+        }), 503
+
     clear_failed_logins(ip_key)
 
     user.last_login = db.func.now()
     db.session.commit()
 
-    session.permanent = True
-    session["user_id"] = user.id
     token = generate_api_token(user.id)
-
-    _create_session_record(user.id, token)
+    if _establish_authenticated_session(user.id, token) is None:
+        logger.error("Guvenli oturum olusturulamadi: user_id=%s", user.id)
+        return jsonify({
+            "ok": False,
+            "error": "A secure session could not be created. Please try again.",
+        }), 503
 
     return jsonify({"ok": True, "is_admin": user.is_admin, "token": token})
 
@@ -2179,15 +2465,42 @@ def site_logout():
     auth_header = request.headers.get("Authorization", "")
     token = None
     if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
+        token = auth_header[7:].strip()
+
+    identity = _decode_token_for_revocation(token)
+    records = {}
+    if identity:
+        token_record = UserSession.query.filter_by(
+            user_id=identity["user_id"],
+            token_jti=identity["jti"],
+        ).first()
+        if token_record:
+            records[token_record.id] = token_record
+
+    # Resolver, bozuk Bearer varken bilinçli olarak cookie'ye fallback yapmaz.
+    # Logout ise tarayıcının imzalı cookie oturumunu da bağımsız kapatmalıdır.
+    cookie_jti = session.get("auth_jti")
+    if isinstance(cookie_jti, str) and re.fullmatch(r"[0-9a-f]{32}", cookie_jti):
+        cookie_record = UserSession.query.filter_by(token_jti=cookie_jti).first()
+        if cookie_record:
+            records[cookie_record.id] = cookie_record
 
     # Not: Web'den çıkış boost'u DURDURMAZ; boost sunucu tarafında çalışmaya
     # devam eder. Boost yalnızca /boost/toggle veya hesap silme ile durdurulur.
-    if token:
-        blacklist_token(token)
-        _deactivate_session_by_token(token)
-
+    success = _revoke_session_records(
+        list(records.values()),
+        [identity] if identity else [],
+    )
+    if success and token and identity:
+        with _blacklist_lock:
+            _token_blacklist.add(token)
+        _cleanup_blacklist()
     session.clear()
+    if not success:
+        return jsonify({
+            "ok": False,
+            "error": "Logout could not be persisted. Please try again.",
+        }), 503
     return jsonify({"ok": True})
 
 
@@ -2199,14 +2512,16 @@ def list_sessions():
     sessions = (
         UserSession.query
         .filter_by(user_id=g.user.id, is_active=True)
+        .filter(
+            UserSession.token_jti.isnot(None),
+            UserSession.expires_at.isnot(None),
+            UserSession.expires_at > datetime.utcnow(),
+        )
         .order_by(UserSession.last_seen.desc())
         .all()
     )
 
-    current_hint = None
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        current_hint = auth_header[7:][:16]
+    current_session_id = g.get("_auth_session_id")
 
     result = []
     for s in sessions:
@@ -2229,7 +2544,7 @@ def list_sessions():
             "user_agent": ua[:80] + ("..." if len(ua) > 80 else ""),
             "created_at": s.created_at.isoformat(),
             "last_seen": s.last_seen.isoformat(),
-            "is_current": s.token_hint == current_hint,
+            "is_current": s.id == current_session_id,
         })
 
     return jsonify({"sessions": result})
@@ -2238,34 +2553,38 @@ def list_sessions():
 @app.route("/sessions/revoke", methods=["POST"])
 @login_required
 def revoke_session():
-    session_id = request.json.get("session_id")
-    if not session_id:
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    if not isinstance(session_id, int) or isinstance(session_id, bool):
         return jsonify({"ok": False, "error": "session_id is required."})
 
     sess = db.session.get(UserSession, session_id)
     if not sess or sess.user_id != g.user.id:
         return jsonify({"ok": False, "error": "Session not found."})
 
-    sess.is_active = False
-    db.session.commit()
+    if not _revoke_session_records([sess]):
+        return jsonify({
+            "ok": False,
+            "error": "Session termination could not be persisted.",
+        }), 503
     return jsonify({"ok": True, "message": "Session terminated."})
 
 
 @app.route("/sessions/revoke-all", methods=["POST"])
 @login_required
 def revoke_all_sessions():
-    current_hint = None
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        current_hint = auth_header[7:][:16]
-
     query = UserSession.query.filter_by(user_id=g.user.id, is_active=True)
-    if current_hint:
-        query = query.filter(UserSession.token_hint != current_hint)
+    current_session_id = g.get("_auth_session_id")
+    if current_session_id:
+        query = query.filter(UserSession.id != current_session_id)
 
-    count = query.count()
-    query.update({"is_active": False}, synchronize_session=False)
-    db.session.commit()
+    sessions_to_revoke = query.all()
+    count = len(sessions_to_revoke)
+    if not _revoke_session_records(sessions_to_revoke):
+        return jsonify({
+            "ok": False,
+            "error": "Sessions could not be terminated.",
+        }), 503
 
     return jsonify({"ok": True, "message": f"{count} session(s) terminated."})
 
@@ -3631,9 +3950,34 @@ def admin_retry_payment():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json(silent=True) or {}
-    payment = db.session.get(Payment, data.get("payment_id"))
-    reason = str(data.get("reason") or "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "A JSON object is required.",
+        }), 400
+
+    payment_id = data.get("payment_id")
+    if type(payment_id) is not int or payment_id <= 0:
+        return jsonify({
+            "ok": False,
+            "error": "A valid payment_id is required.",
+        }), 400
+
+    reason_value = data.get("reason")
+    if not isinstance(reason_value, str):
+        return jsonify({
+            "ok": False,
+            "error": "An audit reason between 5 and 255 characters is required.",
+        }), 400
+    reason = reason_value.strip()
+    if len(reason) < 5 or len(reason) > 255:
+        return jsonify({
+            "ok": False,
+            "error": "An audit reason between 5 and 255 characters is required.",
+        }), 400
+
+    payment = db.session.get(Payment, payment_id)
     if not payment:
         return jsonify({"ok": False, "error": "Payment not found."}), 404
     if (
@@ -3645,29 +3989,120 @@ def admin_retry_payment():
             "ok": False,
             "error": "This payment cannot be retried.",
         }), 409
-    if len(reason) < 5 or len(reason) > 255:
+
+    if payment.user_id is not None and db.session.get(User, payment.user_id) is None:
+        logger.warning(
+            "shopier.verification.retry_blocked_missing_user "
+            "payment_id=%s admin_id=%s",
+            payment.id,
+            g.user.id,
+        )
         return jsonify({
             "ok": False,
-            "error": "An audit reason between 5 and 255 characters is required.",
-        }), 400
+            "error": "This payment no longer has a valid owner.",
+        }), 409
+
+    conflicting_payment = None
+    if payment.user_id is not None:
+        conflicting_payment = (
+            db.session.query(Payment.id)
+            .filter(
+                Payment.user_id == payment.user_id,
+                Payment.id != payment.id,
+                Payment.status.in_(("checkout_started", "verification_pending")),
+            )
+            .order_by(Payment.id.desc())
+            .first()
+        )
+    if conflicting_payment:
+        logger.warning(
+            "shopier.verification.retry_blocked_open_payment "
+            "payment_id=%s conflicting_payment_id=%s admin_id=%s",
+            payment.id,
+            conflicting_payment[0],
+            g.user.id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Another checkout or payment verification is already open for this user.",
+            "conflict": "open_payment_exists",
+        }), 409
 
     old_status = payment.status
-    payment.status = "verification_pending"
-    payment.verification_attempts = 0
-    payment.verification_error = None
-    payment.verification_last_http_status = None
-    payment.next_verification_at = datetime.utcnow()
-    payment.verification_lock_until = None
-    db.session.add(PaymentAuditLog(
-        payment_id=payment.id,
-        actor_user_id=g.user.id,
-        actor_username=g.user.username,
-        action="verification_retry",
-        from_status=old_status,
-        to_status="verification_pending",
-        reason=reason,
-    ))
-    db.session.commit()
+    transaction_id = payment.transaction_id
+    owner_condition = (
+        Payment.user_id.is_(None)
+        if payment.user_id is None
+        else Payment.user_id == payment.user_id
+    )
+    try:
+        result = db.session.execute(
+            update(Payment)
+            .where(
+                Payment.id == payment_id,
+                Payment.status == "verification_failed",
+                Payment.admin_hidden.is_(False),
+                Payment.transaction_id == transaction_id,
+                owner_condition,
+            )
+            .values(
+                status="verification_pending",
+                verification_attempts=0,
+                verification_error=None,
+                verification_last_http_status=None,
+                next_verification_at=datetime.utcnow(),
+                verification_lock_until=None,
+            )
+        )
+        if result.rowcount != 1:
+            db.session.rollback()
+            logger.warning(
+                "shopier.verification.retry_stale payment_id=%s admin_id=%s",
+                payment_id,
+                g.user.id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "The payment changed before the retry could be queued.",
+                "conflict": "payment_state_changed",
+            }), 409
+
+        db.session.add(PaymentAuditLog(
+            payment_id=payment_id,
+            actor_user_id=g.user.id,
+            actor_username=g.user.username,
+            action="verification_retry",
+            from_status=old_status,
+            to_status="verification_pending",
+            reason=reason,
+        ))
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        logger.warning(
+            "shopier.verification.retry_integrity_conflict "
+            "payment_id=%s admin_id=%s",
+            payment_id,
+            g.user.id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Another checkout or payment verification became active. Retry was not queued.",
+            "conflict": "open_payment_exists",
+        }), 409
+    except SQLAlchemyError:
+        db.session.rollback()
+        logger.exception(
+            "shopier.verification.retry_database_error "
+            "payment_id=%s admin_id=%s",
+            payment_id,
+            g.user.id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Payment retry could not be queued. Please try again.",
+        }), 503
+
     _payment_verification_wakeup.set()
     return jsonify({"ok": True, "message": "Payment verification queued."})
 
@@ -3921,10 +4356,15 @@ def steam_callback():
         db.session.commit()
         logger.info("Steam ile yeni kullanici olusturuldu: %s (steam_id=%s)", username, steam_id)
 
-    session.permanent = True
-    session["user_id"] = user.id
     token = generate_api_token(user.id)
-    _create_session_record(user.id, token)
+    if _establish_authenticated_session(user.id, token) is None:
+        logger.error(
+            "Steam girisi dogrulandi ancak guvenli oturum olusturulamadi: user_id=%s",
+            user.id,
+        )
+        if lang == "en":
+            return flask_redirect("/en/?error=session_failed")
+        return flask_redirect("/?error=session_failed")
 
     if lang == "en":
         return flask_redirect("/en/dashboard")

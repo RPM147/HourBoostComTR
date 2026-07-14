@@ -169,7 +169,15 @@ class UserSession(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    # JWT'nin rastgele, imzalı kimliği. Oturum iptali JWT ve Flask cookie için
+    # aynı sunucu tarafı kaydı üzerinden uygulanır. Nullable yalnızca eski
+    # veritabanlarının güvenli şekilde migrate edilebilmesi içindir.
+    token_jti = db.Column(db.String(64), nullable=True, unique=True, index=True)
+    # Legacy görüntüleme alanı; güvenlik kararı için kullanılmaz.
     token_hint = db.Column(db.String(32), nullable=True)
+    # JWT ve Flask cookie aynı mutlak sona erme zamanını paylaşır; aksi halde
+    # Flask'ın yenilenen permanent cookie'si JWT'den daha uzun yaşayabilir.
+    expires_at = db.Column(db.DateTime, nullable=True)
     ip_address = db.Column(db.String(64), nullable=True)
     user_agent = db.Column(db.String(256), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
