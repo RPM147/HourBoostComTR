@@ -160,7 +160,12 @@ from models import (
     db, User, SteamAccount, BoostGame, Payment, PaymentAuditLog, BoostLog,
     Announcement, UserSession, RevokedToken,
 )
-from steam_manager import boost_service
+from steam_manager import (
+    boost_service,
+    purge_quarantined_credentials,
+    quarantine_saved_credentials,
+    restore_quarantined_credentials,
+)
 import shopier as shopier_lib
 from payment_verification import (
     HB_TOKEN_RE,
@@ -178,6 +183,25 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app = Flask(__name__)
 app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
+
+# The production service deliberately uses one gevent worker.  Per-user locks
+# close the cooperative-concurrency gap left by SQLite's lack of row locks:
+# deleting an account now waits for any yielded Steam/login/payment request for
+# that user, while unrelated users continue normally.
+_user_operation_locks = {}
+_user_operation_locks_guard = RLock()
+
+
+def _user_operation_lock(user_id):
+    user_id = int(user_id)
+    with _user_operation_locks_guard:
+        lock = _user_operation_locks.get(user_id)
+        if lock is None:
+            lock = RLock()
+            _user_operation_locks[user_id] = lock
+        return lock
+
+
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 csrf = CSRFProtect(app)
@@ -831,6 +855,9 @@ def _ensure_schema():
         datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
         pcols = {c["name"] for c in inspector.get_columns("payments")}
         payment_columns = {
+            "owner_user_id_snapshot": "INTEGER",
+            "owner_username_snapshot": "VARCHAR(80)",
+            "owner_detached_at": datetime_type,
             "match_token": "VARCHAR(64)",
             "admin_hidden": f"BOOLEAN NOT NULL DEFAULT {false_literal}",
             "shopier_webhook_id": "VARCHAR(100)",
@@ -854,6 +881,21 @@ def _ensure_schema():
                         f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
                     ))
                     logger.info("Şema güncellendi: payments.%s eklendi", column_name)
+
+        # Backfill durable ownership hints before any future user deletion.
+        # The live FK is intentionally cleared on deletion, while these fields
+        # keep the financial row attributable without relying on a reusable
+        # SQLite integer ID alone.
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE payments SET owner_user_id_snapshot = user_id "
+                "WHERE owner_user_id_snapshot IS NULL AND user_id IS NOT NULL"
+            ))
+            conn.execute(text(
+                "UPDATE payments SET owner_username_snapshot = ("
+                "SELECT users.username FROM users WHERE users.id = payments.user_id"
+                ") WHERE owner_username_snapshot IS NULL AND user_id IS NOT NULL"
+            ))
 
         if dialect == "postgresql":
             with db.engine.begin() as conn:
@@ -1150,8 +1192,59 @@ def login_required(f):
         if not user:
             session.clear()
             return jsonify({"ok": False, "error": "User not found."}), 401
-        g.user = user
-        return f(*args, **kwargs)
+        # Admin accounts cannot be deletion targets. Avoid holding the actor's
+        # lock while an admin endpoint acquires a different user's lock, which
+        # would otherwise create a cross-admin lock-order deadlock.
+        if user.is_admin:
+            g.user = user
+            return f(*args, **kwargs)
+        # Serialize all authenticated mutations for one user.  This is
+        # especially important on SQLite, where SELECT ... FOR UPDATE is a
+        # no-op: account deletion must not race a yielded Steam IPC login,
+        # checkout creation, or another request from the same account.
+        with _user_operation_lock(user_id):
+            db.session.expire_all()
+            active_session = UserSession.query.filter(
+                UserSession.id == g.get("_auth_session_id"),
+                UserSession.user_id == user_id,
+                UserSession.token_jti == g.get("_auth_jti"),
+                UserSession.is_active.is_(True),
+                UserSession.expires_at.isnot(None),
+                UserSession.expires_at > datetime.utcnow(),
+            ).first()
+            if active_session is None:
+                session.clear()
+                return jsonify({
+                    "ok": False,
+                    "error": "Session is no longer active.",
+                }), 401
+            user = db.session.get(User, user_id)
+            if not user:
+                session.clear()
+                return jsonify({"ok": False, "error": "User not found."}), 401
+            g.user = user
+            return f(*args, **kwargs)
+    return wrapped
+
+
+def target_user_operation_locked(f):
+    """Serialize an admin action with every request made by its target user."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        # Authorization must precede lock acquisition; otherwise any logged-in
+        # user could queue on an arbitrary victim ID and create a targeted DoS.
+        actor = g.get("user")
+        if not actor or not actor.is_admin:
+            return f(*args, **kwargs)
+        data = request.get_json(silent=True)
+        target_id = data.get("user_id") if isinstance(data, dict) else None
+        if type(target_id) is not int or target_id <= 0:
+            return f(*args, **kwargs)
+        with _user_operation_lock(target_id):
+            # Discard ORM rows read by middleware before the target lock was
+            # acquired. The endpoint must make decisions from fresh state.
+            db.session.expire_all()
+            return f(*args, **kwargs)
     return wrapped
 
 
@@ -1404,7 +1497,36 @@ def _mark_financially_verified_unmatched(payment, canonical, reason):
     payment.verification_lock_until = None
 
 
-def _finalize_canonical_order(payment_id, attempt, canonical):
+def _commit_financially_verified_unmatched(payment, canonical, reason):
+    """Persist a paid order without activating a plan or leaving a lease."""
+    _mark_financially_verified_unmatched(payment, canonical, reason)
+    db.session.commit()
+    logger.warning(
+        "shopier.verification.unmatched payment_id=%s order_id=%s reason=%s",
+        payment.id,
+        payment.transaction_id,
+        payment.verification_error,
+    )
+    return True
+
+
+def _locked_user(user_id):
+    if not user_id:
+        return None
+    # PostgreSQL serializes account deletion/finalization on this row. SQLite
+    # ignores FOR UPDATE, but production currently runs a single gunicorn
+    # worker and write transactions are serialized by SQLite itself.
+    return (
+        db.session.query(User)
+        .filter(User.id == user_id)
+        .with_for_update()
+        .first()
+    )
+
+
+def _finalize_canonical_order(
+    payment_id, attempt, canonical, _owner_lock_acquired=False
+):
     """Finalize payment and plan in one DB transaction."""
     payment = db.session.get(Payment, payment_id)
     if (
@@ -1415,28 +1537,54 @@ def _finalize_canonical_order(payment_id, attempt, canonical):
     ):
         return False
 
+    if not _owner_lock_acquired:
+        owner_id = payment.user_id
+        if owner_id is None and not payment.match_token and canonical.token:
+            checkout = _find_active_checkout_by_token(
+                canonical.token,
+                payment.webhook_received_at or datetime.utcnow(),
+            )
+            owner_id = checkout.user_id if checkout else None
+        if owner_id is not None:
+            # Re-run every precondition after acquiring the lock.  If deletion
+            # won the race, the refreshed row is finalized as unmatched; if the
+            # worker won, deletion observes the completed financial record.
+            db.session.expire_all()
+            with _user_operation_lock(owner_id):
+                return _finalize_canonical_order(
+                    payment_id,
+                    attempt,
+                    canonical,
+                    _owner_lock_acquired=True,
+                )
+
     if canonical.token_error:
         if payment.match_token:
             return _mark_verification_failed(
                 payment_id, attempt, canonical.token_error, 200
             )
-        _mark_financially_verified_unmatched(
-            payment, canonical, canonical.token_error
+        return _commit_financially_verified_unmatched(
+            payment,
+            canonical,
+            canonical.token_error,
         )
-        db.session.commit()
-        logger.warning(
-            "shopier.verification.unmatched payment_id=%s order_id=%s reason=%s",
-            payment.id,
-            payment.transaction_id,
-            payment.verification_error,
-        )
-        return True
 
     target = payment
+    user = None
     if payment.match_token:
-        if payment.match_token != canonical.token or not payment.user_id:
+        if payment.match_token != canonical.token:
             return _mark_verification_failed(
                 payment_id, attempt, "token_mismatch", 200
+            )
+        user = _locked_user(payment.user_id)
+        if not user:
+            payment.owner_user_id_snapshot = (
+                payment.owner_user_id_snapshot or payment.user_id
+            )
+            if payment.user_id is not None and payment.owner_detached_at is None:
+                payment.owner_detached_at = datetime.utcnow()
+            return _commit_financially_verified_unmatched(
+                payment, canonical, "owner_not_found"
             )
     else:
         target = _find_active_checkout_by_token(
@@ -1444,15 +1592,35 @@ def _finalize_canonical_order(payment_id, attempt, canonical):
             payment.webhook_received_at or datetime.utcnow(),
         )
         if not target or not target.user_id:
-            _mark_financially_verified_unmatched(
+            return _commit_financially_verified_unmatched(
                 payment, canonical, "active_token_not_found"
+            )
+
+        user = _locked_user(target.user_id)
+        if not user:
+            detached_at = target.owner_detached_at or datetime.utcnow()
+            payment.owner_user_id_snapshot = (
+                target.owner_user_id_snapshot or target.user_id
+            )
+            payment.owner_username_snapshot = target.owner_username_snapshot
+            payment.owner_detached_at = detached_at
+            target.user_id = None
+            target.owner_detached_at = detached_at
+            target.status = "cancelled"
+            target.match_token = None
+            target.verification_error = "owner_not_found"
+            target.next_verification_at = None
+            target.verification_lock_until = None
+            _mark_financially_verified_unmatched(
+                payment, canonical, "owner_not_found"
             )
             db.session.commit()
             logger.warning(
                 "shopier.verification.unmatched payment_id=%s order_id=%s "
-                "reason=active_token_not_found token_fp=%s",
+                "reason=owner_not_found checkout_id=%s token_fp=%s",
                 payment.id,
                 payment.transaction_id,
+                target.id,
                 token_fingerprint(canonical.token),
             )
             return True
@@ -1466,16 +1634,29 @@ def _finalize_canonical_order(payment_id, attempt, canonical):
             "webhook_body_sha256": payment.webhook_body_sha256,
             "webhook_received_at": payment.webhook_received_at,
             "verification_attempts": payment.verification_attempts,
+            # Hiding either side of a consolidation is append-only admin state;
+            # never make a previously hidden financial row visible again.
+            "admin_hidden": bool(payment.admin_hidden or target.admin_hidden),
         }
+        PaymentAuditLog.query.filter_by(payment_id=payment.id).update(
+            {"payment_id": target.id}, synchronize_session=False
+        )
         db.session.delete(payment)
         db.session.flush()
         for field, value in metadata.items():
             setattr(target, field, value)
 
-    user = db.session.get(User, target.user_id)
     if not user:
-        db.session.rollback()
-        return False
+        # Defensive fallback for corrupt legacy rows. A canonically paid order
+        # must end in manual review instead of being reclaimed forever.
+        target.owner_user_id_snapshot = (
+            target.owner_user_id_snapshot or target.user_id
+        )
+        if target.user_id is not None and target.owner_detached_at is None:
+            target.owner_detached_at = datetime.utcnow()
+        return _commit_financially_verified_unmatched(
+            target, canonical, "owner_not_found"
+        )
 
     target.status = "completed"
     target.plan = canonical.plan
@@ -1526,12 +1707,32 @@ def _process_payment_claim(claim):
 
     try:
         with app.app_context():
-            return _finalize_canonical_order(
+            finalized = _finalize_canonical_order(
                 claim["payment_id"], claim["attempt"], canonical
             )
+            if not finalized:
+                stalled = db.session.get(Payment, claim["payment_id"])
+                if (
+                    stalled
+                    and stalled.status == "verification_pending"
+                    and stalled.verification_attempts == claim["attempt"]
+                ):
+                    synthetic = shopier_lib.ShopierAPIError(
+                        "finalize_without_transition", retryable=True
+                    )
+                    _schedule_verification_retry(
+                        claim["payment_id"], claim["attempt"], synthetic
+                    )
+            return finalized
     except IntegrityError:
         with app.app_context():
             db.session.rollback()
+            synthetic = shopier_lib.ShopierAPIError(
+                "concurrent_conflict", retryable=True
+            )
+            _schedule_verification_retry(
+                claim["payment_id"], claim["attempt"], synthetic
+            )
         logger.warning(
             "shopier.verification.concurrent_conflict payment_id=%s order_id=%s",
             claim["payment_id"],
@@ -2676,11 +2877,21 @@ def plan_checkout():
             p.status = "cancelled"   # diğer planlar + fazlalık duplikeler
     if payment is None:
         token = _generate_match_token()
-        payment = Payment(user_id=user.id, amount=Config.PLANS[plan]["price"],
-                          plan=plan, status="checkout_started", match_token=token)
+        payment = Payment(
+            user_id=user.id,
+            owner_user_id_snapshot=user.id,
+            owner_username_snapshot=user.username,
+            amount=Config.PLANS[plan]["price"],
+            plan=plan,
+            status="checkout_started",
+            match_token=token,
+        )
         db.session.add(payment)
     else:
         token = payment.match_token
+        payment.owner_user_id_snapshot = user.id
+        payment.owner_username_snapshot = user.username
+        payment.owner_detached_at = None
     try:
         db.session.commit()
     except IntegrityError:
@@ -2977,6 +3188,11 @@ def account_login():
 
     if acct_db.user_id != user.id:
         return jsonify({"ok": False, "error": "Unauthorized."})
+    if username and username.casefold() != acct_db.steam_username.casefold():
+        return jsonify({
+            "ok": False,
+            "error": "A connected Steam account username cannot be changed.",
+        }), 409
 
     mgr = boost_service.get_or_create(acct_id, acct_db.steam_username)
 
@@ -3038,7 +3254,6 @@ def account_login():
         acct_db.steam_id = str(mgr.client.steam_id)
     except Exception:
         pass
-    acct_db.steam_username = username
     db.session.commit()
     mgr.app_ids = acct_db.app_ids()
     mgr.persona_state = acct_db.persona_state
@@ -3052,7 +3267,12 @@ def remove_account():
     acct_db = db.session.get(SteamAccount, acct_id)
     if not acct_db or acct_db.user_id != g.user.id:
         return jsonify({"ok": False})
-    boost_service.remove(acct_id)
+    _clear_timers(acct_id)
+    if not boost_service.remove(acct_id, acct_db.steam_username):
+        return jsonify({
+            "ok": False,
+            "error": "Stored Steam credentials could not be removed.",
+        }), 503
     db.session.delete(acct_db)
     db.session.commit()
     return jsonify({"ok": True})
@@ -3859,9 +4079,23 @@ def admin_payments():
         rows = User.query.filter(User.id.in_(user_ids)).all()
         user_map = {u.id: u.username for u in rows}
 
+    def _owner_label(payment):
+        active_username = user_map.get(payment.user_id)
+        if active_username:
+            return active_username
+        if payment.owner_detached_at:
+            snapshot = payment.owner_username_snapshot
+            if snapshot:
+                return f"{snapshot} (deleted)"
+            if payment.owner_user_id_snapshot:
+                return f"deleted account #{payment.owner_user_id_snapshot}"
+            return "deleted account"
+        return "unmatched"
+
     return jsonify({"payments": [{
         "id": p.id, "user_id": p.user_id,
-        "username": user_map.get(p.user_id, "unmatched"),
+        "username": _owner_label(p),
+        "owner_deleted": bool(p.user_id is None and p.owner_detached_at),
         "amount": p.amount, "plan": p.plan, "status": p.status,
         "transaction_id": p.transaction_id or "",
         "verification_error": p.verification_error or "",
@@ -3916,21 +4150,62 @@ def admin_approve_payment():
     if not user:
         return jsonify({"ok": False, "error": f"'{username}' not found."}), 404
 
-    old_status = payment.status
-    payment.user_id = user.id
-    payment.status = "completed"
-    payment.verification_error = "manual_match"
-    plan_changed = _activate_paid_plan(user, payment.plan)
-    db.session.add(PaymentAuditLog(
-        payment_id=payment.id,
-        actor_user_id=g.user.id,
-        actor_username=g.user.username,
-        action="manual_match",
-        from_status=old_status,
-        to_status="completed",
-        reason=reason,
-    ))
-    db.session.commit()
+    user_identity = (
+        user.id,
+        user.username,
+        user.created_at,
+        user.password_hash,
+    )
+    user_id = user.id
+    payment_id = payment.id
+    with _user_operation_lock(user_id):
+        # The account may have been deleted while this admin request waited for
+        # its operation lock. Re-read both rows and fail closed.
+        db.session.expire_all()
+        user = db.session.get(User, user_id)
+        payment = db.session.get(Payment, payment_id)
+        if not user or (
+            user.id,
+            user.username,
+            user.created_at,
+            user.password_hash,
+        ) != user_identity:
+            return jsonify({
+                "ok": False,
+                "error": "The target user changed before matching.",
+            }), 409
+        if (
+            not payment
+            or payment.admin_hidden
+            or payment.status != "unmatched"
+            or not payment.verified_at
+            or not payment.transaction_id
+            or payment.verified_amount_minor is None
+            or payment.plan not in ("basic", "premium")
+        ):
+            return jsonify({
+                "ok": False,
+                "error": "The payment changed before matching. Please reload.",
+            }), 409
+
+        old_status = payment.status
+        payment.user_id = user.id
+        payment.owner_user_id_snapshot = user.id
+        payment.owner_username_snapshot = user.username
+        payment.owner_detached_at = None
+        payment.status = "completed"
+        payment.verification_error = "manual_match"
+        plan_changed = _activate_paid_plan(user, payment.plan)
+        db.session.add(PaymentAuditLog(
+            payment_id=payment.id,
+            actor_user_id=g.user.id,
+            actor_username=g.user.username,
+            action="manual_match",
+            from_status=old_status,
+            to_status="completed",
+            reason=reason,
+        ))
+        db.session.commit()
     logger.warning(
         "shopier.payment.manual_match payment_id=%s order_id=%s admin_id=%s",
         payment.id,
@@ -4139,51 +4414,291 @@ def admin_hide_payment():
 
 @app.route("/admin/users/delete", methods=["POST"])
 @login_required
+@target_user_operation_locked
 def admin_delete_user():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
-    target_id = data.get("user_id")
-    
-    if str(target_id) == str(g.user.id):
-        return jsonify({"ok": False, "error": "You cannot delete your own account."})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "A JSON object is required.",
+        }), 400
 
-    target_user = db.session.get(User, target_id)
+    target_id = data.get("user_id")
+    if type(target_id) is not int or target_id <= 0:
+        return jsonify({
+            "ok": False,
+            "error": "A valid user_id is required.",
+        }), 400
+
+    if target_id == g.user.id:
+        return jsonify({
+            "ok": False,
+            "error": "You cannot delete your own account.",
+        }), 409
+
+    target_user = (
+        db.session.query(User)
+        .filter(User.id == target_id)
+        .with_for_update()
+        .first()
+    )
     if not target_user:
-        return jsonify({"ok": False, "error": "User not found."})
+        return jsonify({"ok": False, "error": "User not found."}), 404
     if target_user.is_admin:
-        return jsonify({"ok": False, "error": "Admin accounts cannot be deleted."})
+        return jsonify({
+            "ok": False,
+            "error": "Admin accounts cannot be deleted.",
+        }), 409
 
     username = target_user.username
+    payments = (
+        Payment.query.filter_by(user_id=target_id)
+        .with_for_update()
+        .all()
+    )
+    known_statuses = {
+        "pending",
+        "checkout_started",
+        "verification_pending",
+        "verification_failed",
+        "completed",
+        "unmatched",
+        "cancelled",
+    }
+    unsafe_payment = next((
+        payment for payment in payments
+        if (
+            payment.status not in known_statuses
+            or (
+                payment.status in ("pending", "checkout_started")
+                and payment.transaction_id is not None
+            )
+        )
+    ), None)
+    if unsafe_payment:
+        logger.warning(
+            "user.delete_blocked_payment_state target_id=%s payment_id=%s status=%s",
+            target_id,
+            unsafe_payment.id,
+            unsafe_payment.status,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "This account has a payment in an unsafe state. Resolve it before deletion.",
+        }), 409
+
+    steam_accounts = (
+        SteamAccount.query.filter_by(user_id=target_id)
+        .with_for_update()
+        .all()
+    )
+    credential_quarantines = []
+    for account in steam_accounts:
+        quarantined = quarantine_saved_credentials(
+            account.id, account.steam_username
+        )
+        if quarantined is None:
+            restore_quarantined_credentials(credential_quarantines)
+            logger.error(
+                "user.delete_credential_quarantine_failed target_id=%s account_id=%s",
+                target_id,
+                account.id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Stored Steam credentials could not be removed.",
+            }), 503
+        credential_quarantines.extend(quarantined)
+
+    deletion_committed = False
     try:
-        steam_accounts = SteamAccount.query.filter_by(user_id=target_id).all()
-        for acct in steam_accounts:
-            mgr = boost_service.get(acct.id)
-            if mgr:
-                try:
-                    mgr.disconnect()
-                except Exception:
-                    pass
-            boost_service.remove(acct.id)
+        detached_at = datetime.utcnow()
+        for payment in payments:
+            old_status = payment.status
+            payment.owner_user_id_snapshot = target_id
+            payment.owner_username_snapshot = username
+            payment.owner_detached_at = detached_at
+            payment.user_id = None
+            if old_status in ("pending", "checkout_started"):
+                payment.status = "cancelled"
+                payment.match_token = None
+                payment.verification_error = "owner_deleted_before_payment"
+                payment.next_verification_at = None
+                payment.verification_lock_until = None
+            db.session.add(PaymentAuditLog(
+                payment_id=payment.id,
+                actor_user_id=g.user.id,
+                actor_username=g.user.username,
+                action="owner_detached_on_user_delete",
+                from_status=old_status,
+                to_status=payment.status,
+                reason=(
+                    f"Owner account deleted: user_id={target_id}; "
+                    "financial record retained."
+                ),
+            ))
 
         BoostLog.query.filter_by(user_id=target_id).delete(synchronize_session=False)
-        Payment.query.filter_by(user_id=target_id).delete(synchronize_session=False)
         UserSession.query.filter_by(user_id=target_id).delete(synchronize_session=False)
+        RevokedToken.query.filter_by(user_id=target_id).delete(synchronize_session=False)
 
-        for acct in steam_accounts:
-            acct_fresh = db.session.get(SteamAccount, acct.id)
-            if acct_fresh:
-                db.session.delete(acct_fresh)
+        for account in steam_accounts:
+            account_fresh = db.session.get(SteamAccount, account.id)
+            if account_fresh:
+                db.session.delete(account_fresh)
 
         db.session.delete(target_user)
         db.session.commit()
-        logger.info("Admin %s tarafindan kullanici silindi: %s (ID:%s)", g.user.username, username, target_id)
-        return jsonify({"ok": True, "message": f"{username} has been successfully deleted."})
-    except Exception as e:
+        deletion_committed = True
+        _plan_expiry_cache.pop(target_id, None)
+
+        # External side effects happen only after the financial/user database
+        # transaction is durable. The pre-commit rename above means secrets are
+        # already inactive, yet a DB rollback could still restore them exactly.
+        cleanup_ok = True
+        detached_managers = {}
+        for account in steam_accounts:
+            try:
+                detached_managers[account.id] = boost_service.detach(account.id)
+            except Exception:
+                detached_managers[account.id] = None
+                cleanup_ok = False
+                logger.exception(
+                    "user.delete_manager_detach_failed target_id=%s account_id=%s",
+                    target_id,
+                    account.id,
+                )
+        for account in steam_accounts:
+            try:
+                _clear_timers(account.id)
+            except Exception:
+                cleanup_ok = False
+                logger.exception(
+                    "user.delete_timer_cleanup_failed target_id=%s account_id=%s",
+                    target_id,
+                    account.id,
+                )
+        for account in steam_accounts:
+            try:
+                manager = detached_managers.get(account.id)
+                if manager:
+                    removed = manager.remove_completely()
+                else:
+                    removed = boost_service.remove(
+                        account.id, account.steam_username
+                    )
+                if not removed:
+                    cleanup_ok = False
+            except Exception:
+                cleanup_ok = False
+                logger.exception(
+                    "user.delete_manager_cleanup_failed target_id=%s account_id=%s",
+                    target_id,
+                    account.id,
+                )
+        if not purge_quarantined_credentials(credential_quarantines):
+            cleanup_ok = False
+        if not cleanup_ok:
+            logger.critical(
+                "user.delete_post_commit_cleanup_incomplete target_id=%s",
+                target_id,
+            )
+        logger.warning(
+            "user.deleted admin_id=%s target_id=%s payments_retained=%s steam_accounts_removed=%s",
+            g.user.id,
+            target_id,
+            len(payments),
+            len(steam_accounts),
+        )
+        return jsonify({
+            "ok": True,
+            "message": f"{username} was deleted; financial records were retained.",
+            "cleanup_warning": not cleanup_ok,
+        })
+    except IntegrityError:
+        if deletion_committed:
+            try:
+                purge_quarantined_credentials(credential_quarantines)
+            except Exception:
+                logger.critical(
+                    "user.delete_post_commit_quarantine_purge_failed target_id=%s",
+                    target_id,
+                    exc_info=True,
+                )
+            logger.critical(
+                "user.delete_post_commit_integrity_error target_id=%s",
+                target_id,
+                exc_info=True,
+            )
+            return jsonify({
+                "ok": True,
+                "message": f"{username} was deleted; financial records were retained.",
+                "cleanup_warning": True,
+            })
         db.session.rollback()
-        logger.error("Kullanici silme hatasi (ID:%s): %s", target_id, e)
-        return jsonify({"ok": False, "error": "Deletion failed. Check server logs."})
+        restore_quarantined_credentials(credential_quarantines)
+        logger.warning("user.delete_integrity_conflict target_id=%s", target_id)
+        return jsonify({
+            "ok": False,
+            "error": "The account changed during deletion. Please retry.",
+        }), 409
+    except SQLAlchemyError:
+        if deletion_committed:
+            try:
+                purge_quarantined_credentials(credential_quarantines)
+            except Exception:
+                logger.critical(
+                    "user.delete_post_commit_quarantine_purge_failed target_id=%s",
+                    target_id,
+                    exc_info=True,
+                )
+            logger.critical(
+                "user.delete_post_commit_database_error target_id=%s",
+                target_id,
+                exc_info=True,
+            )
+            return jsonify({
+                "ok": True,
+                "message": f"{username} was deleted; financial records were retained.",
+                "cleanup_warning": True,
+            })
+        db.session.rollback()
+        restore_quarantined_credentials(credential_quarantines)
+        logger.exception("user.delete_database_error target_id=%s", target_id)
+        return jsonify({
+            "ok": False,
+            "error": "Deletion could not be completed. Please try again.",
+        }), 503
+    except Exception:
+        if deletion_committed:
+            try:
+                purge_quarantined_credentials(credential_quarantines)
+            except Exception:
+                logger.critical(
+                    "user.delete_post_commit_quarantine_purge_failed target_id=%s",
+                    target_id,
+                    exc_info=True,
+                )
+            logger.critical(
+                "user.delete_post_commit_internal_error target_id=%s",
+                target_id,
+                exc_info=True,
+            )
+            return jsonify({
+                "ok": True,
+                "message": f"{username} was deleted; financial records were retained.",
+                "cleanup_warning": True,
+            })
+        db.session.rollback()
+        restore_quarantined_credentials(credential_quarantines)
+        logger.exception("user.delete_internal_error target_id=%s", target_id)
+        return jsonify({
+            "ok": False,
+            "error": "Deletion could not be completed. Please try again.",
+        }), 503
 
 
 @app.route("/admin/announcements/create", methods=["POST"])

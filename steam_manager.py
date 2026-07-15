@@ -43,6 +43,110 @@ WORKER_SCRIPT = os.path.join(BASE_DIR, "steam_worker.js")
 _FERNET = None
 
 
+def _credential_path(account_id, steam_username):
+    """Return the legacy-compatible credential path, contained in TOKEN_DIR."""
+    safe_name = str(steam_username or "").replace("/", "_").replace("\\", "_")
+    candidate = os.path.realpath(
+        os.path.join(TOKEN_DIR, f"{account_id}_{safe_name}.cred")
+    )
+    token_root = os.path.realpath(TOKEN_DIR)
+    if os.path.commonpath((token_root, candidate)) != token_root:
+        raise ValueError("Credential path escaped TOKEN_DIR")
+    return candidate
+
+
+def _node_machine_auth_path(steam_username):
+    """Return steam-user's persisted machine-token path, contained in its data dir."""
+    filename = f"machineAuthToken.{str(steam_username or '').lower()}.txt"
+    candidate = os.path.realpath(os.path.join(NODE_DATA_DIR, filename))
+    node_root = os.path.realpath(NODE_DATA_DIR)
+    if os.path.commonpath((node_root, candidate)) != node_root:
+        raise ValueError("Machine-auth path escaped NODE_DATA_DIR")
+    return candidate
+
+
+def _credential_artifact_paths(account_id, steam_username):
+    return (
+        _credential_path(account_id, steam_username),
+        _node_machine_auth_path(steam_username),
+    )
+
+
+def restore_quarantined_credentials(moved_paths):
+    """Undo a pre-commit credential quarantine after a database rollback."""
+    restored = True
+    for original, quarantined in reversed(moved_paths or []):
+        try:
+            if os.path.exists(quarantined):
+                if os.path.exists(original):
+                    # A live worker may have persisted a newer token while the
+                    # DB transaction was in flight. Keep the fresh artifact;
+                    # never overwrite it with the quarantined older copy.
+                    os.remove(quarantined)
+                    logger.warning(
+                        "Steam credential restore kept a newer artifact"
+                    )
+                else:
+                    os.replace(quarantined, original)
+        except Exception as exc:
+            restored = False
+            logger.critical(
+                "Steam credential quarantine restore failed: error=%s",
+                type(exc).__name__,
+            )
+    return restored
+
+
+def purge_quarantined_credentials(moved_paths):
+    """Permanently remove credential artifacts after the DB commit succeeds."""
+    purged = True
+    for _original, quarantined in moved_paths or []:
+        try:
+            if os.path.exists(quarantined):
+                os.remove(quarantined)
+        except Exception as exc:
+            purged = False
+            logger.critical(
+                "Steam credential quarantine purge failed: error=%s",
+                type(exc).__name__,
+            )
+    return purged
+
+
+def quarantine_saved_credentials(account_id, steam_username):
+    """Atomically hide all persisted Steam auth material before a DB mutation.
+
+    Returns a reversible list on success (including an empty list when there
+    were no files) and ``None`` on failure.  Renaming on the same filesystem is
+    atomic, so a later DB rollback can restore the exact prior state.
+    """
+    moved = []
+    try:
+        for path in _credential_artifact_paths(account_id, steam_username):
+            if not os.path.exists(path):
+                continue
+            quarantined = f"{path}.delete-{uuid.uuid4().hex}"
+            os.replace(path, quarantined)
+            moved.append((path, quarantined))
+        return moved
+    except Exception as exc:
+        restore_quarantined_credentials(moved)
+        logger.error(
+            "Steam credential quarantine failed: account_id=%s error=%s",
+            account_id,
+            type(exc).__name__,
+        )
+        return None
+
+
+def delete_saved_credentials(account_id, steam_username):
+    """Delete encrypted credentials and steam-user machine auth material."""
+    quarantined = quarantine_saved_credentials(account_id, steam_username)
+    if quarantined is None:
+        return False
+    return purge_quarantined_credentials(quarantined)
+
+
 def _get_fernet():
     global _FERNET
     if _FERNET is not None:
@@ -334,11 +438,11 @@ class SteamAccountManager:
         self.app_ids = []
         self.persona_state = 1
         self._reconnect_attempts = 0
+        self._removed = False
         self._setup_events()
 
     def _cred_path(self):
-        safe_name = self.steam_username.replace("/", "_").replace("\\", "_")
-        return os.path.join(TOKEN_DIR, f"{self.account_id}_{safe_name}.cred")
+        return _credential_path(self.account_id, self.steam_username)
 
     def save_credentials(self, password=None, refresh_token=None):
         try:
@@ -399,12 +503,7 @@ class SteamAccountManager:
             return None
 
     def delete_credentials(self):
-        path = self._cred_path()
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+        return delete_saved_credentials(self.account_id, self.steam_username)
 
     def has_credentials(self):
         return os.path.exists(self._cred_path())
@@ -422,6 +521,9 @@ class SteamAccountManager:
 
         @self.client.on("logged_on")
         def _on_login():
+            if self._removed:
+                self.logged_in = False
+                return
             logger.info("[%s] Giris basarili", self.steam_username)
             self.logged_in = True
             self._reconnect_attempts = 0
@@ -435,6 +537,8 @@ class SteamAccountManager:
             logger.info("[%s] new_login_key alindi", self.steam_username)
 
     def _schedule_reconnect(self):
+        if self._removed:
+            return
         if self._reconnect_attempts >= 5:
             logger.error("[%s] Max reconnect asildi", self.steam_username)
             if self.boosting:
@@ -448,6 +552,8 @@ class SteamAccountManager:
         gevent.spawn_later(delay, self._try_reconnect)
 
     def _try_reconnect(self):
+        if self._removed:
+            return
         try:
             creds = self.load_credentials()
             if creds:
@@ -607,8 +713,16 @@ class SteamAccountManager:
         self.logged_in = False
 
     def remove_completely(self):
+        self.mark_removed()
         self.disconnect()
-        self.delete_credentials()
+        return self.delete_credentials()
+
+    def mark_removed(self):
+        """Synchronously make callbacks/reconnects inert before blocking IPC."""
+        self._removed = True
+        self.boosting = False
+        self.start_time = None
+        self.original_start_time = None
 
     def summary(self):
         return {
@@ -636,10 +750,20 @@ class BoostService:
             self._managers[account_id] = SteamAccountManager(account_id, steam_username)
         return self._managers[account_id]
 
-    def remove(self, account_id):
+    def remove(self, account_id, steam_username=None):
+        mgr = self.detach(account_id)
+        if mgr:
+            return mgr.remove_completely()
+        if steam_username is not None:
+            return delete_saved_credentials(account_id, steam_username)
+        return True
+
+    def detach(self, account_id):
+        """Pop and deactivate a manager without yielding on Node IPC."""
         mgr = self._managers.pop(account_id, None)
         if mgr:
-            mgr.remove_completely()
+            mgr.mark_removed()
+        return mgr
 
     def all_managers(self):
         return list(self._managers.items())

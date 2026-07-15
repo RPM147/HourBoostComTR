@@ -91,6 +91,12 @@ class Payment(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    # Financial ownership snapshots survive account deletion. ``user_id`` is
+    # deliberately nullable so the operational user can be removed without
+    # destroying the payment ledger or reattaching history to a reused ID.
+    owner_user_id_snapshot = db.Column(db.Integer, nullable=True)
+    owner_username_snapshot = db.Column(db.String(80), nullable=True)
+    owner_detached_at = db.Column(db.DateTime, nullable=True)
     amount = db.Column(db.Float)
     plan = db.Column(db.String(20))
     status = db.Column(db.String(32), default="pending")
