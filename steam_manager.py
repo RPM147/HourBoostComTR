@@ -1,13 +1,18 @@
 import json
+import hashlib
+import inspect
 import logging
 import os
+import re
 import shutil
+import stat
 import time
 import uuid
 from collections import defaultdict
 
 import gevent
 from gevent import queue
+from gevent.lock import RLock
 from gevent import subprocess
 
 from steam_compat import EPersonaState, EResult
@@ -15,7 +20,8 @@ from steam_compat import EPersonaState, EResult
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(__file__)
-TOKEN_DIR = os.path.join(BASE_DIR, "tokens")
+STATE_DIR = os.path.abspath(os.environ.get("STEAM_STATE_DIR") or BASE_DIR)
+TOKEN_DIR = os.path.join(STATE_DIR, "tokens")
 os.makedirs(TOKEN_DIR, exist_ok=True)
 if os.name != "nt":
     try:
@@ -23,7 +29,7 @@ if os.name != "nt":
     except Exception:
         pass
 
-SENTRY_DIR = os.path.join(BASE_DIR, "sentry")
+SENTRY_DIR = os.path.join(STATE_DIR, "sentry")
 os.makedirs(SENTRY_DIR, exist_ok=True)
 if os.name != "nt":
     try:
@@ -41,10 +47,53 @@ if os.name != "nt":
 
 WORKER_SCRIPT = os.path.join(BASE_DIR, "steam_worker.js")
 _FERNET = None
+_QUARANTINE_SUFFIX_RE = re.compile(r"\.delete-([0-9a-f]{32})$")
+
+
+def _path_exists(path):
+    """Like exists(), but also sees broken symlinks without following them."""
+    return os.path.lexists(path)
+
+
+def _validate_account_id(account_id):
+    value = str(account_id or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", value):
+        raise ValueError("Invalid Steam account id")
+    return value
+
+
+def _contained_path(root, *parts):
+    root_path = os.path.abspath(root)
+    candidate = os.path.abspath(os.path.join(root_path, *parts))
+    if os.path.commonpath((root_path, candidate)) != root_path:
+        raise ValueError("Path escaped its storage root")
+    return candidate
+
+
+def _ensure_private_directory(path, root):
+    """Create a private directory and reject symlinked storage components."""
+    root_path = os.path.abspath(root)
+    candidate = os.path.abspath(path)
+    if os.path.commonpath((root_path, candidate)) != root_path:
+        raise ValueError("Directory escaped its storage root")
+
+    os.makedirs(root_path, exist_ok=True)
+    if os.path.islink(root_path):
+        raise ValueError("Storage root cannot be a symlink")
+    os.makedirs(candidate, exist_ok=True)
+    if os.path.islink(candidate) or not os.path.isdir(candidate):
+        raise ValueError("Steam data directory is not a real directory")
+    if os.path.realpath(candidate) != candidate:
+        raise ValueError("Steam data directory contains a symlink")
+    if os.name != "nt":
+        os.chmod(root_path, 0o700)
+        os.chmod(candidate, 0o700)
+    return candidate
 
 
 def _credential_path(account_id, steam_username):
     """Return the legacy-compatible credential path, contained in TOKEN_DIR."""
+    account_id = _validate_account_id(account_id)
     safe_name = str(steam_username or "").replace("/", "_").replace("\\", "_")
     candidate = os.path.realpath(
         os.path.join(TOKEN_DIR, f"{account_id}_{safe_name}.cred")
@@ -56,7 +105,7 @@ def _credential_path(account_id, steam_username):
 
 
 def _node_machine_auth_path(steam_username):
-    """Return steam-user's persisted machine-token path, contained in its data dir."""
+    """Return the old shared machine-token path used before account isolation."""
     filename = f"machineAuthToken.{str(steam_username or '').lower()}.txt"
     candidate = os.path.realpath(os.path.join(NODE_DATA_DIR, filename))
     node_root = os.path.realpath(NODE_DATA_DIR)
@@ -65,11 +114,63 @@ def _node_machine_auth_path(steam_username):
     return candidate
 
 
-def _credential_artifact_paths(account_id, steam_username):
-    return (
+def _node_account_data_root():
+    return _contained_path(NODE_DATA_DIR, "accounts")
+
+
+def _node_account_data_dir(account_id):
+    """Return a stable, non-user-controlled storage directory for one account."""
+    account_id = _validate_account_id(account_id)
+    storage_key = hashlib.sha256(account_id.encode("utf-8")).hexdigest()
+    return _contained_path(_node_account_data_root(), storage_key)
+
+
+def _account_node_machine_auth_path(account_id, steam_username):
+    filename = f"machineAuthToken.{str(steam_username or '').lower()}.txt"
+    account_dir = _node_account_data_dir(account_id)
+    candidate = os.path.realpath(os.path.join(account_dir, filename))
+    if os.path.commonpath((os.path.realpath(account_dir), candidate)) != os.path.realpath(account_dir):
+        raise ValueError("Machine-auth path escaped account data directory")
+    return candidate
+
+
+def _credential_artifact_paths(
+    account_id,
+    steam_username,
+    *,
+    include_legacy_machine_auth=False,
+    include_account_directory=False,
+):
+    paths = [
         _credential_path(account_id, steam_username),
-        _node_machine_auth_path(steam_username),
-    )
+        _account_node_machine_auth_path(account_id, steam_username),
+    ]
+    if include_legacy_machine_auth:
+        paths.append(_node_machine_auth_path(steam_username))
+    if include_account_directory:
+        paths.append(_node_account_data_dir(account_id))
+
+    # A token path is inside the account directory. If the whole directory is
+    # included, moving the child first would only create an unnecessary second
+    # tombstone. Keep the list deterministic and non-overlapping.
+    if include_account_directory:
+        account_dir = os.path.abspath(_node_account_data_dir(account_id))
+        paths = [
+            path for path in paths
+            if os.path.abspath(path) == account_dir
+            or os.path.commonpath((account_dir, os.path.abspath(path))) != account_dir
+        ]
+    return tuple(dict.fromkeys(paths))
+
+
+def _remove_artifact(path):
+    """Remove a file, symlink, or real directory without following symlinks."""
+    if not _path_exists(path):
+        return
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+        return
+    shutil.rmtree(path)
 
 
 def restore_quarantined_credentials(moved_paths):
@@ -77,12 +178,12 @@ def restore_quarantined_credentials(moved_paths):
     restored = True
     for original, quarantined in reversed(moved_paths or []):
         try:
-            if os.path.exists(quarantined):
-                if os.path.exists(original):
+            if _path_exists(quarantined):
+                if _path_exists(original):
                     # A live worker may have persisted a newer token while the
                     # DB transaction was in flight. Keep the fresh artifact;
                     # never overwrite it with the quarantined older copy.
-                    os.remove(quarantined)
+                    _remove_artifact(quarantined)
                     logger.warning(
                         "Steam credential restore kept a newer artifact"
                     )
@@ -102,8 +203,8 @@ def purge_quarantined_credentials(moved_paths):
     purged = True
     for _original, quarantined in moved_paths or []:
         try:
-            if os.path.exists(quarantined):
-                os.remove(quarantined)
+            if _path_exists(quarantined):
+                _remove_artifact(quarantined)
         except Exception as exc:
             purged = False
             logger.critical(
@@ -113,7 +214,13 @@ def purge_quarantined_credentials(moved_paths):
     return purged
 
 
-def quarantine_saved_credentials(account_id, steam_username):
+def quarantine_saved_credentials(
+    account_id,
+    steam_username,
+    *,
+    include_legacy_machine_auth=False,
+    include_account_directory=False,
+):
     """Atomically hide all persisted Steam auth material before a DB mutation.
 
     Returns a reversible list on success (including an empty list when there
@@ -122,8 +229,13 @@ def quarantine_saved_credentials(account_id, steam_username):
     """
     moved = []
     try:
-        for path in _credential_artifact_paths(account_id, steam_username):
-            if not os.path.exists(path):
+        for path in _credential_artifact_paths(
+            account_id,
+            steam_username,
+            include_legacy_machine_auth=include_legacy_machine_auth,
+            include_account_directory=include_account_directory,
+        ):
+            if not _path_exists(path):
                 continue
             quarantined = f"{path}.delete-{uuid.uuid4().hex}"
             os.replace(path, quarantined)
@@ -139,12 +251,259 @@ def quarantine_saved_credentials(account_id, steam_username):
         return None
 
 
-def delete_saved_credentials(account_id, steam_username):
+def delete_saved_credentials(
+    account_id,
+    steam_username,
+    *,
+    include_legacy_machine_auth=False,
+):
     """Delete encrypted credentials and steam-user machine auth material."""
-    quarantined = quarantine_saved_credentials(account_id, steam_username)
+    quarantined = quarantine_saved_credentials(
+        account_id,
+        steam_username,
+        include_legacy_machine_auth=include_legacy_machine_auth,
+        include_account_directory=True,
+    )
     if quarantined is None:
         return False
     return purge_quarantined_credentials(quarantined)
+
+
+def _atomic_copy_private_file(source, destination):
+    """Copy a regular credential file without exposing a partial destination."""
+    source_stat = os.lstat(source)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ValueError("Credential source is not a regular file")
+
+    destination_dir = os.path.dirname(destination)
+    _ensure_private_directory(destination_dir, _node_account_data_root())
+    if _path_exists(destination):
+        destination_stat = os.lstat(destination)
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise ValueError("Credential destination is not a regular file")
+        return True
+
+    temporary = f"{destination}.tmp-{uuid.uuid4().hex}"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600)
+        source_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            source_flags |= os.O_NOFOLLOW
+        try:
+            source_descriptor = os.open(source, source_flags)
+        except Exception:
+            os.close(descriptor)
+            raise
+        with (
+            os.fdopen(descriptor, "wb") as target,
+            os.fdopen(source_descriptor, "rb") as origin,
+        ):
+            shutil.copyfileobj(origin, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, destination)
+        if os.name != "nt":
+            os.chmod(destination, 0o600)
+        return True
+    finally:
+        if _path_exists(temporary):
+            _remove_artifact(temporary)
+
+
+def _quarantine_candidates(original):
+    parent = os.path.dirname(original)
+    basename = os.path.basename(original)
+    if not os.path.isdir(parent) or os.path.islink(parent):
+        return []
+    candidates = []
+    prefix = basename + ".delete-"
+    for entry in os.scandir(parent):
+        if entry.name.startswith(prefix) and _QUARANTINE_SUFFIX_RE.search(entry.name):
+            candidates.append(entry.path)
+    return candidates
+
+
+def reconcile_credential_quarantines(account_pairs):
+    """Recover credential tombstones using the database as the source of truth.
+
+    A crash before DB commit leaves an account row and a tombstone that must be
+    restored. A crash after commit leaves no account row, so its tombstone can
+    be purged. This is deliberately DB-aware; age-only cleanup can destroy the
+    only valid credential copy.
+    """
+    pairs = [(str(account_id), str(username or "")) for account_id, username in account_pairs]
+    expected = set()
+    expected_account_directories = set()
+    healthy = True
+
+    try:
+        _ensure_private_directory(TOKEN_DIR, TOKEN_DIR)
+        _ensure_private_directory(NODE_DATA_DIR, NODE_DATA_DIR)
+        _ensure_private_directory(_node_account_data_root(), NODE_DATA_DIR)
+    except Exception:
+        logger.critical("Steam credential storage roots are unsafe", exc_info=True)
+        return False
+
+    for account_id, username in pairs:
+        try:
+            credential_path = _credential_path(account_id, username)
+            account_directory = _node_account_data_dir(account_id)
+            expected_account_directories.add(os.path.abspath(account_directory))
+            expected.update((
+                credential_path,
+                _account_node_machine_auth_path(account_id, username),
+                account_directory,
+                _node_machine_auth_path(username),
+            ))
+        except Exception:
+            healthy = False
+            logger.critical(
+                "Steam credential reconciliation skipped invalid account: account_id=%s",
+                account_id,
+                exc_info=True,
+            )
+
+    handled_tombstones = set()
+    for original in sorted(expected):
+        tombstones = _quarantine_candidates(original)
+        if not tombstones:
+            continue
+        handled_tombstones.update(os.path.abspath(path) for path in tombstones)
+        try:
+            if _path_exists(original):
+                for tombstone in tombstones:
+                    _remove_artifact(tombstone)
+                continue
+
+            newest = max(tombstones, key=lambda path: os.lstat(path).st_mtime_ns)
+            os.replace(newest, original)
+            for tombstone in tombstones:
+                if tombstone != newest and _path_exists(tombstone):
+                    _remove_artifact(tombstone)
+            logger.warning("Recovered Steam credential quarantine after interrupted deletion")
+        except Exception:
+            healthy = False
+            logger.critical(
+                "Steam credential quarantine reconciliation failed",
+                exc_info=True,
+            )
+
+    scan_roots = [TOKEN_DIR, NODE_DATA_DIR, _node_account_data_root()]
+    account_root = _node_account_data_root()
+    if os.path.isdir(account_root) and not os.path.islink(account_root):
+        for entry in os.scandir(account_root):
+            if entry.is_dir(follow_symlinks=False) and not _QUARANTINE_SUFFIX_RE.search(entry.name):
+                scan_roots.append(entry.path)
+
+    orphan_account_directories = set()
+    for root in scan_roots:
+        if not os.path.isdir(root) or os.path.islink(root):
+            continue
+        for entry in os.scandir(root):
+            if not _QUARANTINE_SUFFIX_RE.search(entry.name):
+                continue
+            tombstone = os.path.abspath(entry.path)
+            if tombstone in handled_tombstones:
+                continue
+            try:
+                suffix_match = _QUARANTINE_SUFFIX_RE.search(entry.path)
+                original = entry.path[:suffix_match.start()] if suffix_match else None
+                _remove_artifact(entry.path)
+                if original and _path_exists(original):
+                    _remove_artifact(original)
+                root_path = os.path.abspath(root)
+                if (
+                    os.path.dirname(root_path) == os.path.abspath(account_root)
+                    and re.fullmatch(r"[0-9a-f]{64}", os.path.basename(root_path))
+                    and root_path not in expected_account_directories
+                ):
+                    orphan_account_directories.add(root_path)
+                logger.warning("Purged orphaned Steam credential quarantine")
+            except Exception:
+                healthy = False
+                logger.critical(
+                    "Orphaned Steam credential quarantine purge failed",
+                    exc_info=True,
+                )
+    for directory in orphan_account_directories:
+        try:
+            if _path_exists(directory):
+                _remove_artifact(directory)
+        except Exception:
+            healthy = False
+            logger.critical(
+                "Orphaned Steam account data directory purge failed",
+                exc_info=True,
+            )
+    return healthy
+
+
+def migrate_legacy_node_credentials(account_pairs):
+    """Copy shared steam-user machine tokens into account-isolated directories."""
+    pairs = [(str(account_id), str(username or "")) for account_id, username in account_pairs]
+    by_source = defaultdict(list)
+    healthy = True
+    for account_id, username in pairs:
+        try:
+            by_source[_node_machine_auth_path(username)].append(
+                _account_node_machine_auth_path(account_id, username)
+            )
+        except Exception:
+            healthy = False
+            logger.critical(
+                "Legacy Steam credential migration skipped invalid account: account_id=%s",
+                account_id,
+                exc_info=True,
+            )
+
+    referenced_sources = {os.path.abspath(path) for path in by_source}
+    for source, destinations in by_source.items():
+        if not _path_exists(source):
+            continue
+        copied_all = True
+        for destination in dict.fromkeys(destinations):
+            try:
+                _atomic_copy_private_file(source, destination)
+            except Exception:
+                copied_all = False
+                healthy = False
+                logger.critical(
+                    "Legacy Steam machine token copy failed",
+                    exc_info=True,
+                )
+        if copied_all:
+            try:
+                _remove_artifact(source)
+                logger.info(
+                    "Legacy shared Steam machine token migrated to %d account directories",
+                    len(set(destinations)),
+                )
+            except Exception:
+                healthy = False
+                logger.critical(
+                    "Legacy shared Steam machine token purge failed",
+                    exc_info=True,
+                )
+
+    if os.path.isdir(NODE_DATA_DIR) and not os.path.islink(NODE_DATA_DIR):
+        for entry in os.scandir(NODE_DATA_DIR):
+            if not re.fullmatch(r"machineAuthToken\..+\.txt", entry.name):
+                continue
+            if os.path.abspath(entry.path) in referenced_sources:
+                continue
+            try:
+                _remove_artifact(entry.path)
+                logger.warning("Purged orphaned legacy Steam machine token")
+            except Exception:
+                healthy = False
+                logger.critical(
+                    "Orphaned legacy Steam machine token purge failed",
+                    exc_info=True,
+                )
+    return healthy
 
 
 def _get_fernet():
@@ -217,7 +576,7 @@ def _node_binary():
 
 
 class SteamWorkerClient:
-    def __init__(self):
+    def __init__(self, data_directory=None):
         self.connected = False
         self.logged_in = False
         self.steam_id = None
@@ -227,6 +586,8 @@ class SteamWorkerClient:
         self._handlers = defaultdict(list)
         self._reader_greenlet = None
         self._stderr_greenlet = None
+        self._closed = False
+        self.data_directory = data_directory or _node_account_data_dir("standalone")
 
     def set_credential_location(self, _path):
         return None
@@ -246,6 +607,8 @@ class SteamWorkerClient:
                 logger.error("Steam worker event handler hatasi (%s): %s", event_name, e)
 
     def _ensure_process(self):
+        if self._closed:
+            return False
         if self._process and self._process.poll() is None:
             return True
 
@@ -253,9 +616,13 @@ class SteamWorkerClient:
             logger.error("Steam worker bulunamadi: %s", WORKER_SCRIPT)
             return False
 
-        env = os.environ.copy()
-        env["STEAM_WORKER_DATA_DIR"] = NODE_DATA_DIR
         try:
+            data_directory = _ensure_private_directory(
+                self.data_directory,
+                _node_account_data_root(),
+            )
+            env = os.environ.copy()
+            env["STEAM_WORKER_DATA_DIR"] = data_directory
             self._process = subprocess.Popen(
                 [_node_binary(), WORKER_SCRIPT],
                 cwd=BASE_DIR,
@@ -309,6 +676,8 @@ class SteamWorkerClient:
             pass
 
     def _handle_message(self, message):
+        if self._closed:
+            return
         if message.get("refresh_token"):
             self.refresh_token = message.get("refresh_token")
         if message.get("steam_id"):
@@ -334,6 +703,8 @@ class SteamWorkerClient:
             logger.warning("Steam worker event error: %s", message.get("message"))
 
     def _request(self, action, payload=None, timeout=60):
+        if self._closed:
+            return {"ok": False, "eresult": int(EResult.NoConnection)}
         if not self._ensure_process():
             return {"ok": False, "eresult": int(EResult.ServiceUnavailable)}
 
@@ -398,15 +769,66 @@ class SteamWorkerClient:
     def reconnect(self, maxdelay=30):
         return None
 
-    def disconnect(self):
+    def mark_closed(self):
+        """Synchronously prevent any pending or future worker resurrection."""
+        if self._closed:
+            return
+        self._closed = True
+        self.connected = False
+        self.logged_in = False
+        response = {"ok": False, "eresult": int(EResult.NoConnection)}
+        for response_queue in list(self._pending.values()):
+            try:
+                response_queue.put_nowait(response)
+            except Exception:
+                pass
+        self._pending.clear()
+
+    def force_disconnect(self):
+        """Terminate a bad worker without permanently closing this client.
+
+        This is the fail-closed escape hatch used when Steam did not confirm a
+        stop-games request.  Killing the CM session prevents a remotely active
+        game state from surviving while still allowing an explicit later login
+        to create a fresh worker process.
+        """
+        process = self._process
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            try:
+                with gevent.Timeout(5, False):
+                    process.wait()
+            except Exception:
+                pass
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    with gevent.Timeout(2, False):
+                        process.wait()
+            except Exception:
+                pass
+        self.connected = False
+        self.logged_in = False
+        stopped = process is None or process.poll() is not None
+        if not stopped:
+            logger.critical("Steam worker could not be terminated fail-closed")
+        return stopped
+
+    def disconnect(self, permanent=False):
+        if permanent:
+            self.mark_closed()
         if not self._process:
             self.connected = False
             self.logged_in = False
             return
-        try:
-            self._request("disconnect", timeout=5)
-        except Exception:
-            pass
+        if not permanent:
+            try:
+                self._request("disconnect", timeout=5)
+            except Exception:
+                pass
         try:
             if self._process.poll() is None:
                 self._process.terminate()
@@ -420,8 +842,8 @@ class SteamWorkerClient:
         self.logged_in = False
 
 
-def _make_client():
-    client = SteamWorkerClient()
+def _make_client(account_id):
+    client = SteamWorkerClient(_node_account_data_dir(account_id))
     client.set_credential_location(SENTRY_DIR)
     return client
 
@@ -430,24 +852,165 @@ class SteamAccountManager:
     def __init__(self, account_id, steam_username):
         self.account_id = account_id
         self.steam_username = steam_username
-        self.client = _make_client()
+        self.client = _make_client(account_id)
+        # All mutable runtime state for one Steam account is serialized through
+        # this gevent-aware lock. It is public so route/timer/checkpoint code can
+        # take one coherent snapshot instead of racing individual attributes.
+        self.state_lock = RLock()
         self.logged_in = False
         self.boosting = False
         self.start_time = None
         self.original_start_time = None
         self.app_ids = []
         self.persona_state = 1
+        self.boost_session_id = None
+        self.boost_generation = 0
         self._reconnect_attempts = 0
+        self._reconnect_pending_generation = None
+        self._reconnect_pending_token = None
+        self._connection_event_generation = 0
         self._removed = False
         self._setup_events()
+
+    def _active_session_matches_unlocked(
+        self,
+        expected_session_id=None,
+        expected_generation=None,
+    ):
+        if not self.boosting or self.boost_session_id is None:
+            return False
+        if (
+            expected_session_id is not None
+            and self.boost_session_id != expected_session_id
+        ):
+            return False
+        if (
+            expected_generation is not None
+            and self.boost_generation != expected_generation
+        ):
+            return False
+        return True
+
+    def _snapshot_unlocked(self):
+        return {
+            "boosting": self.boosting,
+            "session_id": self.boost_session_id,
+            "generation": self.boost_generation,
+            "start_time": self.start_time,
+            "original_start_time": self.original_start_time,
+            "app_ids": list(self.app_ids),
+            "persona_state": self.persona_state,
+            "logged_in": self.logged_in,
+        }
+
+    def boost_snapshot(self):
+        """Return one internally consistent copy of the account runtime state."""
+        with self.state_lock:
+            return self._snapshot_unlocked()
+
+    def _invalidate_boost_unlocked(self, *, force=False):
+        had_runtime_state = bool(
+            self.boosting
+            or self.start_time is not None
+            or self.original_start_time is not None
+            or self.boost_session_id is not None
+            or self._reconnect_pending_generation is not None
+        )
+        if force or had_runtime_state:
+            self.boost_generation += 1
+        self.boosting = False
+        self.start_time = None
+        self.original_start_time = None
+        self.boost_session_id = None
+        self._reconnect_pending_generation = None
+        self._reconnect_pending_token = None
+
+    def _stop_remote_games_unlocked(self, context):
+        """Stop remote game state or kill the worker session fail-closed."""
+        if self.client._closed:
+            self.logged_in = False
+            return False
+        try:
+            result = self.client.stop_games()
+        except Exception as exc:
+            result = EResult.Fail
+            logger.warning(
+                "[%s] Steam stop-games exception (%s): %s",
+                self.steam_username,
+                context,
+                type(exc).__name__,
+            )
+        if result == EResult.OK:
+            return True
+
+        logger.error(
+            "[%s] Steam stop-games was not confirmed (%s): %s; "
+            "worker disconnected fail-closed",
+            self.steam_username,
+            context,
+            result,
+        )
+        self._connection_event_generation += 1
+        self.client.force_disconnect()
+        self.logged_in = False
+        return False
+
+    @staticmethod
+    def _invoke_fatal_disconnect_callback(segment):
+        if not segment or segment["elapsed"] <= 0:
+            return
+        callback = boost_service.fatal_disconnect_callback
+        if callback is None:
+            return
+
+        args = (
+            segment["account_id"],
+            segment["elapsed"],
+            segment["session_id"],
+            segment["generation"],
+            segment["started_at"],
+            list(segment["app_ids"]),
+        )
+        try:
+            signature = inspect.signature(callback)
+            positional = [
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            accepts_varargs = any(
+                parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            # Some extension callables do not expose a Python signature. Keep
+            # the established two-argument contract in that case.
+            positional = []
+            accepts_varargs = False
+
+        # Resolve compatibility before invoking the handler. A TypeError raised
+        # inside application callback code must not trigger a second invocation
+        # and duplicate a financial/usage log.
+        if accepts_varargs or len(positional) >= 6:
+            callback(*args)
+        elif len(positional) >= 4:
+            callback(*args[:4])
+        else:
+            callback(*args[:2])
 
     def _cred_path(self):
         return _credential_path(self.account_id, self.steam_username)
 
     def save_credentials(self, password=None, refresh_token=None):
         try:
+            if self._removed:
+                return False
             existing = {}
             path = self._cred_path()
+            _ensure_private_directory(TOKEN_DIR, TOKEN_DIR)
             if os.path.exists(path):
                 try:
                     with open(path, "r") as f:
@@ -476,10 +1039,25 @@ class SteamAccountManager:
             if not data.get("password") and not data.get("refresh_token"):
                 return False
 
-            with open(path, "w") as f:
-                json.dump(data, f)
-            if os.name != "nt":
-                os.chmod(path, 0o600)
+            temporary = f"{path}.tmp-{uuid.uuid4().hex}"
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(temporary, flags, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(data, handle, separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if self._removed:
+                    _remove_artifact(temporary)
+                    return False
+                os.replace(temporary, path)
+                if os.name != "nt":
+                    os.chmod(path, 0o600)
+            finally:
+                if _path_exists(temporary):
+                    _remove_artifact(temporary)
             logger.info("[%s] Kimlik bilgileri kaydedildi", self.steam_username)
             return True
         except Exception as e:
@@ -502,8 +1080,12 @@ class SteamAccountManager:
             logger.error("[%s] Kimlik yukleme hatasi: %s", self.steam_username, e)
             return None
 
-    def delete_credentials(self):
-        return delete_saved_credentials(self.account_id, self.steam_username)
+    def delete_credentials(self, *, include_legacy_machine_auth=False):
+        return delete_saved_credentials(
+            self.account_id,
+            self.steam_username,
+            include_legacy_machine_auth=include_legacy_machine_auth,
+        )
 
     def has_credentials(self):
         return os.path.exists(self._cred_path())
@@ -512,83 +1094,200 @@ class SteamAccountManager:
         return self.has_credentials()
 
     def _setup_events(self):
+        def _process_disconnect_event(event_generation):
+            logger.warning("[%s] Baglanti koptu", self.steam_username)
+            with self.state_lock:
+                if event_generation != self._connection_event_generation:
+                    return
+                self.logged_in = False
+                generation = (
+                    self.boost_generation
+                    if self._active_session_matches_unlocked()
+                    else None
+                )
+            if generation is not None:
+                self._schedule_reconnect(generation)
+
         @self.client.on("disconnected")
         def _on_dc():
-            logger.warning("[%s] Baglanti koptu", self.steam_username)
-            self.logged_in = False
-            if self.boosting:
-                self._schedule_reconnect()
+            # SteamWorkerClient emits from its stdout reader. Never let lock
+            # contention in account state block that reader from resolving IPC.
+            self._connection_event_generation += 1
+            gevent.spawn(
+                _process_disconnect_event,
+                self._connection_event_generation,
+            )
+
+        def _process_login_event(event_generation):
+            with self.state_lock:
+                if event_generation != self._connection_event_generation:
+                    return
+                if self._removed:
+                    self.logged_in = False
+                    return
+                logger.info("[%s] Giris basarili", self.steam_username)
+                self.logged_in = True
+                self._reconnect_attempts = 0
+                self._reconnect_pending_generation = None
+                self._reconnect_pending_token = None
+                generation = (
+                    self.boost_generation
+                    if self._active_session_matches_unlocked()
+                    else None
+                )
+                refresh_token = self.client.refresh_token
+            if refresh_token:
+                self.save_credentials(refresh_token=refresh_token)
+            if generation is not None:
+                gevent.spawn(self._resume_boost, generation)
 
         @self.client.on("logged_on")
         def _on_login():
-            if self._removed:
-                self.logged_in = False
-                return
-            logger.info("[%s] Giris basarili", self.steam_username)
-            self.logged_in = True
-            self._reconnect_attempts = 0
-            if self.client.refresh_token:
-                self.save_credentials(refresh_token=self.client.refresh_token)
-            if self.boosting:
-                self._resume_boost()
+            # Keep the worker stdout reader free to deliver responses consumed
+            # by credential persistence and resume IPC.
+            self._connection_event_generation += 1
+            gevent.spawn(
+                _process_login_event,
+                self._connection_event_generation,
+            )
 
         @self.client.on("new_login_key")
         def _on_new_key():
             logger.info("[%s] new_login_key alindi", self.steam_username)
 
-    def _schedule_reconnect(self):
-        if self._removed:
-            return
-        if self._reconnect_attempts >= 5:
-            logger.error("[%s] Max reconnect asildi", self.steam_username)
-            if self.boosting:
-                elapsed = self.stop_boost()
-                if elapsed > 0 and boost_service.fatal_disconnect_callback:
-                    boost_service.fatal_disconnect_callback(self.account_id, elapsed)
-            return
-        delay = min(30 * (2 ** self._reconnect_attempts), 300)
-        self._reconnect_attempts += 1
-        logger.info("[%s] %dsn sonra reconnect", self.steam_username, delay)
-        gevent.spawn_later(delay, self._try_reconnect)
+    def _schedule_reconnect(self, expected_generation=None):
+        finalize_generation = None
+        with self.state_lock:
+            if self._removed or not self._active_session_matches_unlocked(
+                expected_generation=expected_generation
+            ):
+                return
+            generation = self.boost_generation
+            if self._reconnect_pending_generation == generation:
+                return
+            if self._reconnect_attempts >= 5:
+                finalize_generation = generation
+            else:
+                delay = min(30 * (2 ** self._reconnect_attempts), 300)
+                self._reconnect_attempts += 1
+                self._reconnect_pending_generation = generation
+                reconnect_token = uuid.uuid4().hex
+                self._reconnect_pending_token = reconnect_token
 
-    def _try_reconnect(self):
-        if self._removed:
+        if finalize_generation is not None:
+            logger.error("[%s] Max reconnect asildi", self.steam_username)
+            self._finalize_fatal_session(
+                finalize_generation,
+                "maximum reconnect attempts exceeded",
+            )
             return
+
+        logger.info("[%s] %dsn sonra reconnect", self.steam_username, delay)
+        try:
+            gevent.spawn_later(
+                delay,
+                self._try_reconnect,
+                generation,
+                reconnect_token,
+            )
+        except Exception:
+            with self.state_lock:
+                if (
+                    self._reconnect_pending_generation == generation
+                    and self._reconnect_pending_token == reconnect_token
+                ):
+                    self._reconnect_pending_generation = None
+                    self._reconnect_pending_token = None
+            logger.exception("[%s] Reconnect zamanlanamadi", self.steam_username)
+
+    def _try_reconnect(self, expected_generation=None, reconnect_token=None):
+        with self.state_lock:
+            if reconnect_token is not None and (
+                self._reconnect_pending_generation != expected_generation
+                or self._reconnect_pending_token != reconnect_token
+            ):
+                return
+            if self._reconnect_pending_generation == expected_generation:
+                self._reconnect_pending_generation = None
+                self._reconnect_pending_token = None
+            if self._removed or not self._active_session_matches_unlocked(
+                expected_generation=expected_generation
+            ):
+                return
+            generation = self.boost_generation
+
         try:
             creds = self.load_credentials()
-            if creds:
-                result = self._login_with_saved_credentials(creds)
-                if result == EResult.OK:
-                    return
-                if result in (
-                    EResult.AccountLogonDenied,
-                    EResult.AccountLoginDeniedNeedTwoFactor,
-                    EResult.InvalidLoginAuthCode,
-                    EResult.TwoFactorCodeMismatch,
+            if not creds:
+                logger.warning(
+                    "[%s] Kayitli kimlik yok; aktif boost sonlandiriliyor",
+                    self.steam_username,
+                )
+                self._finalize_fatal_session(
+                    generation,
+                    "saved credentials unavailable",
+                )
+                return
+
+            result = self._login_with_saved_credentials(creds)
+            with self.state_lock:
+                if self._removed or not self._active_session_matches_unlocked(
+                    expected_generation=generation
                 ):
-                    logger.warning(
-                        "[%s] Steam Guard gerekiyor, otomatik reconnect yapilamiyor",
-                        self.steam_username,
-                    )
                     return
-                if result == EResult.InvalidPassword:
-                    logger.warning(
-                        "[%s] Gecersiz sifre/token (EResult.5), reconnect durduruluyor",
-                        self.steam_username,
-                    )
-                    return
+            if result == EResult.OK:
+                return
+            if result in (
+                EResult.AccountLogonDenied,
+                EResult.AccountLoginDeniedNeedTwoFactor,
+                EResult.InvalidLoginAuthCode,
+                EResult.TwoFactorCodeMismatch,
+                EResult.InvalidPassword,
+            ):
+                logger.warning(
+                    "[%s] Terminal reconnect sonucu %s; aktif boost "
+                    "sonlandiriliyor",
+                    self.steam_username,
+                    result,
+                )
+                self._finalize_fatal_session(
+                    generation,
+                    f"terminal reconnect result {int(result)}",
+                )
+                return
+
             self.client.reconnect(maxdelay=30)
+            self._schedule_reconnect(generation)
         except Exception as e:
             logger.error("[%s] Reconnect hatasi: %s", self.steam_username, e)
-            self._schedule_reconnect()
+            self._schedule_reconnect(generation)
 
     def _record_login_success(self, password=None):
-        self.logged_in = True
-        self._reconnect_attempts = 0
+        with self.state_lock:
+            if self._removed or self.client._closed:
+                self.logged_in = False
+                return False
+            # The synchronous login response is newer than any event task that
+            # was queued before it; invalidate those stale connection updates.
+            self._connection_event_generation += 1
+            self.logged_in = True
+            self._reconnect_attempts = 0
+            self._reconnect_pending_generation = None
+            self._reconnect_pending_token = None
+            generation = (
+                self.boost_generation
+                if self._active_session_matches_unlocked()
+                else None
+            )
         if password or self.client.refresh_token:
             self.save_credentials(password=password, refresh_token=self.client.refresh_token)
+        if generation is not None:
+            gevent.spawn(self._resume_boost, generation)
+        return True
 
     def _login_with_saved_credentials(self, creds, code=None, code_type="2fa"):
+        if self._removed:
+            return EResult.NoConnection
         refresh_token = creds.get("refresh_token")
         password = creds.get("password")
 
@@ -597,6 +1296,8 @@ class SteamAccountManager:
                 username=self.steam_username,
                 refresh_token=refresh_token,
             )
+            if self._removed:
+                return EResult.NoConnection
             if result == EResult.OK:
                 self._record_login_success()
                 return result
@@ -606,12 +1307,14 @@ class SteamAccountManager:
                 result,
             )
 
-        if password:
+        if password and not self._removed:
             return self._login_with_credentials(password, code=code, code_type=code_type)
-        return EResult.InvalidPassword
+        return EResult.NoConnection if self._removed else EResult.InvalidPassword
 
     def _login_with_credentials(self, password, code=None, code_type="2fa"):
         try:
+            if self._removed:
+                return EResult.NoConnection
             if code:
                 if code_type == "email":
                     result = self.client.login(
@@ -631,6 +1334,8 @@ class SteamAccountManager:
                     password=password,
                 )
 
+            if self._removed:
+                return EResult.NoConnection
             if result == EResult.OK:
                 self._record_login_success(password=password)
                 logger.info("[%s] Kimlik bilgileriyle giris basarili", self.steam_username)
@@ -645,15 +1350,107 @@ class SteamAccountManager:
             logger.error("[%s] Credential login hatasi: %s", self.steam_username, e)
             return EResult.Fail
 
-    def _resume_boost(self):
+    def _stop_boost_session(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        context="explicit stop",
+    ):
+        with self.state_lock:
+            if (
+                expected_session_id is not None
+                or expected_generation is not None
+            ) and not self._active_session_matches_unlocked(
+                expected_session_id=expected_session_id,
+                expected_generation=expected_generation,
+            ):
+                return None
+
+            stopped_at = time.time()
+            started_at = self.start_time
+            segment = {
+                "account_id": self.account_id,
+                "session_id": self.boost_session_id,
+                "generation": self.boost_generation,
+                "started_at": started_at,
+                "stopped_at": stopped_at,
+                "elapsed": max(0, stopped_at - started_at)
+                if started_at is not None
+                else 0,
+                "app_ids": list(self.app_ids),
+            }
+
+            # Local state is closed before IPC. A synchronous disconnected event
+            # can therefore never observe boosting=True and schedule a new loop.
+            self._invalidate_boost_unlocked(force=True)
+            self._stop_remote_games_unlocked(context)
+            return segment
+
+    def _finalize_fatal_session(self, expected_generation, reason):
+        segment = self._stop_boost_session(
+            expected_generation=expected_generation,
+            context=f"fatal reconnect: {reason}",
+        )
+        if segment is None:
+            return False
+        logger.error(
+            "[%s] Boost session fail-closed sonlandirildi: %s",
+            self.steam_username,
+            reason,
+        )
+        # Never call application/DB code while state_lock is held. Application
+        # routes acquire user_operation_lock before state_lock, so reversing that
+        # order here would create a cross-greenlet deadlock.
         try:
-            self.client.change_status(persona_state=EPersonaState(self.persona_state))
-            self.client.games_played(self.app_ids)
-            logger.info("[%s] Boost devam ediyor", self.steam_username)
-        except Exception as e:
-            logger.error("[%s] Resume hatasi: %s", self.steam_username, e)
+            self._invoke_fatal_disconnect_callback(segment)
+        except Exception:
+            logger.exception(
+                "[%s] Fatal disconnect callback hatasi",
+                self.steam_username,
+            )
+        return True
+
+    def _resume_boost(self, expected_generation=None):
+        failure = None
+        with self.state_lock:
+            if (
+                self._removed
+                or not self.logged_in
+                or not self._active_session_matches_unlocked(
+                    expected_generation=expected_generation
+                )
+            ):
+                return False
+            generation = self.boost_generation
+            try:
+                result = self.client.change_status(
+                    persona_state=EPersonaState(self.persona_state)
+                )
+                if result != EResult.OK:
+                    failure = f"persona result {int(result)}"
+                else:
+                    result = self.client.games_played(list(self.app_ids))
+                    if result != EResult.OK:
+                        failure = f"games result {int(result)}"
+            except Exception as exc:
+                failure = f"{type(exc).__name__}"
+
+        if failure is not None:
+            logger.error("[%s] Resume hatasi: %s", self.steam_username, failure)
+            self._finalize_fatal_session(generation, f"resume failed: {failure}")
+            return False
+        with self.state_lock:
+            if not self._active_session_matches_unlocked(
+                expected_generation=generation
+            ):
+                return False
+        logger.info("[%s] Boost devam ediyor", self.steam_username)
+        return True
 
     def login(self, password=None, code=None, code_type="email"):
+        if self._removed:
+            return EResult.NoConnection
         if not password:
             creds = self.load_credentials()
             if creds:
@@ -663,78 +1460,158 @@ class SteamAccountManager:
         return self._login_with_credentials(password, code=code, code_type=code_type)
 
     def start_boost(self, app_ids, persona_state=1):
-        if not self.logged_in:
-            raise Exception("Steam bagli degil")
-        self.app_ids = app_ids
-        self.persona_state = persona_state
-        result = self.client.change_status(persona_state=EPersonaState(persona_state))
-        if result != EResult.OK:
-            raise Exception(f"Steam status degistirilemedi: {result}")
-        result = self.client.games_played(app_ids)
-        if result != EResult.OK:
-            raise Exception(f"Steam boost baslatilamadi: {result}")
-        self.boosting = True
-        self.start_time = time.time()
-        self.original_start_time = time.time()
+        candidate_app_ids = list(app_ids or [])
+        with self.state_lock:
+            if self._removed or self.client._closed or not self.logged_in:
+                raise Exception("Steam bagli degil")
+            if self.boosting:
+                raise Exception("Steam boost zaten aktif")
 
-    def stop_boost(self):
-        try:
-            self.client.stop_games()
-        except Exception:
-            pass
-        self.boosting = False
-        elapsed = 0
-        if self.start_time:
-            elapsed = time.time() - self.start_time
-        self.start_time = None
-        self.original_start_time = None
-        return elapsed
+            result = self.client.change_status(
+                persona_state=EPersonaState(persona_state)
+            )
+            if result != EResult.OK:
+                self._stop_remote_games_unlocked("start persona failure")
+                raise Exception(f"Steam status degistirilemedi: {result}")
+            result = self.client.games_played(candidate_app_ids)
+            if result != EResult.OK:
+                self._stop_remote_games_unlocked("start games failure")
+                raise Exception(f"Steam boost baslatilamadi: {result}")
+
+            now = time.time()
+            self.boost_generation += 1
+            self.boost_session_id = uuid.uuid4().hex
+            self.app_ids = candidate_app_ids
+            self.persona_state = persona_state
+            self.boosting = True
+            self.start_time = now
+            self.original_start_time = now
+            self._reconnect_attempts = 0
+            self._reconnect_pending_generation = None
+            self._reconnect_pending_token = None
+            return self._snapshot_unlocked()
+
+    def stop_boost(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+    ):
+        """Stop one session and return elapsed seconds (legacy-compatible).
+
+        Supplying either expectation turns this into compare-and-stop: a stale
+        timer/checkpoint cannot stop a newer boost session.
+        """
+        segment = self._stop_boost_session(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            context="explicit stop",
+        )
+        return segment["elapsed"] if segment is not None else 0
+
+    def advance_boost_checkpoint(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        min_elapsed=0,
+        now=None,
+    ):
+        """Atomically capture and advance one active usage segment."""
+        with self.state_lock:
+            if not self._active_session_matches_unlocked(
+                expected_session_id=expected_session_id,
+                expected_generation=expected_generation,
+            ):
+                return None
+            if self.start_time is None:
+                return None
+            stopped_at = time.time() if now is None else float(now)
+            elapsed = max(0, stopped_at - self.start_time)
+            if elapsed < max(0, float(min_elapsed or 0)):
+                return None
+            checkpoint = {
+                "account_id": self.account_id,
+                "session_id": self.boost_session_id,
+                "generation": self.boost_generation,
+                "started_at": self.start_time,
+                "stopped_at": stopped_at,
+                "elapsed": elapsed,
+                "app_ids": list(self.app_ids),
+            }
+            self.start_time = stopped_at
+            return checkpoint
+
+    def rollback_boost_checkpoint(self, checkpoint):
+        """Restore an uncommitted checkpoint without rewinding newer state."""
+        if not isinstance(checkpoint, dict):
+            return False
+        with self.state_lock:
+            if not self._active_session_matches_unlocked(
+                expected_session_id=checkpoint.get("session_id"),
+                expected_generation=checkpoint.get("generation"),
+            ):
+                return False
+            if self.start_time != checkpoint.get("stopped_at"):
+                return False
+            started_at = checkpoint.get("started_at")
+            if started_at is None:
+                return False
+            self.start_time = started_at
+            return True
 
     def set_persona(self, state):
-        self.persona_state = state
-        if self.logged_in:
+        with self.state_lock:
+            self.persona_state = state
+            if self.logged_in and not self._removed:
+                try:
+                    self.client.change_status(persona_state=EPersonaState(state))
+                except Exception:
+                    pass
+
+    def disconnect(self, permanent=False):
+        with self.state_lock:
+            self._invalidate_boost_unlocked(force=not self._removed)
+            stop_confirmed = True
+            if not permanent:
+                stop_confirmed = self._stop_remote_games_unlocked("disconnect")
             try:
-                self.client.change_status(persona_state=EPersonaState(state))
+                if permanent or stop_confirmed:
+                    self.client.disconnect(permanent=permanent)
             except Exception:
                 pass
+            self.logged_in = False
 
-    def disconnect(self):
-        self.boosting = False
-        self.start_time = None
-        self.original_start_time = None
-        try:
-            self.client.stop_games()
-        except Exception:
-            pass
-        try:
-            self.client.disconnect()
-        except Exception:
-            pass
-        self.logged_in = False
-
-    def remove_completely(self):
+    def remove_completely(self, *, include_legacy_machine_auth=False):
         self.mark_removed()
-        self.disconnect()
-        return self.delete_credentials()
+        self.disconnect(permanent=True)
+        return self.delete_credentials(
+            include_legacy_machine_auth=include_legacy_machine_auth
+        )
 
     def mark_removed(self):
         """Synchronously make callbacks/reconnects inert before blocking IPC."""
-        self._removed = True
-        self.boosting = False
-        self.start_time = None
-        self.original_start_time = None
+        with self.state_lock:
+            self._removed = True
+            self.logged_in = False
+            self._invalidate_boost_unlocked(force=True)
+            self.client.mark_closed()
 
     def summary(self):
-        return {
-            "id": self.account_id,
-            "steam_username": self.steam_username,
-            "logged_in": self.logged_in,
-            "boosting": self.boosting,
-            "start_time": self.original_start_time,
-            "app_ids": self.app_ids,
-            "persona_state": self.persona_state,
-            "has_token": self.has_token(),
-        }
+        with self.state_lock:
+            snapshot = self._snapshot_unlocked()
+            return {
+                "id": self.account_id,
+                "steam_username": self.steam_username,
+                "logged_in": snapshot["logged_in"],
+                "boosting": snapshot["boosting"],
+                "start_time": snapshot["original_start_time"],
+                "app_ids": snapshot["app_ids"],
+                "persona_state": snapshot["persona_state"],
+                "boost_session_id": snapshot["session_id"],
+                "boost_generation": snapshot["generation"],
+                "has_token": self.has_token(),
+            }
 
 
 class BoostService:
@@ -750,12 +1627,24 @@ class BoostService:
             self._managers[account_id] = SteamAccountManager(account_id, steam_username)
         return self._managers[account_id]
 
-    def remove(self, account_id, steam_username=None):
+    def remove(
+        self,
+        account_id,
+        steam_username=None,
+        *,
+        include_legacy_machine_auth=False,
+    ):
         mgr = self.detach(account_id)
         if mgr:
-            return mgr.remove_completely()
+            return mgr.remove_completely(
+                include_legacy_machine_auth=include_legacy_machine_auth
+            )
         if steam_username is not None:
-            return delete_saved_credentials(account_id, steam_username)
+            return delete_saved_credentials(
+                account_id,
+                steam_username,
+                include_legacy_machine_auth=include_legacy_machine_auth,
+            )
         return True
 
     def detach(self, account_id):
@@ -769,13 +1658,21 @@ class BoostService:
         return list(self._managers.items())
 
     def active_boosts(self):
-        return sum(1 for m in self._managers.values() if m.boosting)
+        managers = list(self._managers.values())
+        return sum(
+            1 for manager in managers
+            if manager.boost_snapshot()["boosting"]
+        )
 
     def stats(self):
+        snapshots = [
+            manager.boost_snapshot()
+            for manager in list(self._managers.values())
+        ]
         return {
-            "total": len(self._managers),
-            "active_boosts": self.active_boosts(),
-            "logged_in": sum(1 for m in self._managers.values() if m.logged_in),
+            "total": len(snapshots),
+            "active_boosts": sum(1 for item in snapshots if item["boosting"]),
+            "logged_in": sum(1 for item in snapshots if item["logged_in"]),
         }
 
 

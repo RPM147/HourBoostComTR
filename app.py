@@ -3,6 +3,7 @@ from gevent import monkey; monkey.patch_all()
 import os
 import json
 import time
+import math
 import secrets
 import hashlib
 import hmac
@@ -17,6 +18,7 @@ import jwt as pyjwt
 import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
+from contextlib import nullcontext
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,8 +164,10 @@ from models import (
 )
 from steam_manager import (
     boost_service,
+    migrate_legacy_node_credentials,
     purge_quarantined_credentials,
     quarantine_saved_credentials,
+    reconcile_credential_quarantines,
     restore_quarantined_credentials,
 )
 import shopier as shopier_lib
@@ -301,25 +305,208 @@ def _add_timer(acct_id, glet):
             _active_timers[acct_id] = []
         _active_timers[acct_id].append(glet)
 
-def _handle_fatal_disconnect(acct_id, elapsed):
+
+def _discard_timer(acct_id, glet):
+    """Remove only the completed timer, never a newer boost's timers."""
+    with _timer_lock:
+        timers = _active_timers.get(acct_id)
+        if not timers:
+            return
+        try:
+            timers.remove(glet)
+        except ValueError:
+            return
+        if not timers:
+            _active_timers.pop(acct_id, None)
+
+
+def _same_boost_session(snapshot, session_id=None, generation=None):
+    if not snapshot:
+        return False
+    has_expectation = session_id is not None or generation is not None
+    if session_id is not None and snapshot.get("session_id") != session_id:
+        return False
+    if generation is not None and snapshot.get("generation") != generation:
+        return False
+    return has_expectation
+
+
+def _add_boost_log_if_missing(
+    acct_id,
+    user_id,
+    started_epoch,
+    stopped_epoch,
+    duration_seconds,
+    app_ids,
+):
+    """Stage one deterministic segment and make an immediate retry idempotent."""
+    duration_seconds = max(0, int(duration_seconds or 0))
+    if duration_seconds <= 0 or started_epoch is None:
+        return False
+
+    started_at = datetime.utcfromtimestamp(float(started_epoch))
+    stopped_at = datetime.utcfromtimestamp(float(stopped_epoch))
+    existing = BoostLog.query.filter_by(
+        account_id=acct_id,
+        user_id=user_id,
+        started_at=started_at,
+        stopped_at=stopped_at,
+        duration_seconds=duration_seconds,
+    ).first()
+    if existing is not None:
+        return False
+
+    normalized_app_ids = [int(app_id) for app_id in (app_ids or [])]
+    db.session.add(BoostLog(
+        account_id=acct_id,
+        user_id=user_id,
+        started_at=started_at,
+        stopped_at=stopped_at,
+        duration_seconds=duration_seconds,
+        games_count=len(normalized_app_ids),
+        app_ids_json=json.dumps(normalized_app_ids),
+    ))
+    return True
+
+
+def _persist_stopped_boost_state(
+    acct_id,
+    user_id,
+    *,
+    started_epoch,
+    stopped_epoch,
+    duration_seconds,
+    app_ids,
+    clear_account_state=True,
+    max_attempts=2,
+):
+    """Persist a stopped segment with a bounded retry.
+
+    Steam and SQLite cannot participate in one transaction.  Runtime is stopped
+    first (fail closed); this function then makes the local state converge.  The
+    values are frozen by the caller so a retry cannot manufacture a new segment.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            acct = db.session.get(SteamAccount, acct_id)
+            if acct is None:
+                db.session.rollback()
+                return False
+            if clear_account_state:
+                acct.is_boosting = False
+                acct.target_stop_time = None
+            _add_boost_log_if_missing(
+                acct_id,
+                user_id,
+                started_epoch,
+                stopped_epoch,
+                duration_seconds,
+                app_ids,
+            )
+            db.session.commit()
+            return True
+        except SQLAlchemyError as exc:
+            db.session.rollback()
+            if attempt == max_attempts:
+                logger.error(
+                    "[acct:%s] Durdurulan boost durumu %d denemede yazilamadi: %s",
+                    acct_id,
+                    max_attempts,
+                    exc,
+                )
+                return False
+            logger.warning(
+                "[acct:%s] Boost durum commit hatasi; yeniden deneniyor: %s",
+                acct_id,
+                exc,
+            )
+
+
+def _handle_fatal_disconnect(
+    acct_id,
+    elapsed,
+    session_id=None,
+    generation=None,
+    started_epoch=None,
+    app_ids=None,
+):
     try:
         with app.app_context():
-            acct = db.session.get(SteamAccount, acct_id)
-            if acct:
-                log = BoostLog(
-                    account_id=acct_id,
-                    user_id=acct.user_id,
-                    started_at=datetime.utcnow() - timedelta(seconds=elapsed),
-                    stopped_at=datetime.utcnow(),
-                    duration_seconds=int(elapsed),
-                    games_count=len(acct.app_ids()),
-                    app_ids_json=json.dumps(acct.app_ids())
+            owner_id = db.session.query(SteamAccount.user_id).filter_by(
+                id=acct_id
+            ).scalar()
+            if owner_id is None:
+                _clear_timers(acct_id)
+                return
+
+            with _user_operation_lock(owner_id):
+                db.session.expire_all()
+                acct = db.session.get(SteamAccount, acct_id)
+                if acct is None:
+                    _clear_timers(acct_id)
+                    return
+                fallback_app_ids = acct.app_ids()
+
+                manager = boost_service.get(acct_id)
+                clear_account_state = True
+                if manager is not None:
+                    # Do not retain a DB read transaction while stop_games may
+                    # yield for up to its IPC timeout.
+                    db.session.rollback()
+                    with manager.state_lock:
+                        current = manager.boost_snapshot()
+                        if current.get("boosting"):
+                            # A successful manual login may already have started
+                            # a newer session while this old callback was queued.
+                            # Never clear that session's DB state or timer.
+                            if _same_boost_session(
+                                current,
+                                session_id=session_id,
+                                generation=generation,
+                            ):
+                                manager.stop_boost(
+                                    expected_session_id=session_id,
+                                    expected_generation=generation,
+                                )
+                            else:
+                                clear_account_state = False
+
+                elapsed = max(0, float(elapsed or 0))
+                stopped_epoch = time.time()
+                if started_epoch is None:
+                    started_epoch = stopped_epoch - elapsed
+                persisted = _persist_stopped_boost_state(
+                    acct_id,
+                    owner_id,
+                    started_epoch=started_epoch,
+                    stopped_epoch=stopped_epoch,
+                    duration_seconds=elapsed,
+                    app_ids=(
+                        list(app_ids)
+                        if app_ids is not None
+                        else fallback_app_ids
+                    ),
+                    clear_account_state=clear_account_state,
                 )
-                db.session.add(log)
-                db.session.commit()
-                logger.info("[%s] Fatal disconnect sonrasi %d saniye veritabanina yazildi", acct_id, int(elapsed))
-    except Exception as e:
-        logger.error("[%s] Fatal disconnect log yazma hatasi: %s", acct_id, e)
+                if clear_account_state:
+                    _clear_timers(acct_id)
+                if persisted:
+                    logger.info(
+                        "[acct:%s] Fatal disconnect sonrasi %d saniye kaydedildi",
+                        acct_id,
+                        int(elapsed),
+                    )
+                else:
+                    logger.critical(
+                        "[acct:%s] Fatal disconnect runtime'i durdu fakat DB uzlasmadi",
+                        acct_id,
+                    )
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        logger.exception("[acct:%s] Fatal disconnect finalization hatasi", acct_id)
 
 boost_service.fatal_disconnect_callback = _handle_fatal_disconnect
 
@@ -329,13 +516,15 @@ def _get_active_seconds(user_id, start_time_filter=None):
     accounts = SteamAccount.query.filter_by(user_id=user_id).all()
     for acct in accounts:
         mgr = boost_service.get(acct.id)
-        if mgr and mgr.boosting and mgr.start_time:
+        snapshot = mgr.boost_snapshot() if mgr else None
+        if snapshot and snapshot.get("boosting") and snapshot.get("start_time"):
+            active_start = snapshot["start_time"]
             if start_time_filter:
-                start_dt = datetime.utcfromtimestamp(mgr.start_time)
+                start_dt = datetime.utcfromtimestamp(active_start)
                 if start_dt >= start_time_filter:
-                    active += (now - mgr.start_time)
+                    active += (now - active_start)
             else:
-                active += (now - mgr.start_time)
+                active += (now - active_start)
     return active
 
 # ───────────────────── JWT ─────────────────────
@@ -1069,12 +1258,37 @@ def _reconcile_boost_state_on_startup():
             logger.info("Restart reconciliation: %d hesabin bayat boost durumu temizlendi", len(stale))
     except Exception as e:
         db.session.rollback()
-        logger.error("Restart reconciliation hatasi: %s", e)
+        logger.critical(
+            "Restart reconciliation hatasi; bayat boost durumu ile servis baslatilmadi: %s",
+            e,
+        )
+        raise
+
+
+def _reconcile_steam_credentials_on_startup():
+    """Resolve interrupted deletions, then remove the legacy shared-token layout."""
+    account_pairs = [
+        (account.id, account.steam_username)
+        for account in SteamAccount.query.with_entities(
+            SteamAccount.id,
+            SteamAccount.steam_username,
+        ).all()
+    ]
+    if not reconcile_credential_quarantines(account_pairs):
+        logger.critical(
+            "Steam credential quarantine reconciliation completed with errors"
+        )
+    if not migrate_legacy_node_credentials(account_pairs):
+        logger.critical(
+            "Legacy Steam credential migration completed with errors; "
+            "shared sources were retained for retry"
+        )
 
 
 with app.app_context():
     db.create_all()
     _ensure_schema()
+    _reconcile_steam_credentials_on_startup()
     _reconcile_boost_state_on_startup()
 
 import gevent
@@ -1084,37 +1298,94 @@ import gevent
 # boost durumunu temizler. Ölü auto_reconnect_saved_accounts() fonksiyonu
 # kaldırıldı (ISSUES.md #19).
 
+def _checkpoint_active_boosts_once():
+    """Persist active segments without advancing memory before durability."""
+    saved = 0
+    for acct_id, manager in boost_service.all_managers():
+        try:
+            owner_id = db.session.query(SteamAccount.user_id).filter_by(
+                id=acct_id
+            ).scalar()
+            if owner_id is None:
+                logger.warning(
+                    "[acct:%s] Checkpoint atlandi: manager icin DB hesabi yok",
+                    acct_id,
+                )
+                continue
+
+            with _user_operation_lock(owner_id):
+                db.session.expire_all()
+                acct = db.session.get(SteamAccount, acct_id)
+                if acct is None:
+                    continue
+                with manager.state_lock:
+                    snapshot = manager.boost_snapshot()
+                    if not snapshot.get("boosting") or snapshot.get("start_time") is None:
+                        continue
+
+                    stopped_epoch = time.time()
+                    elapsed = stopped_epoch - snapshot["start_time"]
+                    if elapsed <= 60:
+                        continue
+
+                    _add_boost_log_if_missing(
+                        acct_id,
+                        owner_id,
+                        snapshot["start_time"],
+                        stopped_epoch,
+                        elapsed,
+                        snapshot.get("app_ids") or acct.app_ids(),
+                    )
+                    try:
+                        db.session.commit()
+                    except SQLAlchemyError as exc:
+                        # The in-memory boundary remains untouched, so the exact
+                        # duration is eligible for the next checkpoint/stop.
+                        db.session.rollback()
+                        logger.error(
+                            "[acct:%s] Checkpoint commit hatasi: %s",
+                            acct_id,
+                            exc,
+                        )
+                        continue
+
+                    advanced = manager.advance_boost_checkpoint(
+                        expected_session_id=snapshot.get("session_id"),
+                        expected_generation=snapshot.get("generation"),
+                        min_elapsed=60,
+                        now=stopped_epoch,
+                    )
+                    if advanced is None:
+                        # The manager lock makes this defensive branch unlikely.
+                        # The DB segment is still valid; a later stop may overlap
+                        # only if an invariant outside this lock was violated.
+                        logger.critical(
+                            "[acct:%s] Checkpoint yazildi fakat runtime siniri ilerlemedi",
+                            acct_id,
+                        )
+                    else:
+                        saved += 1
+        except Exception:
+            db.session.rollback()
+            logger.exception("[acct:%s] Checkpoint hesap hatasi", acct_id)
+    return saved
+
+
 def _checkpoint_loop():
     while True:
         gevent.sleep(900)  # 15 dakika (900 saniye)
-        with app.app_context():
-            logger.info("Running background boost checkpoint (saving active durations)...")
-            count = 0
-            for acct_id, mgr in boost_service.all_managers():
-                if mgr.boosting and mgr.start_time:
-                    elapsed = time.time() - mgr.start_time
-                    if elapsed > 60:
-                        mgr.start_time = time.time()
-                        acct_db = db.session.get(SteamAccount, acct_id)
-                        if acct_db:
-                            log = BoostLog(
-                                account_id=acct_id,
-                                user_id=acct_db.user_id,
-                                started_at=datetime.utcfromtimestamp(time.time() - elapsed),
-                                stopped_at=datetime.utcnow(),
-                                duration_seconds=int(elapsed),
-                                games_count=len(acct_db.app_ids()),
-                                app_ids_json=json.dumps(acct_db.app_ids()),
-                            )
-                            db.session.add(log)
-                            count += 1
-            if count > 0:
-                try:
-                    db.session.commit()
+        try:
+            with app.app_context():
+                logger.info(
+                    "Running background boost checkpoint (saving active durations)..."
+                )
+                count = _checkpoint_active_boosts_once()
+                if count:
                     logger.info("Checkpoint basarili: %d kayit eklendi.", count)
-                except Exception as e:
-                    db.session.rollback()
-                    logger.error("Checkpoint commit hatasi: %s", e)
+        except Exception:
+            # One unexpected account/DB failure must not kill this permanent
+            # background greenlet.
+            logger.exception("Checkpoint dongusu beklenmeyen hata ile karsilasti")
 
 gevent.spawn(_checkpoint_loop)
 
@@ -1128,25 +1399,28 @@ import atexit
 def shutdown_cleanup():
     with app.app_context():
         for acct_id, mgr in boost_service.all_managers():
-            if mgr.boosting:
-                boost_start = mgr.start_time
-                if boost_start is None:
-                    mgr.stop_boost()
-                    continue
-                elapsed = mgr.stop_boost()
-                acct_db = db.session.get(SteamAccount, acct_id)
-                if acct_db and elapsed > 0:
-                    log = BoostLog(
-                        account_id=acct_id,
-                        user_id=acct_db.user_id,
-                        started_at=datetime.utcfromtimestamp(boost_start),
-                        stopped_at=datetime.utcnow(),
-                        duration_seconds=int(elapsed),
-                        games_count=len(acct_db.app_ids()),
-                        app_ids_json=json.dumps(acct_db.app_ids()),
+            try:
+                with mgr.state_lock:
+                    snapshot = mgr.boost_snapshot()
+                    if not snapshot.get("boosting"):
+                        continue
+                    elapsed = mgr.stop_boost(
+                        expected_session_id=snapshot.get("session_id"),
+                        expected_generation=snapshot.get("generation"),
                     )
-                    db.session.add(log)
-        db.session.commit()
+                acct_db = db.session.get(SteamAccount, acct_id)
+                if acct_db:
+                    _persist_stopped_boost_state(
+                        acct_id,
+                        acct_db.user_id,
+                        started_epoch=snapshot.get("start_time"),
+                        stopped_epoch=time.time(),
+                        duration_seconds=elapsed,
+                        app_ids=snapshot.get("app_ids") or [],
+                    )
+            except Exception:
+                db.session.rollback()
+                logger.exception("[acct:%s] Shutdown boost cleanup hatasi", acct_id)
 
         try:
             _cleanup_revoked_tokens()
@@ -3099,21 +3373,8 @@ def get_accounts():
     result = []
     for acct in accounts:
         mgr = boost_service.get_or_create(acct.id, acct.steam_username)
-
-        if mgr.logged_in:
-            s = mgr.summary()
-            s["app_ids"] = acct.app_ids()
-        else:
-            s = {
-                "id": acct.id,
-                "steam_username": acct.steam_username,
-                "logged_in": False,
-                "boosting": False,
-                "start_time": None,
-                "app_ids": acct.app_ids(),
-                "persona_state": acct.persona_state,
-                "has_token": mgr.has_token(),
-            }
+        s = mgr.summary()
+        s["app_ids"] = acct.app_ids()
         result.append(s)
     return jsonify({"accounts": result})
 
@@ -3122,7 +3383,9 @@ def get_accounts():
 @login_required
 @limiter.limit("10 per minute")
 def account_login():
-    data = request.json
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
     username = sanitize(data.get("username", ""), 100)
     password = data.get("password", "")
     if password == "_use_saved_":
@@ -3130,6 +3393,11 @@ def account_login():
     code = sanitize(data.get("code", ""), 10)
     code_type = data.get("code_type", "email")
     acct_id = data.get("acct_id")
+    if acct_id is not None and (
+        not isinstance(acct_id, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", acct_id)
+    ):
+        return jsonify({"ok": False, "error": "Invalid account id."}), 400
     use_token = data.get("use_token", False)
     use_credentials = data.get("use_credentials", False)
 
@@ -3163,28 +3431,9 @@ def account_login():
 
     acct_db = db.session.get(SteamAccount, acct_id)
     if not acct_db:
-        # GÜVENLİK: istemci var olmayan bir acct_id gönderdiğinde de yeni hesap
-        # oluşturuluyor; doğrulama ve plan limiti kontrolleri yukarıdaki
-        # (acct_id'siz) dal ile AYNI şekilde uygulanmak zorundadır. Aksi halde
-        # rastgele acct_id göndererek limitler atlanabilirdi (ISSUES.md #1).
-        if not username:
-            return jsonify({"ok": False, "error": "Username is required."})
-        if not user.is_verified:
-            return jsonify({
-                "ok": False,
-                "error": "Please verify your email address before adding a Steam account.",
-                "need_verify": True,
-            })
-        current = SteamAccount.query.filter_by(user_id=user.id).count()
-        if current >= limits["max_accounts"]:
-            return jsonify({
-                "ok": False,
-                "error": f"Your plan supports a maximum of {limits['max_accounts']} accounts.",
-                "upgrade": True,
-            })
-        acct_db = SteamAccount(id=acct_id, user_id=user.id, steam_username=username)
-        db.session.add(acct_db)
-        db.session.commit()
+        # Account IDs are generated by the server. A caller-selected missing ID
+        # must never create a DB row or choose a filesystem storage namespace.
+        return jsonify({"ok": False, "error": "Account not found."}), 404
 
     if acct_db.user_id != user.id:
         return jsonify({"ok": False, "error": "Unauthorized."})
@@ -3206,8 +3455,9 @@ def account_login():
                 except Exception:
                     pass
                 db.session.commit()
-                mgr.app_ids = acct_db.app_ids()
-                mgr.persona_state = acct_db.persona_state
+                with mgr.state_lock:
+                    mgr.app_ids = acct_db.app_ids()
+                    mgr.persona_state = acct_db.persona_state
                 return jsonify({"ok": True, "acct_id": acct_id})
             elif result == EResult.AccountLogonDenied:
                 return jsonify({"ok": False, "need_code": True, "code_type": "email", "msg": "Email Guard code required."})
@@ -3226,8 +3476,9 @@ def account_login():
             except Exception:
                 pass
             db.session.commit()
-            mgr.app_ids = acct_db.app_ids()
-            mgr.persona_state = acct_db.persona_state
+            with mgr.state_lock:
+                mgr.app_ids = acct_db.app_ids()
+                mgr.persona_state = acct_db.persona_state
             return jsonify({"ok": True, "acct_id": acct_id, "method": "token"})
         elif result == EResult.AccountLogonDenied:
             return jsonify({"ok": False, "need_code": True, "code_type": "email", "acct_id": acct_id, "msg": "Email Guard code required."})
@@ -3255,27 +3506,206 @@ def account_login():
     except Exception:
         pass
     db.session.commit()
-    mgr.app_ids = acct_db.app_ids()
-    mgr.persona_state = acct_db.persona_state
+    with mgr.state_lock:
+        mgr.app_ids = acct_db.app_ids()
+        mgr.persona_state = acct_db.persona_state
     return jsonify({"ok": True, "acct_id": acct_id, "has_token": mgr.has_token()})
 
 
 @app.route("/accounts/remove", methods=["POST"])
 @login_required
 def remove_account():
-    acct_id = request.json.get("acct_id")
-    acct_db = db.session.get(SteamAccount, acct_id)
-    if not acct_db or acct_db.user_id != g.user.id:
-        return jsonify({"ok": False})
-    _clear_timers(acct_id)
-    if not boost_service.remove(acct_id, acct_db.steam_username):
-        return jsonify({
-            "ok": False,
-            "error": "Stored Steam credentials could not be removed.",
-        }), 503
-    db.session.delete(acct_db)
-    db.session.commit()
-    return jsonify({"ok": True})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+    acct_id = data.get("acct_id")
+    if (
+        not isinstance(acct_id, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", acct_id)
+    ):
+        return jsonify({"ok": False, "error": "Invalid account id."}), 400
+
+    user_id = g.user.id
+    # Non-admin requests already hold this RLock through login_required. Taking
+    # it here also serializes an admin's own Steam mutations.
+    with _user_operation_lock(user_id):
+        db.session.expire_all()
+        acct_db = (
+            SteamAccount.query.filter_by(id=acct_id, user_id=user_id)
+            .with_for_update()
+            .first()
+        )
+        if acct_db is None:
+            return jsonify({"ok": False, "error": "Account not found."}), 404
+
+        steam_username = acct_db.steam_username
+        app_ids = acct_db.app_ids()
+        manager = boost_service.get(acct_id)
+        manager_snapshot = manager.boost_snapshot() if manager else None
+        boost_started_at = (
+            manager_snapshot.get("start_time")
+            if manager_snapshot and manager_snapshot.get("boosting")
+            else None
+        )
+        remove_legacy_machine_auth = not db.session.query(SteamAccount.id).filter(
+            SteamAccount.id != acct_id,
+            db.func.lower(SteamAccount.steam_username)
+            == steam_username.lower(),
+        ).first()
+
+        quarantined = quarantine_saved_credentials(
+            acct_id,
+            steam_username,
+            include_legacy_machine_auth=remove_legacy_machine_auth,
+        )
+        if quarantined is None:
+            logger.error(
+                "steam_account.delete_credential_quarantine_failed "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Stored Steam credentials could not be removed.",
+            }), 503
+
+        try:
+            stopped_at = datetime.utcnow()
+            if boost_started_at is not None:
+                elapsed = max(0, int(time.time() - boost_started_at))
+                if elapsed > 0:
+                    db.session.add(BoostLog(
+                        account_id=None,
+                        user_id=user_id,
+                        started_at=datetime.utcfromtimestamp(boost_started_at),
+                        stopped_at=stopped_at,
+                        duration_seconds=elapsed,
+                        games_count=len(app_ids),
+                        app_ids_json=json.dumps(app_ids),
+                    ))
+
+            # Keep historical usage, but sever the foreign key before deleting
+            # the operational account. This prevents new BoostLog FK debt.
+            BoostLog.query.filter_by(account_id=acct_id).update(
+                {BoostLog.account_id: None},
+                synchronize_session=False,
+            )
+            db.session.delete(acct_db)
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            restore_quarantined_credentials(quarantined)
+            logger.warning(
+                "steam_account.delete_integrity_conflict user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "The account changed during deletion. Please retry.",
+            }), 409
+        except SQLAlchemyError:
+            db.session.rollback()
+            restore_quarantined_credentials(quarantined)
+            logger.exception(
+                "steam_account.delete_database_error user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Deletion could not be completed. Please try again.",
+            }), 503
+        except Exception:
+            db.session.rollback()
+            restore_quarantined_credentials(quarantined)
+            logger.exception(
+                "steam_account.delete_internal_error user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Deletion could not be completed. Please try again.",
+            }), 503
+
+        # The DB commit is durable. Make every runtime callback inert before
+        # timer cancellation or blocking Node IPC can yield to another greenlet.
+        cleanup_ok = True
+        detached_manager = None
+        try:
+            detached_manager = boost_service.detach(acct_id)
+        except Exception:
+            cleanup_ok = False
+            logger.exception(
+                "steam_account.delete_manager_detach_failed "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+            fallback_manager = boost_service.get(acct_id)
+            if fallback_manager:
+                try:
+                    fallback_manager.mark_removed()
+                except Exception:
+                    logger.critical(
+                        "steam_account.delete_manager_disable_failed "
+                        "user_id=%s account_id=%s",
+                        user_id,
+                        acct_id,
+                        exc_info=True,
+                    )
+
+        try:
+            _clear_timers(acct_id)
+        except Exception:
+            cleanup_ok = False
+            logger.exception(
+                "steam_account.delete_timer_cleanup_failed "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+
+        try:
+            if detached_manager:
+                removed = detached_manager.remove_completely(
+                    include_legacy_machine_auth=remove_legacy_machine_auth
+                )
+            else:
+                removed = boost_service.remove(
+                    acct_id,
+                    steam_username,
+                    include_legacy_machine_auth=remove_legacy_machine_auth,
+                )
+            if not removed:
+                cleanup_ok = False
+        except Exception:
+            cleanup_ok = False
+            logger.exception(
+                "steam_account.delete_runtime_cleanup_failed "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+
+        if not purge_quarantined_credentials(quarantined):
+            cleanup_ok = False
+        if not cleanup_ok:
+            logger.critical(
+                "steam_account.delete_post_commit_cleanup_incomplete "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+        logger.info(
+            "steam_account.deleted user_id=%s account_id=%s final_segment=%s",
+            user_id,
+            acct_id,
+            bool(boost_started_at),
+        )
+        return jsonify({"ok": True, "cleanup_warning": not cleanup_ok})
 
 
 # ───────────────────── Oyun Listesi ─────────────────────
@@ -3283,58 +3713,123 @@ def remove_account():
 @app.route("/apps/add", methods=["POST"])
 @login_required
 def add_app():
-    acct_id = request.json.get("acct_id")
-    aid = request.json.get("id")
-    acct_db = db.session.get(SteamAccount, acct_id)
-    if not acct_db or acct_db.user_id != g.user.id:
-        return jsonify({"ok": False, "error": "Account not found."})
-
-    limits = g.user.plan_limits()
-    if len(acct_db.games) >= limits["max_games"]:
-        return jsonify({"ok": False, "error": f"Your plan supports {limits['max_games']} games per account.", "upgrade": True})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+    acct_id = data.get("acct_id")
+    if (
+        not isinstance(acct_id, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", acct_id)
+    ):
+        return jsonify({"ok": False, "error": "Invalid account id."}), 400
 
     try:
-        aid = int(aid)
+        app_id = int(data.get("id"))
     except (ValueError, TypeError):
-        return jsonify({"ok": False, "error": "Please enter a valid AppID."})
+        return jsonify({
+            "ok": False,
+            "error": "Please enter a valid AppID.",
+        }), 400
+    if not 1 <= app_id <= 0xFFFFFFFF:
+        return jsonify({
+            "ok": False,
+            "error": "Please enter a valid AppID.",
+        }), 400
 
-    exists = BoostGame.query.filter_by(account_id=acct_id, app_id=aid).first()
-    if not exists:
-        db.session.add(BoostGame(account_id=acct_id, app_id=aid))
-        db.session.commit()
+    acct_db = db.session.get(SteamAccount, acct_id)
+    if not acct_db or acct_db.user_id != g.user.id:
+        return jsonify({"ok": False, "error": "Account not found."}), 404
 
-    ids = acct_db.app_ids()
-    mgr = boost_service.get(acct_id)
-    if mgr:
-        mgr.app_ids = ids
-    return jsonify({"app_ids": ids})
+    manager = boost_service.get(acct_id)
+    lock = manager.state_lock if manager is not None else nullcontext()
+    with lock:
+        db.session.expire_all()
+        acct_db = db.session.get(SteamAccount, acct_id)
+        if not acct_db or acct_db.user_id != g.user.id:
+            return jsonify({"ok": False, "error": "Account not found."}), 404
+        if acct_db.is_boosting or (
+            manager is not None and manager.boost_snapshot().get("boosting")
+        ):
+            return jsonify({
+                "ok": False,
+                "error": "Stop boosting before changing the game list.",
+            }), 409
+
+        limits = g.user.plan_limits()
+        if len(acct_db.games) >= limits["max_games"]:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"Your plan supports {limits['max_games']} games per account."
+                ),
+                "upgrade": True,
+            })
+
+        exists = BoostGame.query.filter_by(
+            account_id=acct_id,
+            app_id=app_id,
+        ).first()
+        if not exists:
+            db.session.add(BoostGame(account_id=acct_id, app_id=app_id))
+            db.session.commit()
+
+        app_ids = acct_db.app_ids()
+        if manager is not None:
+            manager.app_ids = list(app_ids)
+        return jsonify({"app_ids": app_ids})
 
 
 @app.route("/apps/remove", methods=["POST"])
 @login_required
 def remove_app():
-    acct_id = request.json.get("acct_id")
-    aid = request.json.get("id")
-    acct_db = db.session.get(SteamAccount, acct_id)
-    if not acct_db or acct_db.user_id != g.user.id:
-        return jsonify({"ok": False})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+    acct_id = data.get("acct_id")
+    if (
+        not isinstance(acct_id, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", acct_id)
+    ):
+        return jsonify({"ok": False, "error": "Invalid account id."}), 400
 
     try:
-        aid = int(aid)
+        app_id = int(data.get("id"))
     except (ValueError, TypeError):
-        return jsonify({"ok": False})
+        return jsonify({"ok": False, "error": "Invalid AppID."}), 400
+    if not 1 <= app_id <= 0xFFFFFFFF:
+        return jsonify({"ok": False, "error": "Invalid AppID."}), 400
 
-    game = BoostGame.query.filter_by(account_id=acct_id, app_id=aid).first()
-    if game:
-        db.session.delete(game)
-        db.session.commit()
+    acct_db = db.session.get(SteamAccount, acct_id)
+    if not acct_db or acct_db.user_id != g.user.id:
+        return jsonify({"ok": False, "error": "Account not found."}), 404
 
-    ids = acct_db.app_ids()
-    mgr = boost_service.get(acct_id)
-    if mgr:
-        mgr.app_ids = ids
-    return jsonify({"app_ids": ids})
+    manager = boost_service.get(acct_id)
+    lock = manager.state_lock if manager is not None else nullcontext()
+    with lock:
+        db.session.expire_all()
+        acct_db = db.session.get(SteamAccount, acct_id)
+        if not acct_db or acct_db.user_id != g.user.id:
+            return jsonify({"ok": False, "error": "Account not found."}), 404
+        if acct_db.is_boosting or (
+            manager is not None and manager.boost_snapshot().get("boosting")
+        ):
+            return jsonify({
+                "ok": False,
+                "error": "Stop boosting before changing the game list.",
+            }), 409
 
+        game = BoostGame.query.filter_by(
+            account_id=acct_id,
+            app_id=app_id,
+        ).first()
+        if game:
+            db.session.delete(game)
+            db.session.commit()
+
+        app_ids = acct_db.app_ids()
+        if manager is not None:
+            manager.app_ids = list(app_ids)
+        return jsonify({"app_ids": app_ids})
 
 # ───────────────────── Durum & Boost ─────────────────────
 
@@ -3359,221 +3854,399 @@ def set_status():
     return jsonify({"ok": True, "state": state})
 
 
+def _stop_boost_session_and_persist(
+    acct_id,
+    user_id,
+    manager,
+    *,
+    expected_session_id=None,
+    expected_generation=None,
+):
+    """Stop exactly one runtime session and durably finalize its open segment."""
+    snapshot = manager.boost_snapshot()
+    if expected_session_id is not None or expected_generation is not None:
+        if not _same_boost_session(
+            snapshot,
+            session_id=expected_session_id,
+            generation=expected_generation,
+        ):
+            return {"stopped": False, "stale": True, "persisted": True}
+
+    if not snapshot.get("boosting"):
+        persisted = _persist_stopped_boost_state(
+            acct_id,
+            user_id,
+            started_epoch=None,
+            stopped_epoch=time.time(),
+            duration_seconds=0,
+            app_ids=snapshot.get("app_ids") or [],
+        )
+        return {"stopped": False, "stale": False, "persisted": persisted}
+
+    elapsed = manager.stop_boost(
+        expected_session_id=expected_session_id,
+        expected_generation=expected_generation,
+    )
+    stopped_epoch = time.time()
+    persisted = _persist_stopped_boost_state(
+        acct_id,
+        user_id,
+        started_epoch=snapshot.get("start_time"),
+        stopped_epoch=stopped_epoch,
+        duration_seconds=elapsed,
+        app_ids=snapshot.get("app_ids") or [],
+    )
+    return {
+        "stopped": True,
+        "stale": False,
+        "persisted": persisted,
+        "elapsed": elapsed,
+        "session_id": snapshot.get("session_id"),
+        "generation": snapshot.get("generation"),
+    }
+
+
+def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
+    current = gevent.getcurrent()
+    try:
+        with app.app_context():
+            owner_id = db.session.query(SteamAccount.user_id).filter_by(
+                id=acct_id
+            ).scalar()
+            if owner_id != user_id:
+                return
+            with _user_operation_lock(user_id):
+                db.session.expire_all()
+                acct = db.session.get(SteamAccount, acct_id)
+                if acct is None or acct.user_id != user_id:
+                    return
+                manager = boost_service.get(acct_id)
+                if manager is None:
+                    _persist_stopped_boost_state(
+                        acct_id,
+                        user_id,
+                        started_epoch=None,
+                        stopped_epoch=time.time(),
+                        duration_seconds=0,
+                        app_ids=acct.app_ids(),
+                    )
+                    return
+                db.session.rollback()
+                with manager.state_lock:
+                    result = _stop_boost_session_and_persist(
+                        acct_id,
+                        user_id,
+                        manager,
+                        expected_session_id=session_id,
+                        expected_generation=generation,
+                    )
+                if result.get("stale"):
+                    logger.info(
+                        "[acct:%s] Eski boost timer'i yeni session'a dokunmadan atlandi",
+                        acct_id,
+                    )
+                elif not result.get("persisted"):
+                    logger.critical(
+                        "[acct:%s] Timer runtime'i durdurdu fakat DB uzlasmadi",
+                        acct_id,
+                    )
+                else:
+                    logger.info(
+                        "[acct:%s] Boost timer tamamlandi: %s",
+                        acct_id,
+                        reason,
+                    )
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        logger.exception("[acct:%s] Boost timer finalization hatasi", acct_id)
+    finally:
+        _discard_timer(acct_id, current)
+
+
+def _schedule_boost_stop_timer(
+    acct_id,
+    user_id,
+    session_id,
+    generation,
+    delay_seconds,
+    reason,
+):
+    timer = gevent.spawn_later(
+        max(0.0, float(delay_seconds)),
+        _run_boost_stop_timer,
+        acct_id,
+        user_id,
+        session_id,
+        generation,
+        reason,
+    )
+    try:
+        _add_timer(acct_id, timer)
+    except Exception:
+        timer.kill()
+        raise
+    return timer
+
+
 @app.route("/boost/toggle", methods=["POST"])
 @login_required
 def toggle_boost():
-    acct_id = request.json.get("acct_id")
-    timer_hours = request.json.get("timer_hours", 0)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+    acct_id = data.get("acct_id")
+    if (
+        not isinstance(acct_id, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", acct_id)
+    ):
+        return jsonify({"ok": False, "error": "Invalid account id."}), 400
+
+    timer_hours = data.get("timer_hours", 0)
     try:
-        timer_hours = float(timer_hours) if timer_hours else 0
+        timer_hours = float(timer_hours) if timer_hours else 0.0
     except (ValueError, TypeError):
-        timer_hours = 0
-    if timer_hours > 0:
+        timer_hours = 0.0
+    if not math.isfinite(timer_hours) or timer_hours <= 0:
+        timer_hours = 0.0
+    else:
         timer_hours = max(0.5, min(24.0, timer_hours))
 
+    user_id = g.user.id
     acct_db = db.session.get(SteamAccount, acct_id)
-    if not acct_db or acct_db.user_id != g.user.id:
-        return jsonify({"ok": False, "error": "Account not found."})
+    if not acct_db or acct_db.user_id != user_id:
+        return jsonify({"ok": False, "error": "Account not found."}), 404
 
-    mgr = boost_service.get(acct_id)
-    if not mgr or not mgr.logged_in:
+    manager = boost_service.get(acct_id)
+    if not manager:
         return jsonify({"ok": False, "error": "Please connect to Steam first."})
 
-    if mgr.boosting:
-        acct_db.target_stop_time = None
-        acct_db.is_boosting = False
-        db.session.commit()
-        _clear_timers(acct_id)
-        boost_start = mgr.start_time
-        elapsed = mgr.stop_boost()
-        if elapsed > 0 and boost_start:
-            log = BoostLog(
-                account_id=acct_id,
-                user_id=g.user.id,
-                started_at=datetime.utcfromtimestamp(boost_start),
-                stopped_at=datetime.utcnow(),
-                duration_seconds=int(elapsed),
-                games_count=len(acct_db.app_ids()),
-                app_ids_json=json.dumps(acct_db.app_ids()),
+    with manager.state_lock:
+        db.session.expire_all()
+        acct_db = db.session.get(SteamAccount, acct_id)
+        if acct_db is None or acct_db.user_id != user_id:
+            return jsonify({"ok": False, "error": "Account not found."}), 404
+
+        current = manager.boost_snapshot()
+        if current.get("boosting"):
+            # Close the read transaction before yielding to Node IPC.
+            db.session.rollback()
+            _clear_timers(acct_id)
+            result = _stop_boost_session_and_persist(
+                acct_id,
+                user_id,
+                manager,
+                expected_session_id=current.get("session_id"),
+                expected_generation=current.get("generation"),
             )
-            db.session.add(log)
-            db.session.commit()
-        return jsonify({"ok": True, "boosting": False})
+            if not result.get("persisted"):
+                return jsonify({
+                    "ok": False,
+                    "boosting": False,
+                    "error": (
+                        "Boost stopped, but its status could not be saved. "
+                        "Please retry."
+                    ),
+                }), 503
+            return jsonify({
+                "ok": True,
+                "boosting": False,
+                "steam_connected": manager.logged_in,
+            })
 
-    ids = acct_db.app_ids()
-    if not ids:
-        return jsonify({"ok": False, "error": "Game list is empty."})
-        
-    _clear_timers(acct_id)
+        if not current.get("logged_in"):
+            return jsonify({
+                "ok": False,
+                "error": "Please connect to Steam first.",
+            })
 
-    limits = g.user.plan_limits()
+        ids = acct_db.app_ids()
+        if not ids:
+            return jsonify({"ok": False, "error": "Game list is empty."})
 
-    # ── Günlük saat limiti ──
-    daily_hours = limits.get("daily_hours")
-    if daily_hours is not None:
-        from sqlalchemy import func as sqlfunc
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        used_seconds = (
-            db.session.query(sqlfunc.sum(BoostLog.duration_seconds))
-            .filter(BoostLog.user_id == g.user.id, BoostLog.started_at >= today_start)
-            .scalar() or 0
-        )
-        used_seconds += _get_active_seconds(g.user.id, today_start)
-        
-        limit_seconds = daily_hours * 3600
-        remaining = limit_seconds - used_seconds
-        if remaining <= 0:
-            return jsonify({"ok": False, "error": f"You have reached your daily {daily_hours}-hour limit.", "upgrade": True})
+        limits = g.user.plan_limits()
+        stop_candidates = []
+
+        daily_hours = limits.get("daily_hours")
+        if daily_hours is not None:
+            from sqlalchemy import func as sqlfunc
+            today_start = datetime.utcnow().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            used_seconds = (
+                db.session.query(sqlfunc.sum(BoostLog.duration_seconds))
+                .filter(
+                    BoostLog.user_id == user_id,
+                    BoostLog.started_at >= today_start,
+                )
+                .scalar() or 0
+            )
+            used_seconds += _get_active_seconds(user_id, today_start)
+            remaining_daily = daily_hours * 3600 - used_seconds
+            if remaining_daily <= 0:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"You have reached your daily {daily_hours}-hour limit."
+                    ),
+                    "upgrade": True,
+                })
+            stop_candidates.append((remaining_daily, "daily_limit"))
+
+        total_hours = limits.get("total_hours")
+        if total_hours is not None:
+            from sqlalchemy import func as sqlfunc2
+            plan_start = (
+                g.user.plan_activated_at
+                if g.user.plan_activated_at
+                else datetime.utcnow() - timedelta(days=365)
+            )
+            used_total = (
+                db.session.query(sqlfunc2.sum(BoostLog.duration_seconds))
+                .filter(
+                    BoostLog.user_id == user_id,
+                    BoostLog.started_at >= plan_start,
+                )
+                .scalar() or 0
+            )
+            used_total += _get_active_seconds(user_id, plan_start)
+            remaining_total = total_hours * 3600 - used_total
+            if remaining_total <= 0:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"You have used all {total_hours} hours in your plan."
+                    ),
+                    "upgrade": True,
+                })
+            stop_candidates.append((remaining_total, "total_limit"))
 
         if timer_hours > 0:
-            remaining = min(remaining, timer_hours * 3600)
+            stop_candidates.append((timer_hours * 3600, "user_timer"))
 
-        _uid_daily = g.user.id
-
-        def _auto_stop_on_limit():
-            import gevent as _gevent
-            _gevent.sleep(remaining)
-            mgr2 = boost_service.get(acct_id)
-            if mgr2 and mgr2.boosting:
-                boost_start2 = mgr2.start_time
-                elapsed2 = mgr2.stop_boost()
-                with app.app_context():
-                    acct2 = db.session.get(SteamAccount, acct_id)
-                    if acct2:
-                        acct2.is_boosting = False
-                        acct2.target_stop_time = None
-                    if elapsed2 > 0 and boost_start2:
-                        log2 = BoostLog(
-                            account_id=acct_id,
-                            user_id=_uid_daily,
-                            started_at=datetime.utcfromtimestamp(boost_start2),
-                            stopped_at=datetime.utcnow(),
-                            duration_seconds=int(elapsed2),
-                            games_count=len(acct2.app_ids()) if acct2 else 0,
-                            app_ids_json=json.dumps(acct2.app_ids()) if acct2 else "[]",
-                        )
-                        db.session.add(log2)
-                    db.session.commit()
-                logger.info("[acct:%s] Limit/zamanlayici doldu", acct_id)
-            _clear_timers(acct_id)
-
-        _add_timer(acct_id, gevent.spawn(_auto_stop_on_limit))
-
-    else:
-        if timer_hours > 0:
-            _uid_timer = g.user.id
-            timer_seconds = timer_hours * 3600
-
-            def _auto_stop_on_timer():
-                import gevent as _gevent
-                _gevent.sleep(timer_seconds)
-                mgr_t = boost_service.get(acct_id)
-                if mgr_t and mgr_t.boosting:
-                    boost_start_t = mgr_t.start_time
-                    elapsed_t = mgr_t.stop_boost()
-                    with app.app_context():
-                        acct_t = db.session.get(SteamAccount, acct_id)
-                        if acct_t:
-                            acct_t.is_boosting = False
-                            acct_t.target_stop_time = None
-                        if elapsed_t > 0 and boost_start_t:
-                            log_t = BoostLog(
-                                account_id=acct_id,
-                                user_id=_uid_timer,
-                                started_at=datetime.utcfromtimestamp(boost_start_t),
-                                stopped_at=datetime.utcnow(),
-                                duration_seconds=int(elapsed_t),
-                                games_count=len(acct_t.app_ids()) if acct_t else 0,
-                                app_ids_json=json.dumps(acct_t.app_ids()) if acct_t else "[]",
-                            )
-                            db.session.add(log_t)
-                        db.session.commit()
-                    logger.info("[acct:%s] Timer finished (%.1f hours)", acct_id, timer_hours)
-                _clear_timers(acct_id)
-
-            _add_timer(acct_id, gevent.spawn(_auto_stop_on_timer))
-
-    # ── Toplam saat limiti ──
-    total_hours = limits.get("total_hours")
-    if total_hours is not None:
-        from sqlalchemy import func as sqlfunc2
-        plan_start = g.user.plan_activated_at if g.user.plan_activated_at else datetime.utcnow() - timedelta(days=365)
-        used_total = (
-            db.session.query(sqlfunc2.sum(BoostLog.duration_seconds))
-            .filter(BoostLog.user_id == g.user.id, BoostLog.started_at >= plan_start)
-            .scalar() or 0
-        )
-        used_total += _get_active_seconds(g.user.id, plan_start)
-        remaining_total = total_hours * 3600 - used_total
-        if remaining_total <= 0:
-            return jsonify({"ok": False, "error": f"You have used all {total_hours} hours in your plan.", "upgrade": True})
-
-        _uid_total = g.user.id
-
-        def _auto_stop_on_total_limit():
-            import gevent as _gevent
-            _gevent.sleep(remaining_total)
-            mgr3 = boost_service.get(acct_id)
-            if mgr3 and mgr3.boosting:
-                boost_start3 = mgr3.start_time
-                elapsed3 = mgr3.stop_boost()
-                with app.app_context():
-                    acct3 = db.session.get(SteamAccount, acct_id)
-                    if acct3:
-                        acct3.is_boosting = False
-                        acct3.target_stop_time = None
-                    if elapsed3 > 0 and boost_start3:
-                        log3 = BoostLog(
-                            account_id=acct_id,
-                            user_id=_uid_total,
-                            started_at=datetime.utcfromtimestamp(boost_start3),
-                            stopped_at=datetime.utcnow(),
-                            duration_seconds=int(elapsed3),
-                            games_count=len(acct3.app_ids()) if acct3 else 0,
-                            app_ids_json=json.dumps(acct3.app_ids()) if acct3 else "[]",
-                        )
-                        db.session.add(log3)
-                    db.session.commit()
-                logger.info("[acct:%s] Total limit reached", acct_id)
-            _clear_timers(acct_id)
-
-        _add_timer(acct_id, gevent.spawn(_auto_stop_on_total_limit))
-
-    # Calculate and save target_stop_time
-    possible_stops = []
-    if 'remaining' in locals():
-        possible_stops.append(remaining)
-    elif 'timer_seconds' in locals():
-        possible_stops.append(timer_seconds)
-    if 'remaining_total' in locals():
-        possible_stops.append(remaining_total)
-        
-    if possible_stops:
-        min_sec = min(possible_stops)
-        acct_db.target_stop_time = datetime.utcnow() + timedelta(seconds=min_sec)
-    else:
-        acct_db.target_stop_time = None
-        
-    # start_boost başarısız olursa (örn. login bu arada düştüyse) DB'de
-    # is_boosting=True kalmasın diye önce boost başlatılır, sonra commit edilir.
-    try:
-        mgr.start_boost(ids, acct_db.persona_state)
-    except Exception as e:
-        logger.error("[acct:%s] start_boost hatasi: %s", acct_id, e)
-        acct_db.is_boosting = False
-        acct_db.target_stop_time = None
-        db.session.commit()
+        # No timer may exist until every quota check has passed.
+        persona_state = acct_db.persona_state
+        # All values needed by Steam are frozen. Do not hold a DB transaction
+        # across the yielding Node request.
+        db.session.rollback()
         _clear_timers(acct_id)
-        return jsonify({"ok": False, "error": "Steam connection lost. Please reconnect."})
+        try:
+            started = manager.start_boost(ids, persona_state)
+        except Exception as exc:
+            logger.error("[acct:%s] start_boost hatasi: %s", acct_id, exc)
+            _persist_stopped_boost_state(
+                acct_id,
+                user_id,
+                started_epoch=None,
+                stopped_epoch=time.time(),
+                duration_seconds=0,
+                app_ids=ids,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Steam connection lost. Please reconnect.",
+            })
 
-    acct_db.is_boosting = True
-    db.session.commit()
-    return jsonify({
-        "boosting": True,
-        "start_time": mgr.start_time,
-        "timer_hours": timer_hours if timer_hours > 0 else None,
-    })
+        acct_db = db.session.get(SteamAccount, acct_id)
+        if acct_db is None or acct_db.user_id != user_id:
+            compensation = _stop_boost_session_and_persist(
+                acct_id,
+                user_id,
+                manager,
+                expected_session_id=started.get("session_id"),
+                expected_generation=started.get("generation"),
+            )
+            _clear_timers(acct_id)
+            if not compensation.get("persisted"):
+                logger.critical(
+                    "[acct:%s] Start sirasinda hesap kayboldu ve DB uzlasmadi",
+                    acct_id,
+                )
+            return jsonify({
+                "ok": False,
+                "error": "Account changed while boost was starting.",
+            }), 409
 
+        stop_after = (
+            min(stop_candidates, key=lambda item: item[0])
+            if stop_candidates
+            else None
+        )
+        deadline_epoch = time.time() + stop_after[0] if stop_after else None
+        acct_db.is_boosting = True
+        acct_db.target_stop_time = (
+            datetime.utcfromtimestamp(deadline_epoch) if deadline_epoch else None
+        )
+        try:
+            db.session.commit()
+        except SQLAlchemyError as exc:
+            db.session.rollback()
+            logger.error(
+                "[acct:%s] Start DB commit hatasi; Steam boost geri aliniyor: %s",
+                acct_id,
+                exc,
+            )
+            compensation = _stop_boost_session_and_persist(
+                acct_id,
+                user_id,
+                manager,
+                expected_session_id=started.get("session_id"),
+                expected_generation=started.get("generation"),
+            )
+            _clear_timers(acct_id)
+            if not compensation.get("persisted"):
+                logger.critical(
+                    "[acct:%s] Start compensation sonrasi DB uzlasmadi",
+                    acct_id,
+                )
+            return jsonify({
+                "ok": False,
+                "error": "Boost could not be saved and was stopped. Please retry.",
+            }), 503
+
+        if stop_after:
+            try:
+                _schedule_boost_stop_timer(
+                    acct_id,
+                    user_id,
+                    started.get("session_id"),
+                    started.get("generation"),
+                    max(0.0, deadline_epoch - time.time()),
+                    stop_after[1],
+                )
+            except Exception:
+                logger.exception(
+                    "[acct:%s] Timer olusturulamadi; boost fail-closed durduruluyor",
+                    acct_id,
+                )
+                compensation = _stop_boost_session_and_persist(
+                    acct_id,
+                    user_id,
+                    manager,
+                    expected_session_id=started.get("session_id"),
+                    expected_generation=started.get("generation"),
+                )
+                _clear_timers(acct_id)
+                if not compensation.get("persisted"):
+                    logger.critical(
+                        "[acct:%s] Timer compensation sonrasi DB uzlasmadi",
+                        acct_id,
+                    )
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "Boost timer could not be created; boost was stopped."
+                    ),
+                }), 503
+
+        return jsonify({
+            "ok": True,
+            "boosting": True,
+            "start_time": started.get("start_time"),
+            "timer_hours": timer_hours if timer_hours > 0 else None,
+        })
 
 # ───────────────────── İstatistikler ─────────────────────
 
@@ -3822,7 +4495,8 @@ def steam_profile():
         return jsonify({"ok": False})
 
     mgr = boost_service.get(acct_id)
-    if not mgr or not mgr.logged_in:
+    manager_snapshot = mgr.boost_snapshot() if mgr else None
+    if not manager_snapshot or not manager_snapshot.get("logged_in"):
         return jsonify({"ok": False})
 
     steamid = str(
@@ -4495,10 +5169,27 @@ def admin_delete_user():
         .with_for_update()
         .all()
     )
+    target_account_ids = [account.id for account in steam_accounts]
+    remaining_steam_usernames = set()
+    if target_account_ids:
+        remaining_steam_usernames = {
+            row[0]
+            for row in db.session.query(
+                db.func.lower(SteamAccount.steam_username)
+            ).filter(
+                ~SteamAccount.id.in_(target_account_ids)
+            ).all()
+        }
+    remove_legacy_by_account = {
+        account.id: account.steam_username.lower() not in remaining_steam_usernames
+        for account in steam_accounts
+    }
     credential_quarantines = []
     for account in steam_accounts:
         quarantined = quarantine_saved_credentials(
-            account.id, account.steam_username
+            account.id,
+            account.steam_username,
+            include_legacy_machine_auth=remove_legacy_by_account[account.id],
         )
         if quarantined is None:
             restore_quarantined_credentials(credential_quarantines)
@@ -4585,10 +5276,18 @@ def admin_delete_user():
             try:
                 manager = detached_managers.get(account.id)
                 if manager:
-                    removed = manager.remove_completely()
+                    removed = manager.remove_completely(
+                        include_legacy_machine_auth=(
+                            remove_legacy_by_account[account.id]
+                        )
+                    )
                 else:
                     removed = boost_service.remove(
-                        account.id, account.steam_username
+                        account.id,
+                        account.steam_username,
+                        include_legacy_machine_auth=(
+                            remove_legacy_by_account[account.id]
+                        ),
                     )
                 if not removed:
                     cleanup_ok = False
