@@ -2,6 +2,7 @@ import json
 import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import shutil
@@ -123,6 +124,13 @@ def _node_account_data_dir(account_id):
     account_id = _validate_account_id(account_id)
     storage_key = hashlib.sha256(account_id.encode("utf-8")).hexdigest()
     return _contained_path(_node_account_data_root(), storage_key)
+
+
+def _pending_final_segments_path(account_id):
+    return _contained_path(
+        _node_account_data_dir(account_id),
+        "pending-final-segments.json",
+    )
 
 
 def _account_node_machine_auth_path(account_id, steam_username):
@@ -865,6 +873,8 @@ class SteamAccountManager:
         self.persona_state = 1
         self.boost_session_id = None
         self.boost_generation = 0
+        self._pending_final_segments = self._load_pending_final_segments()
+        self._finalized_segment_keys = []
         self._reconnect_attempts = 0
         self._reconnect_pending_generation = None
         self._reconnect_pending_token = None
@@ -901,12 +911,243 @@ class SteamAccountManager:
             "app_ids": list(self.app_ids),
             "persona_state": self.persona_state,
             "logged_in": self.logged_in,
+            "pending_final_segments": [
+                self._copy_segment_unlocked(segment)
+                for segment in self._pending_final_segments
+            ],
         }
 
     def boost_snapshot(self):
         """Return one internally consistent copy of the account runtime state."""
         with self.state_lock:
             return self._snapshot_unlocked()
+
+    @staticmethod
+    def _copy_segment_unlocked(segment):
+        copied = dict(segment)
+        copied["app_ids"] = list(segment.get("app_ids") or [])
+        return copied
+
+    @staticmethod
+    def _segment_matches(segment, *, session_id=None, generation=None):
+        if session_id is not None and segment.get("session_id") != session_id:
+            return False
+        if generation is not None and segment.get("generation") != generation:
+            return False
+        return True
+
+    def _load_pending_final_segments(self):
+        path = _pending_final_segments_path(self.account_id)
+        if not _path_exists(path):
+            return []
+        try:
+            file_stat = os.lstat(path)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > 262144:
+                raise ValueError("Invalid pending segment state file")
+            with open(path, "r", encoding="utf-8") as handle:
+                raw_segments = json.load(handle)
+            if not isinstance(raw_segments, list) or len(raw_segments) > 128:
+                raise ValueError("Invalid pending segment state payload")
+
+            segments = []
+            for raw in raw_segments:
+                if not isinstance(raw, dict):
+                    raise ValueError("Invalid pending segment")
+                session_id = raw.get("session_id")
+                generation = raw.get("generation")
+                started_at = float(raw.get("started_at"))
+                stopped_at = float(raw.get("stopped_at"))
+                app_ids = raw.get("app_ids")
+                remote_confirmed = raw.get("remote_stop_confirmed")
+                if (
+                    raw.get("account_id") != self.account_id
+                    or not isinstance(session_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id)
+                    or type(generation) is not int
+                    or generation < 0
+                    or not math.isfinite(started_at)
+                    or not math.isfinite(stopped_at)
+                    or stopped_at < started_at
+                    or not isinstance(app_ids, list)
+                    or len(app_ids) > 64
+                    or any(type(app_id) is not int or app_id <= 0 for app_id in app_ids)
+                    or type(remote_confirmed) is not bool
+                ):
+                    raise ValueError("Invalid pending segment fields")
+                segments.append({
+                    "account_id": self.account_id,
+                    "session_id": session_id,
+                    "generation": generation,
+                    "started_at": started_at,
+                    "stopped_at": stopped_at,
+                    "elapsed": max(0, stopped_at - started_at),
+                    "app_ids": list(app_ids),
+                    "remote_stop_confirmed": remote_confirmed,
+                })
+            return segments
+        except Exception as exc:
+            logger.critical(
+                "[%s] Pending boost state could not be loaded: %s",
+                self.steam_username,
+                type(exc).__name__,
+            )
+            # Do not silently start a new run over state that could not be
+            # reconciled.  Callers see a pending sentinel and fail closed.
+            return [{
+                "account_id": self.account_id,
+                "session_id": "corrupt-pending-state",
+                "generation": 0,
+                "started_at": 0.0,
+                "stopped_at": 0.0,
+                "elapsed": 0.0,
+                "app_ids": [],
+                "remote_stop_confirmed": False,
+                "state_corrupt": True,
+            }]
+
+    def _save_pending_final_segments_unlocked(self):
+        path = _pending_final_segments_path(self.account_id)
+        if not self._pending_final_segments:
+            try:
+                if _path_exists(path):
+                    _remove_artifact(path)
+                return True
+            except Exception as exc:
+                logger.critical(
+                    "[%s] Pending boost state cleanup failed: %s",
+                    self.steam_username,
+                    type(exc).__name__,
+                )
+                return False
+
+        try:
+            account_dir = _ensure_private_directory(
+                _node_account_data_dir(self.account_id),
+                _node_account_data_root(),
+            )
+            temporary = _contained_path(
+                account_dir,
+                f"pending-final-segments.json.tmp-{uuid.uuid4().hex}",
+            )
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(temporary, flags, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        self._pending_final_segments,
+                        handle,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                if os.name != "nt":
+                    os.chmod(path, 0o600)
+            finally:
+                if _path_exists(temporary):
+                    _remove_artifact(temporary)
+            return True
+        except Exception as exc:
+            logger.critical(
+                "[%s] Pending boost state persistence failed: %s",
+                self.steam_username,
+                type(exc).__name__,
+            )
+            return False
+
+    def pending_final_segments(self, *, session_id=None, generation=None):
+        with self.state_lock:
+            return [
+                self._copy_segment_unlocked(segment)
+                for segment in self._pending_final_segments
+                if self._segment_matches(
+                    segment,
+                    session_id=session_id,
+                    generation=generation,
+                )
+            ]
+
+    def acknowledge_final_segment(self, segment):
+        """Drop one pending final segment only after the DB commit is durable."""
+        if not segment:
+            return False
+        session_id = segment.get("session_id")
+        generation = segment.get("generation")
+        stopped_at = segment.get("stopped_at")
+        with self.state_lock:
+            removed = False
+            for index, pending in enumerate(list(self._pending_final_segments)):
+                if (
+                    pending.get("session_id") == session_id
+                    and pending.get("generation") == generation
+                    and pending.get("stopped_at") == stopped_at
+                ):
+                    del self._pending_final_segments[index]
+                    removed = True
+                    break
+            key = (session_id, generation)
+            if key not in self._finalized_segment_keys:
+                self._finalized_segment_keys.append(key)
+                if len(self._finalized_segment_keys) > 128:
+                    del self._finalized_segment_keys[:-128]
+            if removed:
+                self._save_pending_final_segments_unlocked()
+            return removed
+
+    def was_final_segment_persisted(self, *, session_id=None, generation=None):
+        if session_id is None and generation is None:
+            return False
+        with self.state_lock:
+            return (session_id, generation) in self._finalized_segment_keys
+
+    def retry_pending_final_segment_remote_stop(
+        self,
+        segment,
+        *,
+        context="pending final segment recovery",
+    ):
+        """Retry fail-closed remote shutdown for one durable-pending segment.
+
+        A failed ``stop_games`` followed by a failed worker termination leaves
+        the remote Steam state uncertain.  The local run must stay closed, but
+        the segment cannot be committed as final until a later attempt proves
+        that either Steam accepted the stop or the worker process was killed.
+        """
+        if not segment:
+            return None
+        with self.state_lock:
+            for pending in self._pending_final_segments:
+                if (
+                    pending.get("session_id") == segment.get("session_id")
+                    and pending.get("generation") == segment.get("generation")
+                    and pending.get("stopped_at") == segment.get("stopped_at")
+                ):
+                    if pending.get("remote_stop_confirmed") is not True:
+                        if pending.get("state_corrupt"):
+                            return self._copy_segment_unlocked(pending)
+                        pending["remote_stop_confirmed"] = (
+                            self._stop_remote_games_unlocked(context)
+                        )
+                        self._save_pending_final_segments_unlocked()
+                    return self._copy_segment_unlocked(pending)
+        return None
+
+    def _remember_final_segment_unlocked(self, segment):
+        for pending in self._pending_final_segments:
+            if (
+                pending.get("session_id") == segment.get("session_id")
+                and pending.get("generation") == segment.get("generation")
+                and pending.get("stopped_at") == segment.get("stopped_at")
+            ):
+                return True
+        self._pending_final_segments.append(self._copy_segment_unlocked(segment))
+        if self._save_pending_final_segments_unlocked():
+            return True
+        self._pending_final_segments.pop()
+        return False
 
     def _invalidate_boost_unlocked(self, *, force=False):
         had_runtime_state = bool(
@@ -929,7 +1170,8 @@ class SteamAccountManager:
         """Stop remote game state or kill the worker session fail-closed."""
         if self.client._closed:
             self.logged_in = False
-            return False
+            return bool(self.client.force_disconnect())
+        fail_closed = False
         try:
             result = self.client.stop_games()
         except Exception as exc:
@@ -951,9 +1193,9 @@ class SteamAccountManager:
             result,
         )
         self._connection_event_generation += 1
-        self.client.force_disconnect()
+        fail_closed = self.client.force_disconnect()
         self.logged_in = False
-        return False
+        return bool(fail_closed)
 
     @staticmethod
     def _invoke_fatal_disconnect_callback(segment):
@@ -970,6 +1212,7 @@ class SteamAccountManager:
             segment["generation"],
             segment["started_at"],
             list(segment["app_ids"]),
+            segment["stopped_at"],
         )
         try:
             signature = inspect.signature(callback)
@@ -994,8 +1237,10 @@ class SteamAccountManager:
         # Resolve compatibility before invoking the handler. A TypeError raised
         # inside application callback code must not trigger a second invocation
         # and duplicate a financial/usage log.
-        if accepts_varargs or len(positional) >= 6:
+        if accepts_varargs or len(positional) >= 7:
             callback(*args)
+        elif len(positional) >= 6:
+            callback(*args[:6])
         elif len(positional) >= 4:
             callback(*args[:4])
         else:
@@ -1366,6 +1611,8 @@ class SteamAccountManager:
                 expected_generation=expected_generation,
             ):
                 return None
+            if not self.boosting:
+                return None
 
             stopped_at = time.time()
             started_at = self.start_time
@@ -1381,11 +1628,35 @@ class SteamAccountManager:
                 "app_ids": list(self.app_ids),
             }
 
+            # Write the recovery record before yielding to IPC.  A process kill
+            # between local invalidation and the Steam response must still leave
+            # enough information for the next process to finalize this segment.
+            segment["remote_stop_confirmed"] = False
+            if not self._remember_final_segment_unlocked(segment):
+                segment["local_stop_aborted"] = True
+                logger.critical(
+                    "[%s] Boost stop aborted: pending state is not durable",
+                    self.steam_username,
+                )
+                return self._copy_segment_unlocked(segment)
             # Local state is closed before IPC. A synchronous disconnected event
             # can therefore never observe boosting=True and schedule a new loop.
             self._invalidate_boost_unlocked(force=True)
-            self._stop_remote_games_unlocked(context)
-            return segment
+            segment["remote_stop_confirmed"] = self._stop_remote_games_unlocked(
+                context
+            )
+            for pending in self._pending_final_segments:
+                if (
+                    pending.get("session_id") == segment.get("session_id")
+                    and pending.get("generation") == segment.get("generation")
+                    and pending.get("stopped_at") == segment.get("stopped_at")
+                ):
+                    pending["remote_stop_confirmed"] = segment[
+                        "remote_stop_confirmed"
+                    ]
+                    break
+            self._save_pending_final_segments_unlocked()
+            return self._copy_segment_unlocked(segment)
 
     def _finalize_fatal_session(self, expected_generation, reason):
         segment = self._stop_boost_session(
@@ -1393,6 +1664,12 @@ class SteamAccountManager:
             context=f"fatal reconnect: {reason}",
         )
         if segment is None:
+            return False
+        if segment.get("local_stop_aborted"):
+            logger.critical(
+                "[%s] Fatal boost finalization postponed: pending state is not durable",
+                self.steam_username,
+            )
             return False
         logger.error(
             "[%s] Boost session fail-closed sonlandirildi: %s",
@@ -1509,6 +1786,20 @@ class SteamAccountManager:
         )
         return segment["elapsed"] if segment is not None else 0
 
+    def stop_boost_segment(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        context="explicit stop",
+    ):
+        """Stop one session and return the pending final segment metadata."""
+        return self._stop_boost_session(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            context=context,
+        )
+
     def advance_boost_checkpoint(
         self,
         *,
@@ -1583,6 +1874,12 @@ class SteamAccountManager:
             self.logged_in = False
 
     def remove_completely(self, *, include_legacy_machine_auth=False):
+        segment = self.stop_boost_segment(context="permanent removal")
+        if segment and (
+            segment.get("local_stop_aborted")
+            or segment.get("remote_stop_confirmed") is False
+        ):
+            return False
         self.mark_removed()
         self.disconnect(permanent=True)
         return self.delete_credentials(

@@ -18,7 +18,7 @@ import jwt as pyjwt
 import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,14 +196,33 @@ _user_operation_locks = {}
 _user_operation_locks_guard = RLock()
 
 
+class _UserOperationLockEntry:
+    def __init__(self):
+        self.lock = RLock()
+        self.references = 0
+
+
+@contextmanager
 def _user_operation_lock(user_id):
     user_id = int(user_id)
     with _user_operation_locks_guard:
-        lock = _user_operation_locks.get(user_id)
-        if lock is None:
-            lock = RLock()
-            _user_operation_locks[user_id] = lock
-        return lock
+        entry = _user_operation_locks.get(user_id)
+        if entry is None:
+            entry = _UserOperationLockEntry()
+            _user_operation_locks[user_id] = entry
+        # Increment before waiting so a queued greenlet keeps the entry alive.
+        entry.references += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _user_operation_locks_guard:
+            entry.references -= 1
+            if (
+                entry.references == 0
+                and _user_operation_locks.get(user_id) is entry
+            ):
+                _user_operation_locks.pop(user_id, None)
 
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -422,6 +441,111 @@ def _persist_stopped_boost_state(
             )
 
 
+def _persist_manager_final_segment(
+    acct_id,
+    user_id,
+    manager,
+    segment,
+    *,
+    clear_account_state=True,
+):
+    if not segment:
+        return True
+    if segment.get("remote_stop_confirmed") is False:
+        return False
+    persisted = _persist_stopped_boost_state(
+        acct_id,
+        user_id,
+        started_epoch=segment.get("started_at"),
+        stopped_epoch=segment.get("stopped_at") or time.time(),
+        duration_seconds=segment.get("elapsed"),
+        app_ids=segment.get("app_ids") or [],
+        clear_account_state=clear_account_state,
+    )
+    if persisted and manager is not None:
+        try:
+            manager.acknowledge_final_segment(segment)
+        except Exception:
+            logger.exception("[acct:%s] Pending boost segment ack hatasi", acct_id)
+    return persisted
+
+
+def _finalize_pending_manager_segments(
+    acct_id,
+    user_id,
+    manager,
+    *,
+    clear_account_state=True,
+    session_id=None,
+    generation=None,
+):
+    if manager is None:
+        return {
+            "found": False,
+            "persisted": True,
+            "remote_stop_confirmed": True,
+        }
+    segments = manager.pending_final_segments(
+        session_id=session_id,
+        generation=generation,
+    )
+    persisted = True
+    remote_stop_confirmed = True
+    for segment in segments:
+        if segment.get("remote_stop_confirmed") is False:
+            try:
+                recovered = manager.retry_pending_final_segment_remote_stop(
+                    segment,
+                    context="pending final segment retry",
+                )
+            except Exception:
+                recovered = None
+                logger.exception(
+                    "[acct:%s] Pending segment remote stop retry hatasi",
+                    acct_id,
+                )
+            if recovered is not None:
+                segment = recovered
+        if segment.get("remote_stop_confirmed") is False:
+            remote_stop_confirmed = False
+            persisted = False
+            continue
+        persisted = (
+            _persist_manager_final_segment(
+                acct_id,
+                user_id,
+                manager,
+                segment,
+                clear_account_state=clear_account_state,
+            )
+            and persisted
+        )
+    return {
+        "found": bool(segments),
+        "persisted": persisted,
+        "remote_stop_confirmed": remote_stop_confirmed,
+    }
+
+
+def _persist_pending_manager_segments(
+    acct_id,
+    user_id,
+    manager,
+    *,
+    clear_account_state=True,
+    session_id=None,
+    generation=None,
+):
+    return _finalize_pending_manager_segments(
+        acct_id,
+        user_id,
+        manager,
+        clear_account_state=clear_account_state,
+        session_id=session_id,
+        generation=generation,
+    )["persisted"]
+
+
 def _handle_fatal_disconnect(
     acct_id,
     elapsed,
@@ -429,18 +553,19 @@ def _handle_fatal_disconnect(
     generation=None,
     started_epoch=None,
     app_ids=None,
+    stopped_epoch=None,
 ):
     try:
         with app.app_context():
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
                 id=acct_id
             ).scalar()
+            db.session.rollback()
             if owner_id is None:
                 _clear_timers(acct_id)
                 return
 
             with _user_operation_lock(owner_id):
-                db.session.expire_all()
                 acct = db.session.get(SteamAccount, acct_id)
                 if acct is None:
                     _clear_timers(acct_id)
@@ -449,45 +574,97 @@ def _handle_fatal_disconnect(
 
                 manager = boost_service.get(acct_id)
                 clear_account_state = True
+                segments = []
+                already_finalized = False
                 if manager is not None:
-                    # Do not retain a DB read transaction while stop_games may
-                    # yield for up to its IPC timeout.
-                    db.session.rollback()
-                    with manager.state_lock:
-                        current = manager.boost_snapshot()
-                        if current.get("boosting"):
-                            # A successful manual login may already have started
-                            # a newer session while this old callback was queued.
-                            # Never clear that session's DB state or timer.
-                            if _same_boost_session(
-                                current,
-                                session_id=session_id,
-                                generation=generation,
-                            ):
-                                manager.stop_boost(
-                                    expected_session_id=session_id,
-                                    expected_generation=generation,
-                                )
-                            else:
-                                clear_account_state = False
+                    current = manager.boost_snapshot()
+                    already_finalized = manager.was_final_segment_persisted(
+                        session_id=session_id,
+                        generation=generation,
+                    )
+                    if current.get("boosting"):
+                        # A successful manual login may already have started a
+                        # newer session while this old callback was queued. Never
+                        # clear that session's DB state or timer.
+                        if _same_boost_session(
+                            current,
+                            session_id=session_id,
+                            generation=generation,
+                        ):
+                            db.session.rollback()
+                            stopped = manager.stop_boost_segment(
+                                expected_session_id=session_id,
+                                expected_generation=generation,
+                                context="fatal callback",
+                            )
+                            if stopped is not None:
+                                segments.append(stopped)
+                        else:
+                            clear_account_state = False
+                    segments.extend(manager.pending_final_segments(
+                        session_id=session_id,
+                        generation=generation,
+                    ))
+
+                if not segments and already_finalized:
+                    if clear_account_state:
+                        reconciled = _persist_stopped_boost_state(
+                            acct_id,
+                            owner_id,
+                            started_epoch=None,
+                            stopped_epoch=time.time(),
+                            duration_seconds=0,
+                            app_ids=fallback_app_ids,
+                        )
+                        if reconciled:
+                            _clear_timers(acct_id)
+                        else:
+                            logger.critical(
+                                "[acct:%s] Finalized fatal segment DB state'i temizleyemedi",
+                                acct_id,
+                            )
+                    return
 
                 elapsed = max(0, float(elapsed or 0))
-                stopped_epoch = time.time()
+                stopped_epoch = stopped_epoch or time.time()
                 if started_epoch is None:
                     started_epoch = stopped_epoch - elapsed
-                persisted = _persist_stopped_boost_state(
-                    acct_id,
-                    owner_id,
-                    started_epoch=started_epoch,
-                    stopped_epoch=stopped_epoch,
-                    duration_seconds=elapsed,
-                    app_ids=(
-                        list(app_ids)
-                        if app_ids is not None
-                        else fallback_app_ids
-                    ),
-                    clear_account_state=clear_account_state,
-                )
+                if not segments:
+                    segments.append({
+                        "account_id": acct_id,
+                        "session_id": session_id,
+                        "generation": generation,
+                        "started_at": started_epoch,
+                        "stopped_at": stopped_epoch,
+                        "elapsed": elapsed,
+                        "app_ids": (
+                            list(app_ids)
+                            if app_ids is not None
+                            else fallback_app_ids
+                        ),
+                        "remote_stop_confirmed": True,
+                    })
+                seen = set()
+                persisted = True
+                for segment in segments:
+                    key = (
+                        segment.get("session_id"),
+                        segment.get("generation"),
+                        segment.get("stopped_at"),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    persisted = (
+                        _persist_manager_final_segment(
+                            acct_id,
+                            owner_id,
+                            manager,
+                            segment,
+                            clear_account_state=clear_account_state,
+                        )
+                        and persisted
+                    )
                 if clear_account_state:
                     _clear_timers(acct_id)
                 if persisted:
@@ -1306,6 +1483,7 @@ def _checkpoint_active_boosts_once():
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
                 id=acct_id
             ).scalar()
+            db.session.rollback()
             if owner_id is None:
                 logger.warning(
                     "[acct:%s] Checkpoint atlandi: manager icin DB hesabi yok",
@@ -1400,24 +1578,41 @@ def shutdown_cleanup():
     with app.app_context():
         for acct_id, mgr in boost_service.all_managers():
             try:
-                with mgr.state_lock:
+                owner_id = db.session.query(SteamAccount.user_id).filter_by(
+                    id=acct_id
+                ).scalar()
+                db.session.rollback()
+                if owner_id is None:
+                    continue
+                with _user_operation_lock(owner_id):
+                    acct_db = db.session.get(SteamAccount, acct_id)
+                    if acct_db is None:
+                        continue
                     snapshot = mgr.boost_snapshot()
                     if not snapshot.get("boosting"):
-                        continue
-                    elapsed = mgr.stop_boost(
-                        expected_session_id=snapshot.get("session_id"),
-                        expected_generation=snapshot.get("generation"),
-                    )
-                acct_db = db.session.get(SteamAccount, acct_id)
-                if acct_db:
-                    _persist_stopped_boost_state(
+                        segment = None
+                    else:
+                        segment = mgr.stop_boost_segment(
+                            expected_session_id=snapshot.get("session_id"),
+                            expected_generation=snapshot.get("generation"),
+                            context="shutdown",
+                        )
+                    if segment is not None:
+                        _persist_manager_final_segment(
+                            acct_id,
+                            owner_id,
+                            mgr,
+                            segment,
+                        )
+                    if not _persist_pending_manager_segments(
                         acct_id,
-                        acct_db.user_id,
-                        started_epoch=snapshot.get("start_time"),
-                        stopped_epoch=time.time(),
-                        duration_seconds=elapsed,
-                        app_ids=snapshot.get("app_ids") or [],
-                    )
+                        owner_id,
+                        mgr,
+                    ):
+                        logger.critical(
+                            "[acct:%s] Shutdown pending boost state korunamadi",
+                            acct_id,
+                        )
             except Exception:
                 db.session.rollback()
                 logger.exception("[acct:%s] Shutdown boost cleanup hatasi", acct_id)
@@ -3540,13 +3735,55 @@ def remove_account():
 
         steam_username = acct_db.steam_username
         app_ids = acct_db.app_ids()
-        manager = boost_service.get(acct_id)
-        manager_snapshot = manager.boost_snapshot() if manager else None
-        boost_started_at = (
-            manager_snapshot.get("start_time")
-            if manager_snapshot and manager_snapshot.get("boosting")
-            else None
-        )
+        # Construction is side-effect free until an IPC command is sent and it
+        # reloads any crash-durable pending final segment from disk.
+        manager = boost_service.get_or_create(acct_id, steam_username)
+        final_segment_recorded = False
+        if manager:
+            manager_snapshot = manager.boost_snapshot()
+            if manager_snapshot.get("boosting"):
+                db.session.rollback()
+                stop_result = _stop_boost_session_and_persist(
+                    acct_id,
+                    user_id,
+                    manager,
+                    expected_session_id=manager_snapshot.get("session_id"),
+                    expected_generation=manager_snapshot.get("generation"),
+                )
+                if (
+                    not stop_result.get("remote_stop_confirmed", True)
+                    or not stop_result.get("persisted")
+                ):
+                    return jsonify({
+                        "ok": False,
+                        "error": (
+                            "Active boost could not be finalized safely. "
+                            "Please stop it and try again."
+                        ),
+                    }), 503
+                final_segment_recorded = bool(stop_result.get("stopped"))
+            elif not _persist_pending_manager_segments(acct_id, user_id, manager):
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "Pending boost usage could not be finalized safely. "
+                        "Please try again."
+                    ),
+                }), 503
+            else:
+                final_segment_recorded = bool(
+                    manager_snapshot.get("pending_final_segments")
+                )
+            db.session.expire_all()
+            acct_db = (
+                SteamAccount.query.filter_by(id=acct_id, user_id=user_id)
+                .with_for_update()
+                .first()
+            )
+            if acct_db is None:
+                return jsonify({"ok": False, "error": "Account not found."}), 404
+            steam_username = acct_db.steam_username
+            app_ids = acct_db.app_ids()
         remove_legacy_machine_auth = not db.session.query(SteamAccount.id).filter(
             SteamAccount.id != acct_id,
             db.func.lower(SteamAccount.steam_username)
@@ -3571,20 +3808,6 @@ def remove_account():
             }), 503
 
         try:
-            stopped_at = datetime.utcnow()
-            if boost_started_at is not None:
-                elapsed = max(0, int(time.time() - boost_started_at))
-                if elapsed > 0:
-                    db.session.add(BoostLog(
-                        account_id=None,
-                        user_id=user_id,
-                        started_at=datetime.utcfromtimestamp(boost_started_at),
-                        stopped_at=stopped_at,
-                        duration_seconds=elapsed,
-                        games_count=len(app_ids),
-                        app_ids_json=json.dumps(app_ids),
-                    ))
-
             # Keep historical usage, but sever the foreign key before deleting
             # the operational account. This prevents new BoostLog FK debt.
             BoostLog.query.filter_by(account_id=acct_id).update(
@@ -3703,7 +3926,7 @@ def remove_account():
             "steam_account.deleted user_id=%s account_id=%s final_segment=%s",
             user_id,
             acct_id,
-            bool(boost_started_at),
+            final_segment_recorded,
         )
         return jsonify({"ok": True, "cleanup_warning": not cleanup_ok})
 
@@ -3870,9 +4093,34 @@ def _stop_boost_session_and_persist(
             session_id=expected_session_id,
             generation=expected_generation,
         ):
-            return {"stopped": False, "stale": True, "persisted": True}
+            pending = _finalize_pending_manager_segments(
+                acct_id,
+                user_id,
+                manager,
+                clear_account_state=False,
+                session_id=expected_session_id,
+                generation=expected_generation,
+            )
+            return {
+                "stopped": False,
+                "stale": True,
+                "persisted": pending["persisted"],
+                "remote_stop_confirmed": pending["remote_stop_confirmed"],
+            }
 
     if not snapshot.get("boosting"):
+        pending = _finalize_pending_manager_segments(
+            acct_id,
+            user_id,
+            manager,
+        )
+        if not pending["persisted"]:
+            return {
+                "stopped": False,
+                "stale": False,
+                "persisted": False,
+                "remote_stop_confirmed": pending["remote_stop_confirmed"],
+            }
         persisted = _persist_stopped_boost_state(
             acct_id,
             user_id,
@@ -3881,28 +4129,62 @@ def _stop_boost_session_and_persist(
             duration_seconds=0,
             app_ids=snapshot.get("app_ids") or [],
         )
-        return {"stopped": False, "stale": False, "persisted": persisted}
+        return {
+            "stopped": False,
+            "stale": False,
+            "persisted": persisted,
+            "remote_stop_confirmed": True,
+        }
 
-    elapsed = manager.stop_boost(
+    segment = manager.stop_boost_segment(
         expected_session_id=expected_session_id,
         expected_generation=expected_generation,
+        context="explicit stop",
     )
-    stopped_epoch = time.time()
-    persisted = _persist_stopped_boost_state(
+    if segment is None:
+        # A fatal-disconnect greenlet may have closed this exact run after the
+        # caller snapshot but before this stop call.  Consume the segment it
+        # left behind instead of reporting a false success and deleting it.
+        pending = _finalize_pending_manager_segments(
+            acct_id,
+            user_id,
+            manager,
+            session_id=expected_session_id,
+            generation=expected_generation,
+        )
+        return {
+            "stopped": False,
+            "stale": True,
+            "persisted": pending["persisted"],
+            "remote_stop_confirmed": pending["remote_stop_confirmed"],
+        }
+    if segment.get("remote_stop_confirmed") is False:
+        return {
+            "stopped": not segment.get("local_stop_aborted", False),
+            "stale": False,
+            "persisted": False,
+            "remote_stop_confirmed": False,
+            "local_stop_aborted": bool(segment.get("local_stop_aborted")),
+            "elapsed": segment.get("elapsed", 0),
+            "session_id": segment.get("session_id"),
+            "generation": segment.get("generation"),
+            "stopped_at": segment.get("stopped_at"),
+        }
+    persisted = _persist_manager_final_segment(
         acct_id,
         user_id,
-        started_epoch=snapshot.get("start_time"),
-        stopped_epoch=stopped_epoch,
-        duration_seconds=elapsed,
-        app_ids=snapshot.get("app_ids") or [],
+        manager,
+        segment,
     )
     return {
         "stopped": True,
         "stale": False,
         "persisted": persisted,
-        "elapsed": elapsed,
-        "session_id": snapshot.get("session_id"),
-        "generation": snapshot.get("generation"),
+        "remote_stop_confirmed": True,
+        "elapsed": segment.get("elapsed", 0),
+        "session_id": segment.get("session_id"),
+        "generation": segment.get("generation"),
+        "stopped_at": segment.get("stopped_at"),
     }
 
 
@@ -3913,6 +4195,7 @@ def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
                 id=acct_id
             ).scalar()
+            db.session.rollback()
             if owner_id != user_id:
                 return
             with _user_operation_lock(user_id):
@@ -4014,6 +4297,13 @@ def toggle_boost():
     else:
         timer_hours = max(0.5, min(24.0, timer_hours))
 
+    action = data.get("action")
+    if action not in ("start", "stop"):
+        return jsonify({
+            "ok": False,
+            "error": "A valid boost action is required.",
+        }), 400
+
     user_id = g.user.id
     acct_db = db.session.get(SteamAccount, acct_id)
     if not acct_db or acct_db.user_id != user_id:
@@ -4030,7 +4320,7 @@ def toggle_boost():
             return jsonify({"ok": False, "error": "Account not found."}), 404
 
         current = manager.boost_snapshot()
-        if current.get("boosting"):
+        if action == "stop":
             # Close the read transaction before yielding to Node IPC.
             db.session.rollback()
             _clear_timers(acct_id)
@@ -4041,6 +4331,15 @@ def toggle_boost():
                 expected_session_id=current.get("session_id"),
                 expected_generation=current.get("generation"),
             )
+            if not result.get("remote_stop_confirmed", True):
+                return jsonify({
+                    "ok": False,
+                    "boosting": True,
+                    "error": (
+                        "Steam boost could not be stopped safely. "
+                        "Please reconnect and try again."
+                    ),
+                }), 503
             if not result.get("persisted"):
                 return jsonify({
                     "ok": False,
@@ -4055,6 +4354,25 @@ def toggle_boost():
                 "boosting": False,
                 "steam_connected": manager.logged_in,
             })
+
+        if current.get("boosting"):
+            return jsonify({
+                "ok": True,
+                "boosting": True,
+                "start_time": current.get("start_time"),
+                "timer_hours": timer_hours if timer_hours > 0 else None,
+            })
+
+        pending_ok = _persist_pending_manager_segments(acct_id, user_id, manager)
+        if not pending_ok:
+            return jsonify({
+                "ok": False,
+                "boosting": False,
+                "error": (
+                    "Previous boost status could not be saved. "
+                    "Please retry before starting again."
+                ),
+            }), 503
 
         if not current.get("logged_in"):
             return jsonify({
@@ -4149,7 +4467,38 @@ def toggle_boost():
                 "error": "Steam connection lost. Please reconnect.",
             })
 
-        acct_db = db.session.get(SteamAccount, acct_id)
+        try:
+            acct_db = db.session.get(SteamAccount, acct_id)
+        except SQLAlchemyError as exc:
+            db.session.rollback()
+            logger.error(
+                "[acct:%s] Start sonrasi DB refresh hatasi; Steam boost geri aliniyor: %s",
+                acct_id,
+                exc,
+            )
+            compensation = _stop_boost_session_and_persist(
+                acct_id,
+                user_id,
+                manager,
+                expected_session_id=started.get("session_id"),
+                expected_generation=started.get("generation"),
+            )
+            _clear_timers(acct_id)
+            if not compensation.get("persisted"):
+                logger.critical(
+                    "[acct:%s] Start sirasinda hesap kayboldu ve DB uzlasmadi",
+                    acct_id,
+                )
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "Boost could not be saved, and Steam stop could not be "
+                    "confirmed. Reconnect and retry stopping."
+                    if not compensation.get("remote_stop_confirmed", True)
+                    else "Boost could not be saved and was stopped. Please retry."
+                ),
+            }), 503
+
         if acct_db is None or acct_db.user_id != user_id:
             compensation = _stop_boost_session_and_persist(
                 acct_id,
@@ -4203,7 +4552,12 @@ def toggle_boost():
                 )
             return jsonify({
                 "ok": False,
-                "error": "Boost could not be saved and was stopped. Please retry.",
+                "error": (
+                    "Boost could not be saved, and Steam stop could not be "
+                    "confirmed. Reconnect and retry stopping."
+                    if not compensation.get("remote_stop_confirmed", True)
+                    else "Boost could not be saved and was stopped. Please retry."
+                ),
             }), 503
 
         if stop_after:
@@ -4237,7 +4591,10 @@ def toggle_boost():
                 return jsonify({
                     "ok": False,
                     "error": (
-                        "Boost timer could not be created; boost was stopped."
+                        "Boost timer could not be created, and Steam stop could "
+                        "not be confirmed. Reconnect and retry stopping."
+                        if not compensation.get("remote_stop_confirmed", True)
+                        else "Boost timer could not be created; boost was stopped."
                     ),
                 }), 503
 
@@ -5127,13 +5484,10 @@ def admin_delete_user():
             "error": "Admin accounts cannot be deleted.",
         }), 409
 
-    username = target_user.username
-    payments = (
-        Payment.query.filter_by(user_id=target_id)
-        .with_for_update()
-        .all()
-    )
-    known_statuses = {
+    # Validate non-runtime blockers before stopping a customer's active Steam
+    # service.  The same predicate is checked again after the yielding runtime
+    # finalization so a concurrent payment transition cannot slip through.
+    safe_payment_statuses = {
         "pending",
         "checkout_started",
         "verification_pending",
@@ -5142,10 +5496,97 @@ def admin_delete_user():
         "unmatched",
         "cancelled",
     }
+    unsafe_payment_preflight = next((
+        payment for payment in Payment.query.filter_by(user_id=target_id).all()
+        if (
+            payment.status not in safe_payment_statuses
+            or (
+                payment.status in ("pending", "checkout_started")
+                and payment.transaction_id is not None
+            )
+        )
+    ), None)
+    if unsafe_payment_preflight:
+        logger.warning(
+            "user.delete_blocked_payment_state target_id=%s payment_id=%s status=%s",
+            target_id,
+            unsafe_payment_preflight.id,
+            unsafe_payment_preflight.status,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "This account has a payment in an unsafe state. Resolve it before deletion.",
+        }), 409
+
+    # Stop and durably reconcile every runtime before the destructive database
+    # transaction.  A post-commit cleanup cannot recover an open segment once
+    # its SteamAccount owner has disappeared, and a failed cleanup could leave
+    # an orphan worker boosting for a deleted user.
+    runtime_accounts = db.session.query(
+        SteamAccount.id,
+        SteamAccount.steam_username,
+    ).filter_by(user_id=target_id).all()
+    db.session.rollback()
+    for runtime_account_id, _runtime_username in runtime_accounts:
+        manager = boost_service.get_or_create(
+            runtime_account_id,
+            _runtime_username,
+        )
+        snapshot = manager.boost_snapshot()
+        if snapshot.get("boosting"):
+            result = _stop_boost_session_and_persist(
+                runtime_account_id,
+                target_id,
+                manager,
+                expected_session_id=snapshot.get("session_id"),
+                expected_generation=snapshot.get("generation"),
+            )
+        else:
+            pending = _finalize_pending_manager_segments(
+                runtime_account_id,
+                target_id,
+                manager,
+            )
+            result = {
+                "persisted": pending["persisted"],
+                "remote_stop_confirmed": pending["remote_stop_confirmed"],
+            }
+        if (
+            not result.get("remote_stop_confirmed", True)
+            or not result.get("persisted")
+        ):
+            logger.critical(
+                "user.delete_runtime_finalize_failed target_id=%s account_id=%s",
+                target_id,
+                runtime_account_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "An active Steam boost could not be finalized safely. "
+                    "Reconnect the Steam account and retry deletion."
+                ),
+            }), 503
+
+    db.session.expire_all()
+    target_user = (
+        db.session.query(User)
+        .filter(User.id == target_id)
+        .with_for_update()
+        .first()
+    )
+    if target_user is None:
+        return jsonify({"ok": False, "error": "User not found."}), 404
+    username = target_user.username
+    payments = (
+        Payment.query.filter_by(user_id=target_id)
+        .with_for_update()
+        .all()
+    )
     unsafe_payment = next((
         payment for payment in payments
         if (
-            payment.status not in known_statuses
+            payment.status not in safe_payment_statuses
             or (
                 payment.status in ("pending", "checkout_started")
                 and payment.transaction_id is not None
