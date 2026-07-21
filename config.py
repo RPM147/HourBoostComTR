@@ -12,6 +12,17 @@ def _env_bool(name, default=False):
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_positive_int(name, default):
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a positive integer.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer.")
+    return value
+
+
 class Config:
     # SECRET_KEY zorunlu; env'de yoksa RuntimeError fırlat
     SECRET_KEY = os.environ.get("SECRET_KEY")
@@ -28,6 +39,12 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     PERMANENT_SESSION_LIFETIME = 30 * 24 * 3600
+    # Global Flask/Werkzeug request-body cap. The Shopier webhook already uses
+    # the same 512 KiB ceiling; all other JSON payloads are substantially smaller.
+    MAX_CONTENT_LENGTH = _env_positive_int(
+        "MAX_CONTENT_LENGTH_BYTES",
+        512 * 1024,
+    )
 
     # Rate Limiting Depolama (Redis önerilir: redis://localhost:6379)
     LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI", "memory://")

@@ -1,15 +1,30 @@
+import html
 import smtplib
 import logging
 import os
+from urllib.parse import quote
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from log_security import protect_logger
 
-logger = logging.getLogger(__name__)
+logger = protect_logger(logging.getLogger(__name__))
 
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME", "")
 MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", MAIL_USERNAME)
 SITE_URL = os.environ.get("SITE_URL", "https://hourboost.com.tr")
+
+
+def _escape_html_text(value):
+    """Render untrusted values as text inside HTML email templates."""
+    return html.escape(str(value), quote=True)
+
+
+def _email_action_url(path, token, lang):
+    """Keep bearer tokens in the browser-only fragment, never the HTTP URL."""
+    query = "?lang=en" if lang == "en" else ""
+    fragment_token = quote(str(token), safe="")
+    return f"{SITE_URL.rstrip('/')}{path}{query}#token={fragment_token}"
 
 
 def send_email(to_email, subject, html_body):
@@ -108,11 +123,12 @@ def _base_template_en(header_icon, header_title, body_html):
 # ───────────────────── E-posta Doğrulama ─────────────────────
 
 def send_verification_email(to_email, username, token, lang="tr"):
+    safe_username = _escape_html_text(username)
     if lang == "en":
-        verify_url = f"{SITE_URL}/verify-email/{token}?lang=en"
+        verify_url = _email_action_url("/verify-email", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Hello,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 Welcome to HourBoost! Click the button below to verify your email address and activate your account.
 </p>
@@ -134,10 +150,10 @@ If you did not create this account, you can safely ignore this email.
         html = _base_template_en("⚡", "Steam Hour Boost Service", body)
         return send_email(to_email, "Verify Your Email Address — HourBoost", html)
     else:
-        verify_url = f"{SITE_URL}/verify-email/{token}"
+        verify_url = _email_action_url("/verify-email", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Merhaba,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 HourBoost'a hoş geldin! Hesabını aktifleştirmek için aşağıdaki butona tıklayarak e-posta adresini doğrula.
 </p>
@@ -163,9 +179,10 @@ Eğer bu hesabı sen oluşturmadıysan bu maili görmezden gelebilirsin.
 # ───────────────────── Hoş Geldin ─────────────────────
 
 def send_welcome_email(to_email, username, lang="tr"):
+    safe_username = _escape_html_text(username)
     if lang == "en":
         body = f"""
-<h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#e8eaf0;">Welcome, {username}!</h1>
+<h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#e8eaf0;">Welcome, {safe_username}!</h1>
 <p style="margin:0 0 24px;font-size:15px;color:#8892a0;line-height:1.7;">
 Your email address has been successfully verified. You can now add your Steam accounts and start boosting!
 </p>
@@ -180,7 +197,7 @@ Your email address has been successfully verified. You can now add your Steam ac
         return send_email(to_email, "Account Activated — Welcome to HourBoost!", html)
     else:
         body = f"""
-<h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#e8eaf0;">Hoş geldin, {username}!</h1>
+<h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#e8eaf0;">Hoş geldin, {safe_username}!</h1>
 <p style="margin:0 0 24px;font-size:15px;color:#8892a0;line-height:1.7;">
 E-posta adresin başarıyla doğrulandı. Artık Steam hesaplarını ekleyip boost'a başlayabilirsin!
 </p>
@@ -198,11 +215,12 @@ E-posta adresin başarıyla doğrulandı. Artık Steam hesaplarını ekleyip boo
 # ───────────────────── Şifre Sıfırlama ─────────────────────
 
 def send_password_reset_email(to_email, username, token, lang="tr"):
+    safe_username = _escape_html_text(username)
     if lang == "en":
-        reset_url = f"{SITE_URL}/reset-password/{token}?lang=en"
+        reset_url = _email_action_url("/reset-password", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Hello,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 You requested a password reset for your HourBoost account. Click the button below to set a new password.
 </p>
@@ -224,10 +242,10 @@ If you did not request this, you can safely ignore this email. Your password wil
         html = _base_template_en("🔑", "Password Reset", body)
         return send_email(to_email, "Password Reset Request — HourBoost", html)
     else:
-        reset_url = f"{SITE_URL}/reset-password/{token}"
+        reset_url = _email_action_url("/reset-password", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Merhaba,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 HourBoost hesabın için şifre sıfırlama talebinde bulundun. Yeni şifreni belirlemek için aşağıdaki butona tıkla.
 </p>
@@ -253,11 +271,12 @@ Eğer bu talebi sen yapmadıysan bu maili görmezden gelebilirsin, şifren deği
 # ───────────────────── E-posta Değiştirme ─────────────────────
 
 def send_email_change_email(to_email, username, token, lang="tr"):
+    safe_username = _escape_html_text(username)
     if lang == "en":
-        confirm_url = f"{SITE_URL}/confirm-email-change/{token}?lang=en"
+        confirm_url = _email_action_url("/confirm-email-change", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Hello,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 You requested to change your email address on HourBoost. Click the button below to verify your new email address.
 </p>
@@ -279,10 +298,10 @@ If you did not request this, you can safely ignore this email.
         html = _base_template_en("✉️", "Email Change", body)
         return send_email(to_email, "Verify Your New Email Address — HourBoost", html)
     else:
-        confirm_url = f"{SITE_URL}/confirm-email-change/{token}"
+        confirm_url = _email_action_url("/confirm-email-change", token, lang)
         body = f"""
 <p style="margin:0 0 8px;font-size:13px;color:#5a6070;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Merhaba,</p>
-<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{username}</h1>
+<h1 style="margin:0 0 20px;font-size:22px;font-weight:700;color:#e8eaf0;">{safe_username}</h1>
 <p style="margin:0 0 28px;font-size:15px;color:#8892a0;line-height:1.7;">
 HourBoost hesabının e-posta adresini değiştirme talebinde bulundun. Yeni e-posta adresini doğrulamak için aşağıdaki butona tıkla.
 </p>

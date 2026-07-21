@@ -19,12 +19,13 @@ import ipaddress
 from urllib.parse import urlparse
 from functools import wraps
 from contextlib import contextmanager, nullcontext
+from log_security import protect_logger
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = protect_logger(logging.getLogger(__name__))
 
 # ───────────────────── SSRF Koruması ─────────────────────
 
@@ -146,7 +147,7 @@ class SafeURLOpener:
         return safe_urlopen(url, timeout=timeout, **kwargs)
 
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 from flask import Flask, request, jsonify, session, g, render_template
@@ -160,7 +161,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from config import Config
 from models import (
     db, User, SteamAccount, BoostGame, Payment, PaymentAuditLog, BoostLog,
-    Announcement, UserSession, RevokedToken,
+    Announcement, UserSession, RevokedToken, PASSWORD_HASH_METHOD,
 )
 from steam_manager import (
     boost_service,
@@ -183,10 +184,20 @@ from gevent.event import Event
 from gevent.lock import RLock
 
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.config.from_object(Config)
 app.permanent_session_lifetime = Config.PERMANENT_SESSION_LIFETIME
+
+
+@app.errorhandler(413)
+def request_payload_too_large(_error):
+    return jsonify({
+        "ok": False,
+        "error": "Payload too large.",
+    }), 413
+
 
 # The production service deliberately uses one gevent worker.  Per-user locks
 # close the cooperative-concurrency gap left by SQLite's lack of row locks:
@@ -300,7 +311,26 @@ SERVER_START = time.time()
 
 _active_timers = {}
 _timer_lock = RLock()
+_account_user_timer_deadlines = {}
+_user_quota_watchdogs = {}
+_user_quota_hard_fences = {}
+_quota_watchdog_lock = RLock()
+_quota_watchdog_generation = 0
 _bg_reconnect_locks = set()
+
+QUOTA_RECONCILE_RETRY_SECONDS = 2.0
+QUOTA_EXHAUSTION_EPSILON_SECONDS = 0.05
+
+
+def _kill_greenlet_nonblocking(greenlet):
+    """Cancel without waiting for cleanup that may need a lock we hold."""
+    try:
+        greenlet.kill(block=False)
+    except TypeError:
+        # Lightweight test doubles and non-gevent timer adapters generally
+        # expose kill() without the gevent ``block`` keyword.
+        greenlet.kill()
+
 
 def _clear_timers(acct_id):
     # Referansları kilit altında çıkar, kill işlemini kilit dışında yap
@@ -308,13 +338,14 @@ def _clear_timers(acct_id):
     current = gevent.getcurrent()
     with _timer_lock:
         timers = _active_timers.pop(acct_id, None)
+        _account_user_timer_deadlines.pop(acct_id, None)
     if not timers:
         return
     for t in timers:
         if t is current:
             continue  # Bu fonksiyonu çağıran greenlet kendini öldürmesin
         try:
-            t.kill()
+            _kill_greenlet_nonblocking(t)
         except Exception:
             pass
 
@@ -337,6 +368,7 @@ def _discard_timer(acct_id, glet):
             return
         if not timers:
             _active_timers.pop(acct_id, None)
+            _account_user_timer_deadlines.pop(acct_id, None)
 
 
 def _same_boost_session(snapshot, session_id=None, generation=None):
@@ -359,7 +391,18 @@ def _add_boost_log_if_missing(
     app_ids,
 ):
     """Stage one deterministic segment and make an immediate retry idempotent."""
-    duration_seconds = max(0, int(duration_seconds or 0))
+    try:
+        raw_duration = float(duration_seconds or 0)
+    except (TypeError, ValueError):
+        raw_duration = 0.0
+    # Integer storage must not make repeated sub-second sessions free.  Round
+    # billable usage up; the maximum accounting bias is below one second per
+    # finalized segment and quota can never be silently under-counted.
+    duration_seconds = (
+        max(0, int(math.ceil(max(0.0, raw_duration - 1e-9))))
+        if math.isfinite(raw_duration)
+        else 0
+    )
     if duration_seconds <= 0 or started_epoch is None:
         return False
 
@@ -555,6 +598,7 @@ def _handle_fatal_disconnect(
     app_ids=None,
     stopped_epoch=None,
 ):
+    owner_id = None
     try:
         with app.app_context():
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
@@ -684,25 +728,1056 @@ def _handle_fatal_disconnect(
         except Exception:
             pass
         logger.exception("[acct:%s] Fatal disconnect finalization hatasi", acct_id)
+    finally:
+        if owner_id is not None:
+            try:
+                with app.app_context():
+                    with _user_operation_lock(owner_id):
+                        db.session.expire_all()
+                        _reconcile_user_quota_locked(
+                            owner_id,
+                            "fatal_disconnect",
+                            enforce=True,
+                        )
+            except Exception:
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                logger.exception(
+                    "quota.fatal_reschedule_failed user_id=%s account_id=%s",
+                    owner_id,
+                    acct_id,
+                )
 
 boost_service.fatal_disconnect_callback = _handle_fatal_disconnect
+
+
+def _boost_log_seconds_in_window(
+    started_at,
+    stopped_at,
+    duration_seconds,
+    window_start=None,
+    window_end=None,
+):
+    """Return the recorded segment duration that belongs to one UTC window.
+
+    ``duration_seconds`` remains the accounting source of truth. Timestamps are
+    used only to split that duration across boundaries such as midnight or plan
+    activation, so rounding differences cannot create extra quota usage.
+    """
+    if started_at is None:
+        return 0.0
+    try:
+        duration = float(duration_seconds or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(duration) or duration <= 0:
+        return 0.0
+
+    effective_stop = stopped_at
+    if effective_stop is None or effective_stop <= started_at:
+        effective_stop = started_at + timedelta(seconds=duration)
+
+    segment_span = (effective_stop - started_at).total_seconds()
+    if segment_span <= 0:
+        return 0.0
+
+    overlap_start = max(started_at, window_start) if window_start else started_at
+    overlap_end = min(effective_stop, window_end) if window_end else effective_stop
+    overlap_span = (overlap_end - overlap_start).total_seconds()
+    if overlap_span <= 0:
+        return 0.0
+
+    return duration * min(1.0, overlap_span / segment_span)
+
+
+def _get_logged_seconds(user_id, start_time_filter=None, end_time_filter=None):
+    query = db.session.query(
+        BoostLog.started_at,
+        BoostLog.stopped_at,
+        BoostLog.duration_seconds,
+    ).filter(BoostLog.user_id == user_id)
+    if start_time_filter is not None:
+        query = query.filter(or_(
+            BoostLog.stopped_at > start_time_filter,
+            BoostLog.stopped_at.is_(None),
+        ))
+    if end_time_filter is not None:
+        query = query.filter(BoostLog.started_at < end_time_filter)
+
+    return sum(
+        _boost_log_seconds_in_window(
+            row.started_at,
+            row.stopped_at,
+            row.duration_seconds,
+            start_time_filter,
+            end_time_filter,
+        )
+        for row in query.all()
+    )
+
 
 def _get_active_seconds(user_id, start_time_filter=None):
     active = 0
     now = time.time()
+    now_utc = datetime.utcfromtimestamp(now)
     accounts = SteamAccount.query.filter_by(user_id=user_id).all()
     for acct in accounts:
         mgr = boost_service.get(acct.id)
         snapshot = mgr.boost_snapshot() if mgr else None
         if snapshot and snapshot.get("boosting") and snapshot.get("start_time"):
             active_start = snapshot["start_time"]
-            if start_time_filter:
-                start_dt = datetime.utcfromtimestamp(active_start)
-                if start_dt >= start_time_filter:
-                    active += (now - active_start)
-            else:
-                active += (now - active_start)
+            active_start_utc = datetime.utcfromtimestamp(active_start)
+            counted_start = (
+                max(active_start_utc, start_time_filter)
+                if start_time_filter is not None
+                else active_start_utc
+            )
+            active += max(0.0, (now_utc - counted_start).total_seconds())
     return active
+
+
+def _utc_datetime_epoch(value):
+    """Convert a naive-or-aware UTC datetime to an epoch without local-TZ drift."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.timestamp()
+
+
+def _active_user_runs_snapshot(user_id, now_epoch=None):
+    """Freeze the user's active runtime set for one quota calculation."""
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    runs = []
+    accounts = (
+        SteamAccount.query.filter_by(user_id=user_id)
+        .order_by(SteamAccount.id)
+        .all()
+    )
+    for account in accounts:
+        manager = boost_service.get(account.id)
+        snapshot = manager.boost_snapshot() if manager is not None else None
+        if not snapshot or not snapshot.get("boosting"):
+            continue
+        start_time = snapshot.get("start_time")
+        runs.append({
+            "account": account,
+            "manager": manager,
+            "snapshot": snapshot,
+            "start_time": float(start_time) if start_time is not None else None,
+            "now_epoch": now_epoch,
+        })
+    return runs
+
+
+def _quota_usage_snapshot(user_id, *, now_epoch=None):
+    """Return one user-level quota/accounting snapshot.
+
+    Daily and total limits are measured in boost-account-seconds.  With N
+    active accounts, one wall-clock second therefore consumes N quota seconds.
+    The caller must hold ``_user_operation_lock(user_id)`` so start/stop and
+    plan mutations cannot change the snapshot midway through the decision.
+    """
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    now_utc = datetime.utcfromtimestamp(now_epoch)
+    user = db.session.get(User, user_id)
+    if user is None:
+        return None
+
+    limits = Config.PLANS.get(user.plan, Config.PLANS["free"])
+    runs = _active_user_runs_snapshot(user_id, now_epoch)
+    active_count = len(runs)
+    invalid_runtime = any(run["start_time"] is None for run in runs)
+
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+    daily_limit = limits.get("daily_hours")
+    daily_limit_seconds = (
+        float(daily_limit) * 3600.0 if daily_limit is not None else None
+    )
+    daily_logged = (
+        _get_logged_seconds(user_id, today_start, now_utc)
+        if daily_limit_seconds is not None
+        else 0.0
+    )
+    daily_active = 0.0
+    if daily_limit_seconds is not None:
+        today_epoch = _utc_datetime_epoch(today_start)
+        for run in runs:
+            if run["start_time"] is not None:
+                daily_active += max(
+                    0.0,
+                    now_epoch - max(run["start_time"], today_epoch),
+                )
+    daily_used = daily_logged + daily_active
+    daily_remaining = (
+        daily_limit_seconds - daily_used
+        if daily_limit_seconds is not None
+        else None
+    )
+
+    total_limit = limits.get("total_hours")
+    total_limit_seconds = (
+        float(total_limit) * 3600.0 if total_limit is not None else None
+    )
+    # Legacy paid rows without an activation timestamp must not receive a new
+    # quota window accidentally. Count from account creation instead of an
+    # arbitrary recent cutoff.
+    plan_start = user.plan_activated_at or user.created_at or datetime(1970, 1, 1)
+    total_logged = (
+        _get_logged_seconds(user_id, plan_start, now_utc)
+        if total_limit_seconds is not None
+        else 0.0
+    )
+    total_active = 0.0
+    if total_limit_seconds is not None:
+        plan_start_epoch = _utc_datetime_epoch(plan_start)
+        for run in runs:
+            if run["start_time"] is not None:
+                total_active += max(
+                    0.0,
+                    now_epoch - max(run["start_time"], plan_start_epoch),
+                )
+    total_used = total_logged + total_active
+    total_remaining = (
+        total_limit_seconds - total_used
+        if total_limit_seconds is not None
+        else None
+    )
+
+    constraints = []
+    if daily_remaining is not None:
+        constraints.append((daily_remaining, "daily_limit"))
+    if total_remaining is not None:
+        constraints.append((total_remaining, "total_limit"))
+    if invalid_runtime:
+        constraints.append((0.0, "invalid_runtime"))
+
+    limiting = min(constraints, key=lambda item: item[0]) if constraints else None
+    remaining_usage = max(0.0, limiting[0]) if limiting else None
+    estimated_wall = (
+        remaining_usage / active_count
+        if remaining_usage is not None and active_count > 0
+        else None
+    )
+    quota_depleted = bool(
+        limiting is not None
+        and limiting[0] <= QUOTA_EXHAUSTION_EPSILON_SECONDS
+    )
+    exhausted = bool(active_count > 0 and quota_depleted)
+
+    events = []
+    if active_count > 0 and not exhausted:
+        if daily_remaining is not None:
+            daily_delay = max(0.0, daily_remaining / active_count)
+            midnight_delay = max(
+                0.0,
+                _utc_datetime_epoch(tomorrow_start) - now_epoch,
+            )
+            # At an exact tie the UTC reset wins: daily windows are [start,end)
+            # and the next day's quota becomes available at midnight.
+            if midnight_delay <= daily_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS:
+                events.append((midnight_delay, 0, "utc_midnight"))
+            else:
+                events.append((daily_delay, 1, "daily_limit"))
+        if total_remaining is not None:
+            events.append((
+                max(0.0, total_remaining / active_count),
+                1,
+                "total_limit",
+            ))
+        if user.plan != "free" and user.plan_expires is not None:
+            events.append((
+                max(0.0, _utc_datetime_epoch(user.plan_expires) - now_epoch),
+                0,
+                "plan_expiry",
+            ))
+
+    next_event = min(events, key=lambda item: (item[0], item[1])) if events else None
+    quota_deadline_epoch = (
+        now_epoch + estimated_wall if estimated_wall is not None else None
+    )
+    return {
+        "user": user,
+        "plan": user.plan,
+        "limits": limits,
+        "now_epoch": now_epoch,
+        "now_utc": now_utc,
+        "runs": runs,
+        "active_count": active_count,
+        "daily_used_seconds": daily_used,
+        "daily_remaining_seconds": (
+            max(0.0, daily_remaining) if daily_remaining is not None else None
+        ),
+        "total_used_seconds": total_used,
+        "total_remaining_seconds": (
+            max(0.0, total_remaining) if total_remaining is not None else None
+        ),
+        "remaining_usage_seconds": remaining_usage,
+        "estimated_wall_seconds": estimated_wall,
+        "quota_deadline_epoch": quota_deadline_epoch,
+        "quota_depleted": quota_depleted,
+        "exhausted": exhausted,
+        "exhaustion_reason": limiting[1] if limiting else None,
+        "next_delay_seconds": next_event[0] if next_event else None,
+        "next_reason": next_event[2] if next_event else None,
+    }
+
+
+def _account_user_timer_deadline(acct_id, snapshot):
+    with _timer_lock:
+        entry = _account_user_timer_deadlines.get(acct_id)
+        if not entry:
+            return None
+        if (
+            entry.get("session_id") != snapshot.get("session_id")
+            or entry.get("generation") != snapshot.get("generation")
+        ):
+            return None
+        return entry.get("deadline_epoch")
+
+
+def _remember_account_user_timer_deadline(
+    acct_id,
+    session_id,
+    generation,
+    deadline_epoch,
+):
+    with _timer_lock:
+        _account_user_timer_deadlines[acct_id] = {
+            "session_id": session_id,
+            "generation": generation,
+            "deadline_epoch": float(deadline_epoch),
+        }
+
+
+def _sync_user_target_stop_times_locked(user_id, quota_deadline_epoch=None):
+    """Persist the effective UI deadline without losing account user timers."""
+    changed = False
+    accounts = SteamAccount.query.filter_by(user_id=user_id).all()
+    for account in accounts:
+        manager = boost_service.get(account.id)
+        snapshot = manager.boost_snapshot() if manager is not None else None
+        runtime_active = bool(snapshot and snapshot.get("boosting"))
+        deadlines = []
+        if runtime_active and quota_deadline_epoch is not None:
+            deadlines.append(float(quota_deadline_epoch))
+        if runtime_active:
+            user_deadline = _account_user_timer_deadline(account.id, snapshot)
+            if user_deadline is not None:
+                deadlines.append(float(user_deadline))
+        effective = min(deadlines) if deadlines else None
+        target = datetime.utcfromtimestamp(effective) if effective is not None else None
+        if account.is_boosting != runtime_active:
+            account.is_boosting = runtime_active
+            changed = True
+        if account.target_stop_time != target:
+            account.target_stop_time = target
+            changed = True
+    if changed:
+        db.session.commit()
+    return changed
+
+
+def _cancel_user_quota_watchdog(user_id):
+    with _quota_watchdog_lock:
+        entry = _user_quota_watchdogs.pop(int(user_id), None)
+    if entry is None:
+        return False
+    greenlet = entry.get("greenlet")
+    if (
+        not entry.get("cutoff_claimed")
+        and greenlet is not None
+        and greenlet is not gevent.getcurrent()
+    ):
+        try:
+            _kill_greenlet_nonblocking(greenlet)
+        except Exception:
+            pass
+    return True
+
+
+def _install_user_quota_watchdog(
+    user_id,
+    delay_seconds,
+    reason,
+    *,
+    expected_generation=None,
+    expected_token=None,
+):
+    """Atomically replace one user's watchdog; keep the old one on spawn failure."""
+    global _quota_watchdog_generation
+    user_id = int(user_id)
+    token = secrets.token_hex(16)
+    delay_seconds = max(0.0, float(delay_seconds))
+    with _quota_watchdog_lock:
+        if expected_generation is not None or expected_token is not None:
+            current_entry = _user_quota_watchdogs.get(user_id)
+            if not (
+                current_entry
+                and current_entry.get("generation") == expected_generation
+                and hmac.compare_digest(
+                    str(current_entry.get("token")),
+                    str(expected_token),
+                )
+            ):
+                return None
+        _quota_watchdog_generation += 1
+        generation = _quota_watchdog_generation
+        greenlet = gevent.spawn_later(
+            delay_seconds,
+            _run_user_quota_watchdog,
+            user_id,
+            generation,
+            token,
+            reason,
+        )
+        entry = {
+            "generation": generation,
+            "token": token,
+            "greenlet": greenlet,
+            "deadline_epoch": time.time() + delay_seconds,
+            "reason": reason,
+        }
+        previous = _user_quota_watchdogs.get(user_id)
+        _user_quota_watchdogs[user_id] = entry
+    if previous:
+        previous_greenlet = previous.get("greenlet")
+        if (
+            not previous.get("cutoff_claimed")
+            and previous_greenlet is not None
+            and previous_greenlet is not gevent.getcurrent()
+        ):
+            try:
+                _kill_greenlet_nonblocking(previous_greenlet)
+            except Exception:
+                pass
+    return entry
+
+
+def _claim_user_quota_hard_fence(user_id, generation, token):
+    """Atomically linearize a hard quota deadline against plan changes."""
+    user_id = int(user_id)
+    now_epoch = time.time()
+    with _quota_watchdog_lock:
+        entry = _user_quota_watchdogs.get(user_id)
+        if not (
+            entry
+            and entry.get("generation") == generation
+            and hmac.compare_digest(str(entry.get("token")), str(token))
+            and entry.get("reason") in ("daily_limit", "total_limit")
+        ):
+            return {"claimed": False, "stale": True}
+
+        deadline_epoch = float(entry.get("deadline_epoch") or 0.0)
+        remaining = deadline_epoch - now_epoch
+        if remaining > QUOTA_EXHAUSTION_EPSILON_SECONDS:
+            return {
+                "claimed": False,
+                "early": True,
+                "remaining": remaining,
+                "reason": entry.get("reason"),
+            }
+
+        existing = _user_quota_hard_fences.get(user_id)
+        if existing is not None:
+            return {
+                "claimed": False,
+                "busy": True,
+                "existing": dict(existing),
+            }
+
+        entry["cutoff_claimed"] = True
+        fence = {
+            "generation": generation,
+            "token": token,
+            "deadline_epoch": deadline_epoch,
+            "reason": entry.get("reason"),
+            "claimed_at": now_epoch,
+        }
+        _user_quota_hard_fences[user_id] = fence
+        return {"claimed": True, "fence": dict(fence)}
+
+
+def _active_user_quota_hard_fence(user_id):
+    with _quota_watchdog_lock:
+        fence = _user_quota_hard_fences.get(int(user_id))
+        return dict(fence) if fence is not None else None
+
+
+def _finish_user_quota_hard_fence(user_id, generation, token):
+    with _quota_watchdog_lock:
+        fence = _user_quota_hard_fences.get(int(user_id))
+        if (
+            fence
+            and fence.get("generation") == generation
+            and hmac.compare_digest(str(fence.get("token")), str(token))
+        ):
+            _user_quota_hard_fences.pop(int(user_id), None)
+            return True
+    return False
+
+
+def _quota_watchdog_is_current(user_id, generation, token):
+    with _quota_watchdog_lock:
+        entry = _user_quota_watchdogs.get(int(user_id))
+        return bool(
+            entry
+            and entry.get("generation") == generation
+            and hmac.compare_digest(str(entry.get("token")), str(token))
+        )
+
+
+def _discard_user_quota_watchdog(user_id, generation, token, greenlet):
+    with _quota_watchdog_lock:
+        entry = _user_quota_watchdogs.get(int(user_id))
+        if (
+            entry
+            and entry.get("generation") == generation
+            and hmac.compare_digest(str(entry.get("token")), str(token))
+            and entry.get("greenlet") is greenlet
+        ):
+            _user_quota_watchdogs.pop(int(user_id), None)
+
+
+def _reconcile_user_pending_segments_locked(user_id):
+    """Make all durable final segments billable before granting more quota."""
+    ok = True
+    accounts = SteamAccount.query.filter_by(user_id=user_id).all()
+    for account in accounts:
+        # A process restart clears the in-memory registry, not the durable
+        # pending-final file. Hydrate every DB account before admitting new
+        # usage so an API caller cannot bypass unbilled usage merely by being
+        # the first route hit after restart.
+        manager = boost_service.get_or_create(
+            account.id,
+            account.steam_username,
+        )
+        snapshot = manager.boost_snapshot()
+        pending_segments = snapshot.get("pending_final_segments") or []
+        if not pending_segments:
+            continue
+
+        # An unconfirmed old stop and a newer active run on the same Steam
+        # account is an impossible/unsafe overlap. Retrying stop_games could
+        # stop the newer run, so fail closed and let quota enforcement close it.
+        if snapshot.get("boosting") and any(
+            segment.get("remote_stop_confirmed") is not True
+            for segment in pending_segments
+        ):
+            logger.critical(
+                "[acct:%s] Active runtime conflicts with unconfirmed pending usage",
+                account.id,
+            )
+            ok = False
+            continue
+
+        result = _finalize_pending_manager_segments(
+            account.id,
+            user_id,
+            manager,
+            clear_account_state=not snapshot.get("boosting"),
+        )
+        if (
+            not result.get("persisted")
+            or not result.get("remote_stop_confirmed")
+        ):
+            ok = False
+    return ok
+
+
+def _preempt_user_quota_hard_fence(user_id, fence):
+    """Close every live runtime at a hard deadline without waiting for user lock.
+
+    Authenticated requests intentionally hold the per-user operation lock across
+    Steam IPC. A quota deadline must not wait behind a slow login/start/stop
+    request, so this first phase only touches account-local runtime state and
+    crash-durable pending files. Database reconciliation happens later under
+    the normal user lock.
+    """
+    boundary_epoch = float(fence["deadline_epoch"])
+    rows = (
+        db.session.query(SteamAccount.id, SteamAccount.steam_username)
+        .filter(SteamAccount.user_id == int(user_id))
+        .order_by(SteamAccount.id)
+        .all()
+    )
+    db.session.rollback()
+
+    managers = []
+    created_account_ids = []
+    for account_id, steam_username in rows:
+        manager = boost_service.get(account_id)
+        if manager is None:
+            manager = boost_service.get_or_create(account_id, steam_username)
+            created_account_ids.append(account_id)
+        managers.append((account_id, manager))
+
+    prepare_jobs = [
+        (
+            account_id,
+            manager,
+            gevent.spawn(
+                manager.prepare_stop_boost_segment,
+                stopped_at=boundary_epoch,
+                context=f"hard quota fence: {fence['reason']}",
+            ),
+        )
+        for account_id, manager in managers
+    ]
+    if prepare_jobs:
+        gevent.joinall([item[2] for item in prepare_jobs])
+
+    prepared = []
+    failed_accounts = []
+    for account_id, manager, job in prepare_jobs:
+        if job.exception is not None:
+            logger.error(
+                "quota.hard_fence_prepare_failed user_id=%s account_id=%s error=%s",
+                user_id,
+                account_id,
+                type(job.exception).__name__,
+            )
+            failed_accounts.append(account_id)
+            continue
+        segment = job.value
+        if segment is None:
+            continue
+        if segment.get("local_stop_aborted"):
+            failed_accounts.append(account_id)
+            continue
+        _clear_timers(account_id)
+        prepared.append((account_id, manager, segment))
+
+    confirm_jobs = [
+        (
+            account_id,
+            manager,
+            segment,
+            gevent.spawn(
+                manager.confirm_prepared_stop_segment,
+                segment,
+                context=f"hard quota fence: {fence['reason']}",
+            ),
+        )
+        for account_id, manager, segment in prepared
+    ]
+    if confirm_jobs:
+        gevent.joinall([item[3] for item in confirm_jobs])
+
+    confirmed_count = 0
+    for account_id, _manager, _segment, job in confirm_jobs:
+        if job.exception is not None:
+            failed_accounts.append(account_id)
+            logger.error(
+                "quota.hard_fence_confirm_failed user_id=%s account_id=%s error=%s",
+                user_id,
+                account_id,
+                type(job.exception).__name__,
+            )
+            continue
+        confirmed = job.value
+        if not confirmed or confirmed.get("remote_stop_confirmed") is not True:
+            failed_accounts.append(account_id)
+            continue
+        confirmed_count += 1
+
+    return {
+        "ok": not failed_accounts,
+        "prepared_count": len(prepared),
+        "confirmed_count": confirmed_count,
+        "failed_accounts": sorted(set(failed_accounts)),
+        "created_account_ids": created_account_ids,
+        "stopped_at": boundary_epoch,
+    }
+
+
+def _cleanup_hard_fence_orphan_managers(created_account_ids):
+    """Detach managers hydrated for DB rows deleted during fence IPC."""
+    if not created_account_ids:
+        return
+    live_ids = {
+        account_id
+        for (account_id,) in db.session.query(SteamAccount.id).filter(
+            SteamAccount.id.in_(created_account_ids)
+        ).all()
+    }
+    db.session.rollback()
+    for account_id in created_account_ids:
+        if account_id not in live_ids:
+            try:
+                boost_service.detach(account_id)
+            except Exception:
+                logger.exception(
+                    "quota.hard_fence_orphan_cleanup_failed account_id=%s",
+                    account_id,
+                )
+
+
+def _stop_all_user_boosts_locked(user_id, reason, *, stopped_epoch=None):
+    """Stop all active accounts at one accounting boundary.
+
+    Local segments are first made crash-durable with a shared timestamp. Steam
+    IPC confirmations then run concurrently; database writes remain serialized
+    to keep SQLite safe.
+    """
+    stopped_epoch = time.time() if stopped_epoch is None else float(stopped_epoch)
+    runs = _active_user_runs_snapshot(user_id, stopped_epoch)
+    db.session.rollback()
+    prepared = []
+    failed_accounts = []
+
+    for run in runs:
+        account_id = run["account"].id
+        manager = run["manager"]
+        snapshot = run["snapshot"]
+        _clear_timers(account_id)
+        try:
+            segment = manager.prepare_stop_boost_segment(
+                expected_session_id=snapshot.get("session_id"),
+                expected_generation=snapshot.get("generation"),
+                stopped_at=stopped_epoch,
+                context=f"user quota: {reason}",
+            )
+        except Exception:
+            logger.exception(
+                "[acct:%s] Quota stop prepare failed",
+                account_id,
+            )
+            failed_accounts.append(account_id)
+            continue
+        if segment is None or segment.get("local_stop_aborted"):
+            failed_accounts.append(account_id)
+            continue
+        prepared.append((account_id, manager, segment))
+
+    jobs = []
+    for account_id, manager, segment in prepared:
+        job = gevent.spawn(
+            manager.confirm_prepared_stop_segment,
+            segment,
+            context=f"user quota: {reason}",
+        )
+        jobs.append((account_id, manager, segment, job))
+    if jobs:
+        gevent.joinall([item[3] for item in jobs])
+
+    persisted_count = 0
+    for account_id, manager, original_segment, job in jobs:
+        if job.exception is not None:
+            logger.error(
+                "[acct:%s] Quota Steam stop confirmation failed: %s",
+                account_id,
+                type(job.exception).__name__,
+            )
+            failed_accounts.append(account_id)
+            continue
+        segment = job.value or original_segment
+        if segment.get("remote_stop_confirmed") is not True:
+            failed_accounts.append(account_id)
+            continue
+        if _persist_manager_final_segment(
+            account_id,
+            user_id,
+            manager,
+            segment,
+        ):
+            persisted_count += 1
+        else:
+            failed_accounts.append(account_id)
+
+    return {
+        "ok": not failed_accounts,
+        "active_count": len(runs),
+        "persisted_count": persisted_count,
+        "failed_accounts": sorted(set(failed_accounts)),
+        "stopped_at": stopped_epoch,
+    }
+
+
+def _expire_user_plan_if_needed_locked(user, now_utc=None):
+    now_utc = now_utc or datetime.utcnow()
+    if (
+        user.plan != "free"
+        and user.plan_expires is not None
+        and user.plan_expires <= now_utc
+    ):
+        # Linearize the plan change against a hard-deadline claim. If the
+        # watchdog already claimed, its boundary wins; otherwise this
+        # cancellation makes the old quota callback inert before the commit.
+        _cancel_user_quota_watchdog(user.id)
+        user.plan = "free"
+        user.plan_expires = None
+        user.plan_activated_at = None
+        db.session.commit()
+        _plan_expiry_cache.pop(user.id, None)
+        logger.info("Plan suresi doldu: user_id=%s", user.id)
+        return True
+    return False
+
+
+def _reconcile_user_quota_locked(user_id, cause, *, enforce=True):
+    """Reconcile pending usage, enforce quota, and install one user watchdog."""
+    user_id = int(user_id)
+    user = db.session.get(User, user_id)
+    if user is None:
+        _cancel_user_quota_watchdog(user_id)
+        return {"ok": True, "missing_user": True, "active_count": 0}
+
+    _expire_user_plan_if_needed_locked(user)
+    if not _reconcile_user_pending_segments_locked(user_id):
+        try:
+            _install_user_quota_watchdog(
+                user_id,
+                QUOTA_RECONCILE_RETRY_SECONDS,
+                "reconcile_retry",
+            )
+        except Exception:
+            logger.exception(
+                "quota.watchdog.retry_schedule_failed user_id=%s cause=%s",
+                user_id,
+                cause,
+            )
+        return {
+            "ok": False,
+            "pending_unresolved": True,
+            "active_count": None,
+        }
+
+    state = _quota_usage_snapshot(user_id)
+    if state is None:
+        _cancel_user_quota_watchdog(user_id)
+        return {"ok": True, "missing_user": True, "active_count": 0}
+
+    if state["exhausted"] and state["active_count"] > 0 and enforce:
+        hard_fence = _active_user_quota_hard_fence(user_id)
+        stopped_epoch = state["now_epoch"]
+        if hard_fence is not None:
+            stopped_epoch = min(
+                stopped_epoch,
+                float(hard_fence["deadline_epoch"]),
+            )
+        stopped = _stop_all_user_boosts_locked(
+            user_id,
+            state.get("exhaustion_reason") or cause,
+            stopped_epoch=stopped_epoch,
+        )
+        if stopped["ok"]:
+            _cancel_user_quota_watchdog(user_id)
+        else:
+            try:
+                _install_user_quota_watchdog(
+                    user_id,
+                    QUOTA_RECONCILE_RETRY_SECONDS,
+                    "reconcile_retry",
+                )
+            except Exception:
+                logger.exception(
+                    "quota.watchdog.stop_retry_schedule_failed user_id=%s",
+                    user_id,
+                )
+        state.update({
+            "ok": stopped["ok"],
+            "quota_stopped": True,
+            "stop_result": stopped,
+        })
+        return state
+
+    if state["active_count"] <= 0:
+        _cancel_user_quota_watchdog(user_id)
+        try:
+            _sync_user_target_stop_times_locked(user_id)
+        except SQLAlchemyError:
+            db.session.rollback()
+            logger.exception(
+                "quota.target_sync_failed user_id=%s cause=%s",
+                user_id,
+                cause,
+            )
+        state["ok"] = True
+        return state
+
+    delay = state.get("next_delay_seconds")
+    reason = state.get("next_reason")
+    if delay is None or reason is None:
+        _cancel_user_quota_watchdog(user_id)
+    else:
+        try:
+            _install_user_quota_watchdog(user_id, delay, reason)
+        except Exception:
+            logger.exception(
+                "quota.watchdog.schedule_failed user_id=%s cause=%s",
+                user_id,
+                cause,
+            )
+            state["ok"] = False
+            state["schedule_failed"] = True
+            return state
+
+    try:
+        _sync_user_target_stop_times_locked(
+            user_id,
+            state.get("quota_deadline_epoch"),
+        )
+    except SQLAlchemyError:
+        db.session.rollback()
+        logger.exception(
+            "quota.target_sync_failed user_id=%s cause=%s",
+            user_id,
+            cause,
+        )
+    state["ok"] = True
+    return state
+
+
+def _run_user_quota_watchdog(user_id, generation, token, reason):
+    current = gevent.getcurrent()
+    hard_fence = None
+    preempt_result = None
+    try:
+        if not _quota_watchdog_is_current(user_id, generation, token):
+            return
+
+        if reason in ("daily_limit", "total_limit"):
+            claim = _claim_user_quota_hard_fence(
+                user_id,
+                generation,
+                token,
+            )
+            if claim.get("early"):
+                _install_user_quota_watchdog(
+                    user_id,
+                    claim["remaining"],
+                    claim["reason"],
+                    expected_generation=generation,
+                    expected_token=token,
+                )
+                return
+            if not claim.get("claimed"):
+                return
+            hard_fence = claim["fence"]
+            with app.app_context():
+                try:
+                    preempt_result = _preempt_user_quota_hard_fence(
+                        user_id,
+                        hard_fence,
+                    )
+                except Exception:
+                    preempt_result = {
+                        "ok": False,
+                        "created_account_ids": [],
+                    }
+                    logger.exception(
+                        "quota.hard_fence_preemption_failed user_id=%s reason=%s",
+                        user_id,
+                        reason,
+                    )
+
+        with app.app_context():
+            with _user_operation_lock(user_id):
+                if (
+                    hard_fence is None
+                    and not _quota_watchdog_is_current(
+                        user_id,
+                        generation,
+                        token,
+                    )
+                ):
+                    return
+                db.session.expire_all()
+                if preempt_result is not None:
+                    _cleanup_hard_fence_orphan_managers(
+                        preempt_result.get("created_account_ids") or []
+                    )
+                result = _reconcile_user_quota_locked(
+                    user_id,
+                    f"watchdog:{reason}",
+                    enforce=True,
+                )
+                if hard_fence is not None:
+                    logger.info(
+                        "quota.hard_fence_complete user_id=%s reason=%s "
+                        "prepared=%s confirmed=%s preempt_ok=%s reconcile_ok=%s",
+                        user_id,
+                        reason,
+                        preempt_result.get("prepared_count")
+                        if preempt_result else 0,
+                        preempt_result.get("confirmed_count")
+                        if preempt_result else 0,
+                        preempt_result.get("ok") if preempt_result else False,
+                        result.get("ok"),
+                    )
+                elif result.get("quota_stopped"):
+                    logger.info(
+                        "quota.exhausted user_id=%s reason=%s accounts=%s ok=%s",
+                        user_id,
+                        result.get("exhaustion_reason"),
+                        result.get("active_count"),
+                        result.get("ok"),
+                    )
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        logger.exception(
+            "quota.watchdog.failed user_id=%s reason=%s",
+            user_id,
+            reason,
+        )
+        try:
+            with app.app_context():
+                with _user_operation_lock(user_id):
+                    if preempt_result is not None:
+                        _cleanup_hard_fence_orphan_managers(
+                            preempt_result.get("created_account_ids") or []
+                        )
+                    if hard_fence is not None:
+                        db.session.expire_all()
+                        recovery = _reconcile_user_quota_locked(
+                            user_id,
+                            f"hard_fence_recovery:{reason}",
+                            enforce=True,
+                        )
+                        if not recovery.get("ok"):
+                            _install_user_quota_watchdog(
+                                user_id,
+                                QUOTA_RECONCILE_RETRY_SECONDS,
+                                "reconcile_retry",
+                            )
+                    elif _quota_watchdog_is_current(
+                        user_id,
+                        generation,
+                        token,
+                    ):
+                        _install_user_quota_watchdog(
+                            user_id,
+                            QUOTA_RECONCILE_RETRY_SECONDS,
+                            "reconcile_retry",
+                        )
+        except Exception:
+            logger.critical(
+                "quota.watchdog.recovery_failed user_id=%s",
+                user_id,
+                exc_info=True,
+            )
+    finally:
+        if hard_fence is not None:
+            _finish_user_quota_hard_fence(
+                user_id,
+                generation,
+                token,
+            )
+        _discard_user_quota_watchdog(
+            user_id,
+            generation,
+            token,
+            current,
+        )
 
 # ───────────────────── JWT ─────────────────────
 
@@ -1155,6 +2230,49 @@ def _ensure_schema():
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN tokens_valid_after {col_type}"))
             logger.info("Şema güncellendi: users.tokens_valid_after eklendi")
 
+        if "plan_activated_at" not in cols:
+            col_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
+            with db.engine.begin() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE users ADD COLUMN plan_activated_at {col_type}"
+                ))
+            logger.info("Şema güncellendi: users.plan_activated_at eklendi")
+
+        # Legacy paid users must not receive a fresh quota merely because the
+        # activation timestamp did not exist in their original schema. The
+        # conservative fallback matches quota accounting: count from account
+        # creation, or the Unix epoch for malformed legacy rows. Free users
+        # intentionally remain NULL; a later paid activation opens a new usage
+        # window explicitly.
+        paid_plan_names = tuple(
+            name
+            for name, limits in Config.PLANS.items()
+            if name != "free" and limits.get("total_hours") is not None
+        )
+        if paid_plan_names:
+            plan_params = {
+                f"paid_plan_{index}": name
+                for index, name in enumerate(paid_plan_names)
+            }
+            plan_placeholders = ", ".join(
+                f":{key}" for key in plan_params
+            )
+            with db.engine.begin() as conn:
+                backfilled = conn.execute(text(
+                    "UPDATE users SET plan_activated_at = "
+                    "COALESCE(created_at, :legacy_plan_epoch) "
+                    "WHERE plan_activated_at IS NULL "
+                    f"AND plan IN ({plan_placeholders})"
+                ), {
+                    **plan_params,
+                    "legacy_plan_epoch": datetime(1970, 1, 1),
+                })
+            if backfilled.rowcount:
+                logger.warning(
+                    "Legacy plan quota window backfilled: %d users",
+                    backfilled.rowcount,
+                )
+
         session_cols = {
             c["name"] for c in inspector.get_columns("user_sessions")
         }
@@ -1401,6 +2519,10 @@ def _ensure_schema():
                 "CREATE INDEX IF NOT EXISTS ix_payments_verification_due "
                 "ON payments (status, next_verification_at, verification_lock_until)"
             ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_boost_logs_user_window "
+                "ON boost_logs (user_id, stopped_at, started_at)"
+            ))
     except Exception as e:
         try:
             db.session.rollback()
@@ -1478,6 +2600,7 @@ import gevent
 def _checkpoint_active_boosts_once():
     """Persist active segments without advancing memory before durability."""
     saved = 0
+    affected_user_ids = set()
     for acct_id, manager in boost_service.all_managers():
         try:
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
@@ -1543,9 +2666,30 @@ def _checkpoint_active_boosts_once():
                         )
                     else:
                         saved += 1
+                        affected_user_ids.add(owner_id)
         except Exception:
             db.session.rollback()
             logger.exception("[acct:%s] Checkpoint hesap hatasi", acct_id)
+    for owner_id in sorted(affected_user_ids):
+        try:
+            with _user_operation_lock(owner_id):
+                db.session.expire_all()
+                result = _reconcile_user_quota_locked(
+                    owner_id,
+                    "checkpoint",
+                    enforce=True,
+                )
+                if not result.get("ok"):
+                    logger.critical(
+                        "quota.checkpoint_reschedule_failed user_id=%s",
+                        owner_id,
+                    )
+        except Exception:
+            db.session.rollback()
+            logger.exception(
+                "quota.checkpoint_reconcile_failed user_id=%s",
+                owner_id,
+            )
     return saved
 
 
@@ -1575,6 +2719,24 @@ import atexit
 
 @atexit.register
 def shutdown_cleanup():
+    with _quota_watchdog_lock:
+        quota_entries = list(_user_quota_watchdogs.values())
+        active_fence_count = len(_user_quota_hard_fences)
+        _user_quota_watchdogs.clear()
+        _user_quota_hard_fences.clear()
+    if active_fence_count:
+        logger.warning(
+            "Shutdown interrupted %d active quota hard fences; durable pending "
+            "segments will reconcile on next start",
+            active_fence_count,
+        )
+    for entry in quota_entries:
+        greenlet = entry.get("greenlet")
+        if greenlet is not None and greenlet is not gevent.getcurrent():
+            try:
+                _kill_greenlet_nonblocking(greenlet)
+            except Exception:
+                pass
     with app.app_context():
         for acct_id, mgr in boost_service.all_managers():
             try:
@@ -1726,8 +2888,32 @@ def sanitize(text, maxlen=100):
 # Parola politikası (ISSUES.md #13): en az 10 karakter, en az 1 küçük harf,
 # 1 büyük harf ve 1 rakam. Tüm parola belirleyen endpoint'ler bunu kullanır.
 _PW_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{10,}$")
+_EMAIL_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 PASSWORD_POLICY_MSG_EN = "Password must be at least 10 characters and include uppercase and lowercase letters and a number."
 PASSWORD_POLICY_MSG_TR = "Sifre en az 10 karakter olmali; buyuk harf, kucuk harf ve rakam icermelidir."
+
+# A missing username must consume the same password-KDF work as a real one.
+# The random input is generated once per process and is never exposed or logged.
+_LOGIN_DUMMY_PASSWORD_HASH = generate_password_hash(
+    secrets.token_hex(32),
+    method=PASSWORD_HASH_METHOD,
+)
+
+
+def _login_password_matches(user, password) -> bool:
+    password_hash = user.password_hash if user is not None else _LOGIN_DUMMY_PASSWORD_HASH
+    candidate = password if isinstance(password, str) else ""
+    password_matches = check_password_hash(password_hash, candidate)
+    return user is not None and password_matches
+
+
+def _email_action_token_from_json(data):
+    if not isinstance(data, dict):
+        return None
+    token = data.get("token")
+    if not isinstance(token, str) or not _EMAIL_ACTION_TOKEN_RE.fullmatch(token):
+        return None
+    return token
 
 
 def is_strong_password(pw) -> bool:
@@ -1765,15 +2951,19 @@ def resolve_payment_from_note(note: str, reference_time=None):
     return None, None
 
 
-def _activate_plan(user, plan: str):
+def _activate_plan(user, plan: str, *, reset_usage_window=True):
     """Kullanıcıya planı tanımla; süre Config.PLANS[plan]['duration_days']'ten
     okunur. None ise plan süresizdir (plan_expires=None). Çağıran commit eder."""
+    now_utc = datetime.utcnow()
+    if user.id is not None:
+        _cancel_user_quota_watchdog(user.id)
     user.plan = plan
     duration_days = Config.PLANS.get(plan, {}).get("duration_days")
     user.plan_expires = (
-        datetime.utcnow() + timedelta(days=duration_days) if duration_days else None
+        now_utc + timedelta(days=duration_days) if duration_days else None
     )
-    user.plan_activated_at = datetime.utcnow()
+    if reset_usage_window or user.plan_activated_at is None:
+        user.plan_activated_at = now_utc
 
 
 _PLAN_RANK = {"free": 0, "basic": 1, "premium": 2}
@@ -2018,7 +3208,7 @@ def _finalize_canonical_order(
             # Re-run every precondition after acquiring the lock.  If deletion
             # won the race, the refreshed row is finalized as unmatched; if the
             # worker won, deletion observes the completed financial record.
-            db.session.expire_all()
+            db.session.rollback()
             with _user_operation_lock(owner_id):
                 return _finalize_canonical_order(
                     payment_id,
@@ -2138,6 +3328,18 @@ def _finalize_canonical_order(
     target.verification_lock_until = None
     plan_changed = _activate_paid_plan(user, canonical.plan)
     db.session.commit()
+    if plan_changed:
+        quota_result = _reconcile_user_quota_locked(
+            user.id,
+            "verified_payment_plan_change",
+            enforce=True,
+        )
+        if not quota_result.get("ok"):
+            logger.critical(
+                "quota.payment_reschedule_failed user_id=%s payment_id=%s",
+                user.id,
+                target.id,
+            )
 
     logger.info(
         "shopier.payment.completed payment_id=%s order_id=%s plan=%s "
@@ -2307,7 +3509,12 @@ def set_maintenance_mode(enabled: bool) -> None:
 # eklenir. Kalan sayfalar taşınana kadar eski (unsafe-inline) politikada kalır.
 # Not: nonce ile 'unsafe-inline' aynı politikada birleştirilemez — nonce varsa
 # tarayıcı 'unsafe-inline'ı yok sayar; bu yüzden geçiş sayfa-bazlı yapılır.
-_STRICT_CSP_ENDPOINTS = {"admin_page"}
+_STRICT_CSP_ENDPOINTS = {
+    "admin_page",
+    "verify_email_page",
+    "reset_password_page",
+    "confirm_email_change_page",
+}
 
 
 @app.before_request
@@ -2325,7 +3532,10 @@ def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Referrer-Policy'] = g.get(
+        "referrer_policy",
+        "strict-origin-when-cross-origin",
+    )
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
     # _STRICT_CSP_ENDPOINTS'teki sayfalarda script-src nonce tabanlıdır
     # ('unsafe-inline' yok); inline <script> blokları nonce taşımak zorundadır
@@ -2334,7 +3544,10 @@ def add_security_headers(response):
     # style-src'de 'unsafe-inline' bilinçli olarak KALIYOR: arayüz yaygın
     # biçimde inline style attribute kullanıyor; asıl XSS riski (script
     # çalıştırma / JWT çalma) script-src katılaştırmasıyla kapanır.
-    if request.endpoint in _STRICT_CSP_ENDPOINTS:
+    if (
+        request.endpoint in _STRICT_CSP_ENDPOINTS
+        and response.status_code < 400
+    ):
         script_src = f"'self' https://cdn.jsdelivr.net 'nonce-{g.get('csp_nonce', '')}'"
     else:
         script_src = "'self' https://cdn.jsdelivr.net 'unsafe-inline'"
@@ -2467,11 +3680,22 @@ def check_plan_expiry():
     user = db.session.get(User, uid)
     if not user:
         return
-    if user.plan != "free" and user.plan_expires:
-        if user.plan_expires < datetime.utcnow():
-            user.plan = "free"
-            user.plan_expires = None
-            db.session.commit()
+    plan_may_be_expired = bool(
+        user.plan != "free"
+        and user.plan_expires
+        and user.plan_expires <= datetime.utcnow()
+    )
+    db.session.rollback()
+    if plan_may_be_expired:
+        with _user_operation_lock(uid):
+            db.session.expire_all()
+            user = db.session.get(User, uid)
+            if user and _expire_user_plan_if_needed_locked(user):
+                _reconcile_user_quota_locked(
+                    uid,
+                    "request_plan_expiry",
+                    enforce=True,
+                )
 
     # Oturum "son görülme" güncellemesi (Bearer ile gelen istekler için).
     # Bu blok 5 dk throttle'lı (fonksiyon başındaki _plan_expiry_cache kontrolü),
@@ -2684,21 +3908,57 @@ def session_check():
 @app.route("/plan/info")
 @login_required
 def plan_info():
-    user = g.user
-    limits = user.plan_limits()
-    acct_count = SteamAccount.query.filter_by(user_id=user.id).count()
-    return jsonify({
-        "plan": user.plan,
-        "max_accounts": limits["max_accounts"],
-        "max_games": limits["max_games"],
-        "daily_hours": limits.get("daily_hours"),
-        "total_hours": limits.get("total_hours"),
-        "price": limits["price"],
-        "current_accounts": acct_count,
-        "plan_expires": user.plan_expires.isoformat() if user.plan_expires else None,
-        "all_plans": Config.PLANS,
-        "is_verified": user.is_verified,
-    })
+    user_id = g.user.id
+    db.session.rollback()
+    with _user_operation_lock(user_id):
+        user = db.session.get(User, user_id)
+        if user is None:
+            return jsonify({"ok": False, "error": "User not found."}), 404
+        limits = user.plan_limits()
+        acct_count = SteamAccount.query.filter_by(user_id=user.id).count()
+        quota = _reconcile_user_quota_locked(
+            user_id,
+            "plan_info",
+            enforce=True,
+        )
+        if not quota.get("ok"):
+            return jsonify({
+                "ok": False,
+                "error": "Boost usage is being reconciled. Please retry.",
+            }), 503
+        if quota.get("quota_stopped"):
+            quota = _quota_usage_snapshot(user_id) or quota
+        # Reconciliation may expire the plan and refresh its limits.
+        user = db.session.get(User, user_id)
+        limits = user.plan_limits()
+        return jsonify({
+            "plan": user.plan,
+            "max_accounts": limits["max_accounts"],
+            "max_games": limits["max_games"],
+            "daily_hours": limits.get("daily_hours"),
+            "total_hours": limits.get("total_hours"),
+            "price": limits["price"],
+            "current_accounts": acct_count,
+            "plan_expires": user.plan_expires.isoformat() if user.plan_expires else None,
+            "all_plans": Config.PLANS,
+            "is_verified": user.is_verified,
+            "quota_remaining_seconds": (
+                quota.get("remaining_usage_seconds") if quota else None
+            ),
+            "quota_daily_remaining_seconds": (
+                quota.get("daily_remaining_seconds") if quota else None
+            ),
+            "quota_total_remaining_seconds": (
+                quota.get("total_remaining_seconds") if quota else None
+            ),
+            "quota_active_accounts": quota.get("active_count") if quota else 0,
+            "quota_estimated_wall_seconds": (
+                quota.get("estimated_wall_seconds") if quota else None
+            ),
+            "quota_window": (
+                "daily" if limits.get("daily_hours") is not None else "total"
+            ),
+        })
 
 
 @app.route("/register", methods=["POST"])
@@ -2758,47 +4018,100 @@ def register():
     })
 
 
-@app.route("/verify-email/<token>")
-def verify_email(token):
-    lang = request.args.get("lang", "tr")
-    if lang not in ("en", "tr"):
-        lang = "tr"
-
+@app.route("/verify-email", methods=["GET"])
+def verify_email_page():
+    lang = _get_request_lang()
+    g.referrer_policy = "no-referrer"
     template = "en/verify_result.html" if lang == "en" else "verify_result.html"
+    return render_template(
+        template,
+        pending=True,
+        action_endpoint="/verify-email",
+        pending_message=(
+            "Click the button below to verify your email address."
+            if lang == "en"
+            else "E-posta adresini doğrulamak için aşağıdaki butona tıkla."
+        ),
+        action_label="VERIFY EMAIL" if lang == "en" else "E-POSTAYI DOĞRULA",
+        invalid_message=(
+            "Invalid or expired verification link."
+            if lang == "en"
+            else "Geçersiz veya süresi dolmuş doğrulama linki."
+        ),
+        request_error=(
+            "Verification could not be completed. Please try again."
+            if lang == "en"
+            else "Doğrulama tamamlanamadı. Lütfen tekrar dene."
+        ),
+    )
+
+
+@app.route("/verify-email", methods=["POST"])
+@limiter.limit("10 per hour")
+def verify_email():
+    lang = _get_request_lang()
+    token = _email_action_token_from_json(request.get_json(silent=True))
+    if token is None:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired verification link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş doğrulama linki."
+            ),
+        }), 400
 
     user = User.query.filter_by(verification_token=token).first()
-    if not user:
-        return render_template(template, success=False,
-            message="Invalid or expired verification link." if lang == "en"
-            else "Geçersiz veya süresi dolmuş doğrulama linki.")
-
-    if not user.verification_sent_at:
-        return render_template(template, success=False,
-            message="Invalid verification link." if lang == "en"
-            else "Geçersiz doğrulama linki.")
+    if not user or not user.verification_sent_at:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired verification link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş doğrulama linki."
+            ),
+        }), 400
 
     elapsed = datetime.utcnow() - user.verification_sent_at
     if elapsed.total_seconds() > 86400:
-        return render_template(template, success=False,
-            message="Verification link has expired. Please request a new one." if lang == "en"
-            else "Doğrulama linkinin süresi dolmuş. Lütfen yeni link isteyin.")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Verification link has expired. Please request a new one."
+                if lang == "en"
+                else "Doğrulama linkinin süresi dolmuş. Lütfen yeni link isteyin."
+            ),
+        }), 410
 
     if user.is_verified:
-        return render_template(template, success=True,
-            message="Your email address is already verified." if lang == "en"
-            else "E-posta adresiniz zaten doğrulanmış.")
+        return jsonify({
+            "ok": True,
+            "message": (
+                "Your email address is already verified."
+                if lang == "en"
+                else "E-posta adresiniz zaten doğrulanmış."
+            ),
+        })
 
     user.is_verified = True
     user.verification_token = None
     db.session.commit()
 
     user_lang = getattr(user, "lang", "tr") or "tr"
-    # SMTP'yi bloklamadan arka planda gönder (register/forgot ile tutarlı).
-    gevent.spawn(mailer.send_welcome_email, user.email, user.username, lang=user_lang)
-
-    return render_template(template, success=True,
-        message="Your email has been verified! You can now add Steam accounts." if lang == "en"
-        else "E-posta adresiniz başarıyla doğrulandı! Artık Steam hesabı ekleyebilirsiniz.")
+    gevent.spawn(
+        mailer.send_welcome_email,
+        user.email,
+        user.username,
+        lang=user_lang,
+    )
+    return jsonify({
+        "ok": True,
+        "message": (
+            "Your email has been verified! You can now add Steam accounts."
+            if lang == "en"
+            else "E-posta adresiniz başarıyla doğrulandı! Artık Steam hesabı ekleyebilirsiniz."
+        ),
+    })
 
 
 @app.route("/resend-verification", methods=["POST"])
@@ -2868,41 +4181,93 @@ def forgot_password():
     return jsonify(_generic_msg)
 
 
-@app.route("/reset-password/<token>")
-def reset_password_page(token):
-    lang = request.args.get("lang", "tr")
-    if lang not in ("en", "tr"):
-        lang = "tr"
+@app.route("/reset-password", methods=["GET"])
+def reset_password_page():
+    lang = _get_request_lang()
+    g.referrer_policy = "no-referrer"
     template = "en/reset_password.html" if lang == "en" else "reset_password.html"
+    return render_template(template)
+
+
+@app.route("/reset-password/validate", methods=["POST"])
+@limiter.limit("10 per hour")
+def validate_reset_password_token():
+    lang = _get_request_lang()
+    token = _email_action_token_from_json(request.get_json(silent=True))
+    if token is None:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş link."
+            ),
+        }), 400
 
     user = User.query.filter_by(reset_token=token).first()
     if not user or not user.reset_token_expires:
-        return render_template(template, valid=False,
-            message="Invalid or expired link." if lang == "en" else "Geçersiz veya süresi dolmuş link.")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş link."
+            ),
+        }), 400
     if datetime.utcnow() > user.reset_token_expires:
-        return render_template(template, valid=False,
-            message="This link has expired. Please create a new request." if lang == "en"
-            else "Bu linkin süresi dolmuş. Lütfen yeni talep oluşturun.")
-    return render_template(template, valid=True, token=token)
+        return jsonify({
+            "ok": False,
+            "error": (
+                "This link has expired. Please create a new request."
+                if lang == "en"
+                else "Bu linkin süresi dolmuş. Lütfen yeni talep oluşturun."
+            ),
+        }), 410
+    return jsonify({"ok": True})
 
 
 @app.route("/reset-password", methods=["POST"])
 @limiter.limit("5 per hour")
 def reset_password():
-    data = request.json
-    token = data.get("token", "")
-    new_password = data.get("password", "")
+    lang = _get_request_lang()
+    data = request.get_json(silent=True)
+    token = _email_action_token_from_json(data)
+    new_password = data.get("password", "") if isinstance(data, dict) else ""
 
     if not token or not new_password:
-        return jsonify({"ok": False, "error": "Missing information."})
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Missing information."
+                if lang == "en"
+                else "Eksik bilgi gönderildi."
+            ),
+        }), 400
     if not is_strong_password(new_password):
-        return jsonify({"ok": False, "error": PASSWORD_POLICY_MSG_EN})
+        return jsonify({
+            "ok": False,
+            "error": (
+                PASSWORD_POLICY_MSG_EN
+                if lang == "en"
+                else PASSWORD_POLICY_MSG_TR
+            ),
+        }), 400
 
     user = User.query.filter_by(reset_token=token).first()
     if not user or not user.reset_token_expires:
-        return jsonify({"ok": False, "error": "Invalid link."})
+        return jsonify({
+            "ok": False,
+            "error": "Invalid link." if lang == "en" else "Geçersiz link.",
+        }), 400
     if datetime.utcnow() > user.reset_token_expires:
-        return jsonify({"ok": False, "error": "Link has expired."})
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Link has expired."
+                if lang == "en"
+                else "Linkin süresi dolmuş."
+            ),
+        }), 410
 
     user.set_password(new_password)
     user.reset_token = None
@@ -2910,7 +4275,14 @@ def reset_password():
     _invalidate_all_user_tokens(user)
     db.session.commit()
     logger.info("Sifre sifirlandi: %s", user.username)
-    return jsonify({"ok": True, "message": "Your password has been updated successfully."})
+    return jsonify({
+        "ok": True,
+        "message": (
+            "Your password has been updated successfully."
+            if lang == "en"
+            else "Şifreniz başarıyla güncellendi."
+        ),
+    })
 
 
 @app.route("/change-password", methods=["POST"])
@@ -3042,21 +4414,72 @@ def change_email():
     return jsonify({"ok": True, "message": f"A verification email has been sent to {new_email}."})
 
 
-@app.route("/confirm-email-change/<token>")
-def confirm_email_change(token):
-    lang = request.args.get("lang", "tr")
-    if lang not in ("en", "tr"):
-        lang = "tr"
+@app.route("/confirm-email-change", methods=["GET"])
+def confirm_email_change_page():
+    lang = _get_request_lang()
+    g.referrer_policy = "no-referrer"
     template = "en/verify_result.html" if lang == "en" else "verify_result.html"
+    return render_template(
+        template,
+        pending=True,
+        action_endpoint="/confirm-email-change",
+        pending_message=(
+            "Click the button below to confirm your new email address."
+            if lang == "en"
+            else "Yeni e-posta adresini onaylamak için aşağıdaki butona tıkla."
+        ),
+        action_label=(
+            "CONFIRM NEW EMAIL"
+            if lang == "en"
+            else "YENİ E-POSTAYI ONAYLA"
+        ),
+        invalid_message=(
+            "Invalid or expired link."
+            if lang == "en"
+            else "Geçersiz veya süresi dolmuş link."
+        ),
+        request_error=(
+            "Email change could not be completed. Please try again."
+            if lang == "en"
+            else "E-posta değişikliği tamamlanamadı. Lütfen tekrar dene."
+        ),
+    )
+
+
+@app.route("/confirm-email-change", methods=["POST"])
+@limiter.limit("10 per hour")
+def confirm_email_change():
+    lang = _get_request_lang()
+    token = _email_action_token_from_json(request.get_json(silent=True))
+    if token is None:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş link."
+            ),
+        }), 400
 
     user = User.query.filter_by(email_change_token=token).first()
     if not user or not user.email_change_expires:
-        return render_template(template, success=False,
-            message="Invalid or expired link." if lang == "en" else "Geçersiz veya süresi dolmuş link.")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "Invalid or expired link."
+                if lang == "en"
+                else "Geçersiz veya süresi dolmuş link."
+            ),
+        }), 400
     if datetime.utcnow() > user.email_change_expires:
-        return render_template(template, success=False,
-            message="This link has expired. Please create a new request." if lang == "en"
-            else "Bu linkin süresi dolmuş. Lütfen yeni talep oluşturun.")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "This link has expired. Please create a new request."
+                if lang == "en"
+                else "Bu linkin süresi dolmuş. Lütfen yeni talep oluşturun."
+            ),
+        }), 410
 
     # İstek ile onay arasında yeni e-posta başkası tarafından alınmış olabilir;
     # unique constraint'ten kaynaklı 500 yerine temiz hata döndür.
@@ -3069,9 +4492,14 @@ def confirm_email_change(token):
         user.email_change_new = None
         user.email_change_expires = None
         db.session.commit()
-        return render_template(template, success=False,
-            message="This email address is now in use by another account. Please try again." if lang == "en"
-            else "Bu e-posta adresi artık başka bir hesap tarafından kullanılıyor. Lütfen tekrar deneyin.")
+        return jsonify({
+            "ok": False,
+            "error": (
+                "This email address is now in use by another account. Please try again."
+                if lang == "en"
+                else "Bu e-posta adresi artık başka bir hesap tarafından kullanılıyor. Lütfen tekrar deneyin."
+            ),
+        }), 409
 
     user.email = user.email_change_new
     user.email_change_token = None
@@ -3079,9 +4507,14 @@ def confirm_email_change(token):
     user.email_change_expires = None
     db.session.commit()
     logger.info("E-posta degistirildi: %s", user.username)
-    return render_template(template, success=True,
-        message="Your email address has been updated successfully!" if lang == "en"
-        else "E-posta adresiniz başarıyla güncellendi!")
+    return jsonify({
+        "ok": True,
+        "message": (
+            "Your email address has been updated successfully!"
+            if lang == "en"
+            else "E-posta adresiniz başarıyla güncellendi!"
+        ),
+    })
 
 
 @app.route("/site_login", methods=["POST"])
@@ -3098,7 +4531,7 @@ def site_login():
         return jsonify({"ok": False, "error": "Too many failed attempts. Please wait 5 minutes."}), 429
 
     user = User.query.filter_by(username=u).first()
-    if not user or not user.check_password(p):
+    if not _login_password_matches(user, p):
         record_failed_login(ip_key)
         return jsonify({"ok": False, "error": "Invalid username or password."})
 
@@ -3267,16 +4700,34 @@ def plan_upgrade():
     if not g.user.is_admin:
         return jsonify({"ok": False, "error": "You need to make a payment to upgrade your plan."}), 403
 
-    plan = request.json.get("plan", "")
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+    plan = data.get("plan", "")
     if plan not in ("basic", "premium"):
         return jsonify({"ok": False, "error": "Invalid plan."})
 
-    user = g.user
-    if user.plan == plan:
-        return jsonify({"ok": False, "error": "You are already on this plan."})
+    user_id = g.user.id
+    db.session.rollback()
+    with _user_operation_lock(user_id):
+        user = db.session.get(User, user_id)
+        if user is None:
+            return jsonify({"ok": False, "error": "User not found."}), 404
+        if user.plan == plan:
+            return jsonify({"ok": False, "error": "You are already on this plan."})
 
-    _activate_plan(user, plan)
-    db.session.commit()
+        _activate_plan(user, plan)
+        db.session.commit()
+        quota_result = _reconcile_user_quota_locked(
+            user_id,
+            "admin_self_plan_upgrade",
+            enforce=True,
+        )
+        if not quota_result.get("ok"):
+            return jsonify({
+                "ok": False,
+                "error": "Plan changed, but active boost quota could not be reconciled.",
+            }), 503
     return jsonify({"ok": True, "plan": plan, "message": f"Switched to {plan.title()} plan!"})
 
 
@@ -3582,9 +5033,10 @@ def account_login():
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "Invalid request body."}), 400
     username = sanitize(data.get("username", ""), 100)
+    # Passwords are opaque user data. Saved-login behavior is selected only by
+    # the explicit use_credentials/use_token controls below, never by a magic
+    # password value or an empty-password fallback.
     password = data.get("password", "")
-    if password == "_use_saved_":
-        password = ""
     code = sanitize(data.get("code", ""), 10)
     code_type = data.get("code_type", "email")
     acct_id = data.get("acct_id")
@@ -3596,33 +5048,52 @@ def account_login():
     use_token = data.get("use_token", False)
     use_credentials = data.get("use_credentials", False)
 
-    user = g.user
-    limits = user.plan_limits()
+    user_id = g.user.id
 
     if not acct_id:
         if not username:
             return jsonify({"ok": False, "error": "Username is required."})
-        if not user.is_verified:
-            return jsonify({
-                "ok": False,
-                "error": "Please verify your email address before adding a Steam account.",
-                "need_verify": True,
-            })
-        current = SteamAccount.query.filter_by(user_id=user.id).count()
-        if current >= limits["max_accounts"]:
-            return jsonify({
-                "ok": False,
-                "error": f"Your plan supports a maximum of {limits['max_accounts']} accounts.",
-                "upgrade": True,
-            })
-        existing_acct = SteamAccount.query.filter_by(user_id=user.id, steam_username=username).first()
-        if existing_acct:
-            acct_id = existing_acct.id
-        else:
-            acct_id = secrets.token_hex(8)
-            new_acct = SteamAccount(id=acct_id, user_id=user.id, steam_username=username)
-            db.session.add(new_acct)
-            db.session.commit()
+        # login_required already holds this lock for non-admin users. Taking the
+        # re-entrant lock here also protects an admin adding their own account.
+        with _user_operation_lock(user_id):
+            db.session.expire_all()
+            locked_user = db.session.get(User, user_id)
+            if locked_user is None:
+                return jsonify({"ok": False, "error": "User not found."}), 401
+            if not locked_user.is_verified:
+                return jsonify({
+                    "ok": False,
+                    "error": "Please verify your email address before adding a Steam account.",
+                    "need_verify": True,
+                })
+
+            existing_accounts = SteamAccount.query.filter_by(user_id=user_id).all()
+            requested_username = username.casefold()
+            existing_acct = next(
+                (
+                    account for account in existing_accounts
+                    if account.steam_username.casefold() == requested_username
+                ),
+                None,
+            )
+            if existing_acct:
+                acct_id = existing_acct.id
+            else:
+                limits = locked_user.plan_limits()
+                if len(existing_accounts) >= limits["max_accounts"]:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"Your plan supports a maximum of {limits['max_accounts']} accounts.",
+                        "upgrade": True,
+                    })
+                acct_id = secrets.token_hex(8)
+                new_acct = SteamAccount(
+                    id=acct_id,
+                    user_id=user_id,
+                    steam_username=username,
+                )
+                db.session.add(new_acct)
+                db.session.commit()
 
     acct_db = db.session.get(SteamAccount, acct_id)
     if not acct_db:
@@ -3630,7 +5101,7 @@ def account_login():
         # must never create a DB row or choose a filesystem storage namespace.
         return jsonify({"ok": False, "error": "Account not found."}), 404
 
-    if acct_db.user_id != user.id:
+    if acct_db.user_id != user_id:
         return jsonify({"ok": False, "error": "Unauthorized."})
     if username and username.casefold() != acct_db.steam_username.casefold():
         return jsonify({
@@ -3663,7 +5134,7 @@ def account_login():
             else:
                 return jsonify({"ok": False, "error": str(result)})
 
-    if use_token or (not password and mgr.has_credentials()):
+    if use_token:
         result = mgr.login()
         if result == EResult.OK:
             try:
@@ -3754,6 +5225,11 @@ def remove_account():
                     not stop_result.get("remote_stop_confirmed", True)
                     or not stop_result.get("persisted")
                 ):
+                    _reconcile_user_quota_locked(
+                        user_id,
+                        "account_remove_stop_failed",
+                        enforce=True,
+                    )
                     return jsonify({
                         "ok": False,
                         "error": (
@@ -3763,6 +5239,11 @@ def remove_account():
                     }), 503
                 final_segment_recorded = bool(stop_result.get("stopped"))
             elif not _persist_pending_manager_segments(acct_id, user_id, manager):
+                _reconcile_user_quota_locked(
+                    user_id,
+                    "account_remove_pending_failed",
+                    enforce=True,
+                )
                 return jsonify({
                     "ok": False,
                     "error": (
@@ -3784,6 +5265,17 @@ def remove_account():
                 return jsonify({"ok": False, "error": "Account not found."}), 404
             steam_username = acct_db.steam_username
             app_ids = acct_db.app_ids()
+        quota_after_runtime_stop = _reconcile_user_quota_locked(
+            user_id,
+            "account_remove_runtime_stop",
+            enforce=True,
+        )
+        if not quota_after_runtime_stop.get("ok"):
+            logger.critical(
+                "quota.account_remove_reschedule_failed user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
         remove_legacy_machine_auth = not db.session.query(SteamAccount.id).filter(
             SteamAccount.id != acct_id,
             db.func.lower(SteamAccount.steam_username)
@@ -3928,7 +5420,45 @@ def remove_account():
             acct_id,
             final_segment_recorded,
         )
-        return jsonify({"ok": True, "cleanup_warning": not cleanup_ok})
+        quota_ok = False
+        try:
+            quota_result = _reconcile_user_quota_locked(
+                user_id,
+                "account_removed",
+                enforce=True,
+            )
+            quota_ok = bool(quota_result.get("ok"))
+        except Exception:
+            db.session.rollback()
+            logger.exception(
+                "quota.account_remove_post_commit_reconcile_failed "
+                "user_id=%s account_id=%s",
+                user_id,
+                acct_id,
+            )
+        if not quota_ok:
+            cleanup_ok = False
+            try:
+                _install_user_quota_watchdog(
+                    user_id,
+                    QUOTA_RECONCILE_RETRY_SECONDS,
+                    "reconcile_retry",
+                )
+            except Exception:
+                logger.critical(
+                    "quota.account_remove_post_commit_retry_failed "
+                    "user_id=%s account_id=%s",
+                    user_id,
+                    acct_id,
+                    exc_info=True,
+                )
+        payload = {
+            "ok": True,
+            "cleanup_warning": not cleanup_ok,
+        }
+        if not quota_ok:
+            payload["quota_warning"] = True
+        return jsonify(payload)
 
 
 # ───────────────────── Oyun Listesi ─────────────────────
@@ -4084,6 +5614,7 @@ def _stop_boost_session_and_persist(
     *,
     expected_session_id=None,
     expected_generation=None,
+    stopped_epoch=None,
 ):
     """Stop exactly one runtime session and durably finalize its open segment."""
     snapshot = manager.boost_snapshot()
@@ -4136,11 +5667,24 @@ def _stop_boost_session_and_persist(
             "remote_stop_confirmed": True,
         }
 
-    segment = manager.stop_boost_segment(
-        expected_session_id=expected_session_id,
-        expected_generation=expected_generation,
-        context="explicit stop",
-    )
+    if stopped_epoch is None:
+        segment = manager.stop_boost_segment(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            context="explicit stop",
+        )
+    else:
+        segment = manager.prepare_stop_boost_segment(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            stopped_at=stopped_epoch,
+            context="canonical deadline stop",
+        )
+        if segment is not None and not segment.get("local_stop_aborted"):
+            segment = manager.confirm_prepared_stop_segment(
+                segment,
+                context="canonical deadline stop",
+            )
     if segment is None:
         # A fatal-disconnect greenlet may have closed this exact run after the
         # caller snapshot but before this stop call.  Consume the segment it
@@ -4190,6 +5734,7 @@ def _stop_boost_session_and_persist(
 
 def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
     current = gevent.getcurrent()
+    should_reschedule_quota = False
     try:
         with app.app_context():
             owner_id = db.session.query(SteamAccount.user_id).filter_by(
@@ -4198,6 +5743,7 @@ def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
             db.session.rollback()
             if owner_id != user_id:
                 return
+            should_reschedule_quota = True
             with _user_operation_lock(user_id):
                 db.session.expire_all()
                 acct = db.session.get(SteamAccount, acct_id)
@@ -4246,6 +5792,26 @@ def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
             pass
         logger.exception("[acct:%s] Boost timer finalization hatasi", acct_id)
     finally:
+        if should_reschedule_quota:
+            try:
+                with app.app_context():
+                    with _user_operation_lock(user_id):
+                        db.session.expire_all()
+                        _reconcile_user_quota_locked(
+                            user_id,
+                            f"account_timer:{reason}",
+                            enforce=True,
+                        )
+            except Exception:
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                logger.exception(
+                    "quota.account_timer_reschedule_failed user_id=%s account_id=%s",
+                    user_id,
+                    acct_id,
+                )
         _discard_timer(acct_id, current)
 
 
@@ -4257,8 +5823,10 @@ def _schedule_boost_stop_timer(
     delay_seconds,
     reason,
 ):
+    delay_seconds = max(0.0, float(delay_seconds))
+    deadline_epoch = time.time() + delay_seconds
     timer = gevent.spawn_later(
-        max(0.0, float(delay_seconds)),
+        delay_seconds,
         _run_boost_stop_timer,
         acct_id,
         user_id,
@@ -4268,8 +5836,15 @@ def _schedule_boost_stop_timer(
     )
     try:
         _add_timer(acct_id, timer)
+        if reason == "user_timer":
+            _remember_account_user_timer_deadline(
+                acct_id,
+                session_id,
+                generation,
+                deadline_epoch,
+            )
     except Exception:
-        timer.kill()
+        _kill_greenlet_nonblocking(timer)
         raise
     return timer
 
@@ -4312,26 +5887,53 @@ def toggle_boost():
     manager = boost_service.get(acct_id)
     if not manager:
         return jsonify({"ok": False, "error": "Please connect to Steam first."})
-
-    with manager.state_lock:
+    # Close the ownership read transaction before an admin request waits for
+    # the same user lock. Normal users already hold this re-entrant lock through
+    # login_required; the explicit acquisition closes the admin race as well.
+    db.session.rollback()
+    with _user_operation_lock(user_id):
         db.session.expire_all()
+        locked_user = db.session.get(User, user_id)
         acct_db = db.session.get(SteamAccount, acct_id)
-        if acct_db is None or acct_db.user_id != user_id:
+        if (
+            locked_user is None
+            or acct_db is None
+            or acct_db.user_id != user_id
+        ):
             return jsonify({"ok": False, "error": "Account not found."}), 404
+        manager = boost_service.get(acct_id)
+        if manager is None:
+            return jsonify({
+                "ok": False,
+                "error": "Please connect to Steam first.",
+            })
 
-        current = manager.boost_snapshot()
         if action == "stop":
-            # Close the read transaction before yielding to Node IPC.
-            db.session.rollback()
-            _clear_timers(acct_id)
-            result = _stop_boost_session_and_persist(
-                acct_id,
-                user_id,
-                manager,
-                expected_session_id=current.get("session_id"),
-                expected_generation=current.get("generation"),
-            )
+            with manager.state_lock:
+                current = manager.boost_snapshot()
+                db.session.rollback()
+                _clear_timers(acct_id)
+                result = _stop_boost_session_and_persist(
+                    acct_id,
+                    user_id,
+                    manager,
+                    expected_session_id=current.get("session_id"),
+                    expected_generation=current.get("generation"),
+                )
             if not result.get("remote_stop_confirmed", True):
+                try:
+                    _install_user_quota_watchdog(
+                        user_id,
+                        QUOTA_RECONCILE_RETRY_SECONDS,
+                        "reconcile_retry",
+                    )
+                except Exception:
+                    logger.critical(
+                        "quota.manual_stop_retry_schedule_failed user_id=%s account_id=%s",
+                        user_id,
+                        acct_id,
+                        exc_info=True,
+                    )
                 return jsonify({
                     "ok": False,
                     "boosting": True,
@@ -4341,6 +5943,19 @@ def toggle_boost():
                     ),
                 }), 503
             if not result.get("persisted"):
+                try:
+                    _install_user_quota_watchdog(
+                        user_id,
+                        QUOTA_RECONCILE_RETRY_SECONDS,
+                        "reconcile_retry",
+                    )
+                except Exception:
+                    logger.critical(
+                        "quota.manual_stop_persist_retry_schedule_failed user_id=%s account_id=%s",
+                        user_id,
+                        acct_id,
+                        exc_info=True,
+                    )
                 return jsonify({
                     "ok": False,
                     "boosting": False,
@@ -4349,231 +5964,111 @@ def toggle_boost():
                         "Please retry."
                     ),
                 }), 503
+            quota_result = _reconcile_user_quota_locked(
+                user_id,
+                "manual_stop",
+                enforce=True,
+            )
+            if not quota_result.get("ok"):
+                logger.critical(
+                    "quota.manual_stop_reschedule_failed user_id=%s account_id=%s",
+                    user_id,
+                    acct_id,
+                )
             return jsonify({
                 "ok": True,
                 "boosting": False,
                 "steam_connected": manager.logged_in,
             })
 
-        if current.get("boosting"):
-            return jsonify({
-                "ok": True,
-                "boosting": True,
-                "start_time": current.get("start_time"),
-                "timer_hours": timer_hours if timer_hours > 0 else None,
-            })
-
-        pending_ok = _persist_pending_manager_segments(acct_id, user_id, manager)
-        if not pending_ok:
+        quota_ready = _reconcile_user_quota_locked(
+            user_id,
+            "pre_start",
+            enforce=True,
+        )
+        if not quota_ready.get("ok"):
             return jsonify({
                 "ok": False,
                 "boosting": False,
                 "error": (
-                    "Previous boost status could not be saved. "
-                    "Please retry before starting again."
+                    "Previous boost usage could not be reconciled safely. "
+                    "Please retry before starting."
                 ),
             }), 503
 
-        if not current.get("logged_in"):
-            return jsonify({
-                "ok": False,
-                "error": "Please connect to Steam first.",
-            })
-
-        ids = acct_db.app_ids()
-        if not ids:
-            return jsonify({"ok": False, "error": "Game list is empty."})
-
-        limits = g.user.plan_limits()
-        stop_candidates = []
-
-        daily_hours = limits.get("daily_hours")
-        if daily_hours is not None:
-            from sqlalchemy import func as sqlfunc
-            today_start = datetime.utcnow().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            used_seconds = (
-                db.session.query(sqlfunc.sum(BoostLog.duration_seconds))
-                .filter(
-                    BoostLog.user_id == user_id,
-                    BoostLog.started_at >= today_start,
-                )
-                .scalar() or 0
-            )
-            used_seconds += _get_active_seconds(user_id, today_start)
-            remaining_daily = daily_hours * 3600 - used_seconds
-            if remaining_daily <= 0:
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        f"You have reached your daily {daily_hours}-hour limit."
-                    ),
-                    "upgrade": True,
-                })
-            stop_candidates.append((remaining_daily, "daily_limit"))
-
-        total_hours = limits.get("total_hours")
-        if total_hours is not None:
-            from sqlalchemy import func as sqlfunc2
-            plan_start = (
-                g.user.plan_activated_at
-                if g.user.plan_activated_at
-                else datetime.utcnow() - timedelta(days=365)
-            )
-            used_total = (
-                db.session.query(sqlfunc2.sum(BoostLog.duration_seconds))
-                .filter(
-                    BoostLog.user_id == user_id,
-                    BoostLog.started_at >= plan_start,
-                )
-                .scalar() or 0
-            )
-            used_total += _get_active_seconds(user_id, plan_start)
-            remaining_total = total_hours * 3600 - used_total
-            if remaining_total <= 0:
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        f"You have used all {total_hours} hours in your plan."
-                    ),
-                    "upgrade": True,
-                })
-            stop_candidates.append((remaining_total, "total_limit"))
-
-        if timer_hours > 0:
-            stop_candidates.append((timer_hours * 3600, "user_timer"))
-
-        # No timer may exist until every quota check has passed.
-        persona_state = acct_db.persona_state
-        # All values needed by Steam are frozen. Do not hold a DB transaction
-        # across the yielding Node request.
-        db.session.rollback()
-        _clear_timers(acct_id)
-        try:
-            started = manager.start_boost(ids, persona_state)
-        except Exception as exc:
-            logger.error("[acct:%s] start_boost hatasi: %s", acct_id, exc)
-            _persist_stopped_boost_state(
-                acct_id,
-                user_id,
-                started_epoch=None,
-                stopped_epoch=time.time(),
-                duration_seconds=0,
-                app_ids=ids,
-            )
-            return jsonify({
-                "ok": False,
-                "error": "Steam connection lost. Please reconnect.",
-            })
-
-        try:
+        with manager.state_lock:
+            db.session.expire_all()
             acct_db = db.session.get(SteamAccount, acct_id)
-        except SQLAlchemyError as exc:
+            if acct_db is None or acct_db.user_id != user_id:
+                return jsonify({"ok": False, "error": "Account not found."}), 404
+
+            current = manager.boost_snapshot()
+            if current.get("boosting"):
+                return jsonify({
+                    "ok": True,
+                    "boosting": True,
+                    "start_time": current.get("start_time"),
+                    "timer_hours": timer_hours if timer_hours > 0 else None,
+                })
+            if not current.get("logged_in"):
+                return jsonify({
+                    "ok": False,
+                    "error": "Please connect to Steam first.",
+                })
+
+            quota_before = _quota_usage_snapshot(user_id)
+            if quota_before is None:
+                return jsonify({"ok": False, "error": "User not found."}), 404
+            if quota_before.get("quota_depleted"):
+                limits = quota_before["limits"]
+                if quota_before.get("exhaustion_reason") == "daily_limit":
+                    message = (
+                        f"You have reached your daily "
+                        f"{limits.get('daily_hours')}-hour limit."
+                    )
+                else:
+                    message = (
+                        f"You have used all {limits.get('total_hours')} "
+                        "hours in your plan."
+                    )
+                return jsonify({
+                    "ok": False,
+                    "error": message,
+                    "upgrade": True,
+                })
+
+            ids = acct_db.app_ids()
+            if not ids:
+                return jsonify({"ok": False, "error": "Game list is empty."})
+
+            persona_state = acct_db.persona_state
             db.session.rollback()
-            logger.error(
-                "[acct:%s] Start sonrasi DB refresh hatasi; Steam boost geri aliniyor: %s",
-                acct_id,
-                exc,
-            )
-            compensation = _stop_boost_session_and_persist(
-                acct_id,
-                user_id,
-                manager,
-                expected_session_id=started.get("session_id"),
-                expected_generation=started.get("generation"),
-            )
             _clear_timers(acct_id)
-            if not compensation.get("persisted"):
-                logger.critical(
-                    "[acct:%s] Start sirasinda hesap kayboldu ve DB uzlasmadi",
-                    acct_id,
-                )
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "Boost could not be saved, and Steam stop could not be "
-                    "confirmed. Reconnect and retry stopping."
-                    if not compensation.get("remote_stop_confirmed", True)
-                    else "Boost could not be saved and was stopped. Please retry."
-                ),
-            }), 503
-
-        if acct_db is None or acct_db.user_id != user_id:
-            compensation = _stop_boost_session_and_persist(
-                acct_id,
-                user_id,
-                manager,
-                expected_session_id=started.get("session_id"),
-                expected_generation=started.get("generation"),
-            )
-            _clear_timers(acct_id)
-            if not compensation.get("persisted"):
-                logger.critical(
-                    "[acct:%s] Start sirasinda hesap kayboldu ve DB uzlasmadi",
-                    acct_id,
-                )
-            return jsonify({
-                "ok": False,
-                "error": "Account changed while boost was starting.",
-            }), 409
-
-        stop_after = (
-            min(stop_candidates, key=lambda item: item[0])
-            if stop_candidates
-            else None
-        )
-        deadline_epoch = time.time() + stop_after[0] if stop_after else None
-        acct_db.is_boosting = True
-        acct_db.target_stop_time = (
-            datetime.utcfromtimestamp(deadline_epoch) if deadline_epoch else None
-        )
-        try:
-            db.session.commit()
-        except SQLAlchemyError as exc:
-            db.session.rollback()
-            logger.error(
-                "[acct:%s] Start DB commit hatasi; Steam boost geri aliniyor: %s",
-                acct_id,
-                exc,
-            )
-            compensation = _stop_boost_session_and_persist(
-                acct_id,
-                user_id,
-                manager,
-                expected_session_id=started.get("session_id"),
-                expected_generation=started.get("generation"),
-            )
-            _clear_timers(acct_id)
-            if not compensation.get("persisted"):
-                logger.critical(
-                    "[acct:%s] Start compensation sonrasi DB uzlasmadi",
-                    acct_id,
-                )
-            return jsonify({
-                "ok": False,
-                "error": (
-                    "Boost could not be saved, and Steam stop could not be "
-                    "confirmed. Reconnect and retry stopping."
-                    if not compensation.get("remote_stop_confirmed", True)
-                    else "Boost could not be saved and was stopped. Please retry."
-                ),
-            }), 503
-
-        if stop_after:
             try:
-                _schedule_boost_stop_timer(
+                started = manager.start_boost(ids, persona_state)
+            except Exception as exc:
+                logger.error("[acct:%s] start_boost hatasi: %s", acct_id, exc)
+                _persist_stopped_boost_state(
                     acct_id,
                     user_id,
-                    started.get("session_id"),
-                    started.get("generation"),
-                    max(0.0, deadline_epoch - time.time()),
-                    stop_after[1],
+                    started_epoch=None,
+                    stopped_epoch=time.time(),
+                    duration_seconds=0,
+                    app_ids=ids,
                 )
-            except Exception:
-                logger.exception(
-                    "[acct:%s] Timer olusturulamadi; boost fail-closed durduruluyor",
+                return jsonify({
+                    "ok": False,
+                    "error": "Steam connection lost. Please reconnect.",
+                })
+
+            try:
+                acct_db = db.session.get(SteamAccount, acct_id)
+            except SQLAlchemyError as exc:
+                db.session.rollback()
+                logger.error(
+                    "[acct:%s] Start sonrasi DB refresh hatasi; Steam boost geri aliniyor: %s",
                     acct_id,
+                    exc,
                 )
                 compensation = _stop_boost_session_and_persist(
                     acct_id,
@@ -4585,9 +6080,121 @@ def toggle_boost():
                 _clear_timers(acct_id)
                 if not compensation.get("persisted"):
                     logger.critical(
-                        "[acct:%s] Timer compensation sonrasi DB uzlasmadi",
+                        "[acct:%s] Start sirasinda DB uzlasmadi",
                         acct_id,
                     )
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "Boost could not be saved, and Steam stop could not be "
+                        "confirmed. Reconnect and retry stopping."
+                        if not compensation.get("remote_stop_confirmed", True)
+                        else "Boost could not be saved and was stopped. Please retry."
+                    ),
+                }), 503
+
+            if acct_db is None or acct_db.user_id != user_id:
+                compensation = _stop_boost_session_and_persist(
+                    acct_id,
+                    user_id,
+                    manager,
+                    expected_session_id=started.get("session_id"),
+                    expected_generation=started.get("generation"),
+                )
+                _clear_timers(acct_id)
+                if not compensation.get("persisted"):
+                    logger.critical(
+                        "[acct:%s] Start sirasinda hesap kayboldu ve DB uzlasmadi",
+                        acct_id,
+                    )
+                return jsonify({
+                    "ok": False,
+                    "error": "Account changed while boost was starting.",
+                }), 409
+
+            user_timer_deadline = (
+                time.time() + timer_hours * 3600.0
+                if timer_hours > 0
+                else None
+            )
+            quota_after_start = _quota_usage_snapshot(user_id)
+            quota_deadline = (
+                quota_after_start.get("quota_deadline_epoch")
+                if quota_after_start
+                else None
+            )
+            deadlines = [
+                deadline for deadline in (user_timer_deadline, quota_deadline)
+                if deadline is not None
+            ]
+            effective_deadline = min(deadlines) if deadlines else None
+            acct_db.is_boosting = True
+            acct_db.target_stop_time = (
+                datetime.utcfromtimestamp(effective_deadline)
+                if effective_deadline is not None
+                else None
+            )
+            try:
+                db.session.commit()
+            except SQLAlchemyError as exc:
+                db.session.rollback()
+                logger.error(
+                    "[acct:%s] Start DB commit hatasi; Steam boost geri aliniyor: %s",
+                    acct_id,
+                    exc,
+                )
+                compensation = _stop_boost_session_and_persist(
+                    acct_id,
+                    user_id,
+                    manager,
+                    expected_session_id=started.get("session_id"),
+                    expected_generation=started.get("generation"),
+                )
+                _clear_timers(acct_id)
+                if not compensation.get("persisted"):
+                    logger.critical(
+                        "[acct:%s] Start compensation sonrasi DB uzlasmadi",
+                        acct_id,
+                    )
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "Boost could not be saved, and Steam stop could not be "
+                        "confirmed. Reconnect and retry stopping."
+                        if not compensation.get("remote_stop_confirmed", True)
+                        else "Boost could not be saved and was stopped. Please retry."
+                    ),
+                }), 503
+
+        if user_timer_deadline is not None:
+            try:
+                _schedule_boost_stop_timer(
+                    acct_id,
+                    user_id,
+                    started.get("session_id"),
+                    started.get("generation"),
+                    max(0.0, user_timer_deadline - time.time()),
+                    "user_timer",
+                )
+            except Exception:
+                logger.exception(
+                    "[acct:%s] User timer olusturulamadi; boost durduruluyor",
+                    acct_id,
+                )
+                with manager.state_lock:
+                    compensation = _stop_boost_session_and_persist(
+                        acct_id,
+                        user_id,
+                        manager,
+                        expected_session_id=started.get("session_id"),
+                        expected_generation=started.get("generation"),
+                    )
+                _clear_timers(acct_id)
+                _reconcile_user_quota_locked(
+                    user_id,
+                    "user_timer_start_compensation",
+                    enforce=True,
+                )
                 return jsonify({
                     "ok": False,
                     "error": (
@@ -4598,11 +6205,146 @@ def toggle_boost():
                     ),
                 }), 503
 
+        quota_result = _reconcile_user_quota_locked(
+            user_id,
+            "start_committed",
+            enforce=True,
+        )
+        hard_fence = _active_user_quota_hard_fence(user_id)
+        if not quota_result.get("ok") or quota_result.get("quota_stopped"):
+            with manager.state_lock:
+                snapshot = manager.boost_snapshot()
+                if _same_boost_session(
+                    snapshot,
+                    session_id=started.get("session_id"),
+                    generation=started.get("generation"),
+                ):
+                    compensation = _stop_boost_session_and_persist(
+                        acct_id,
+                        user_id,
+                        manager,
+                        expected_session_id=started.get("session_id"),
+                        expected_generation=started.get("generation"),
+                        stopped_epoch=(
+                            hard_fence.get("deadline_epoch")
+                            if hard_fence is not None
+                            else None
+                        ),
+                    )
+                else:
+                    compensation = {"persisted": True, "remote_stop_confirmed": True}
+            _clear_timers(acct_id)
+            _reconcile_user_quota_locked(
+                user_id,
+                "quota_start_compensation",
+                enforce=True,
+            )
+            remote_stop_confirmed = compensation.get(
+                "remote_stop_confirmed",
+                True,
+            )
+            if (
+                not compensation.get("persisted")
+                or remote_stop_confirmed is not True
+            ):
+                logger.critical(
+                    "quota.start_compensation_incomplete user_id=%s "
+                    "account_id=%s persisted=%s remote_stop_confirmed=%s",
+                    user_id,
+                    acct_id,
+                    compensation.get("persisted"),
+                    remote_stop_confirmed,
+                )
+            if hard_fence is not None:
+                error_message = (
+                    "Your boost quota expired while Steam was responding, and "
+                    "the remote stop could not be confirmed. Reconnect and "
+                    "retry stopping."
+                    if remote_stop_confirmed is not True
+                    else "Your boost quota expired while Steam was responding; "
+                    "the new boost was stopped."
+                )
+                response_status = 409
+            else:
+                error_message = (
+                    "Boost quota could not be scheduled safely, and Steam "
+                    "stop could not be confirmed. Reconnect and retry stopping."
+                    if remote_stop_confirmed is not True
+                    else "Boost quota could not be scheduled safely; the new "
+                    "boost was stopped. Please retry."
+                )
+                response_status = 503
+            return jsonify({
+                "ok": False,
+                "boosting": remote_stop_confirmed is not True,
+                "error": error_message,
+            }), response_status
+
+        # A hard deadline can claim while this request is blocked in Steam
+        # IPC. The fence deliberately bypasses the user lock, so never return a
+        # stale success while that deadline owns the user's runtime boundary.
+        if hard_fence is not None:
+            with manager.state_lock:
+                snapshot = manager.boost_snapshot()
+                if _same_boost_session(
+                    snapshot,
+                    session_id=started.get("session_id"),
+                    generation=started.get("generation"),
+                ):
+                    compensation = _stop_boost_session_and_persist(
+                        acct_id,
+                        user_id,
+                        manager,
+                        expected_session_id=started.get("session_id"),
+                        expected_generation=started.get("generation"),
+                        stopped_epoch=hard_fence.get("deadline_epoch"),
+                    )
+                else:
+                    compensation = {
+                        "persisted": True,
+                        "remote_stop_confirmed": True,
+                    }
+            _clear_timers(acct_id)
+            remote_stop_confirmed = compensation.get(
+                "remote_stop_confirmed",
+                True,
+            )
+            if (
+                not compensation.get("persisted")
+                or remote_stop_confirmed is not True
+            ):
+                logger.critical(
+                    "quota.hard_fence_start_compensation_incomplete "
+                    "user_id=%s account_id=%s fence_generation=%s "
+                    "persisted=%s remote_stop_confirmed=%s",
+                    user_id,
+                    acct_id,
+                    hard_fence.get("generation"),
+                    compensation.get("persisted"),
+                    remote_stop_confirmed,
+                )
+            return jsonify({
+                "ok": False,
+                "boosting": remote_stop_confirmed is not True,
+                "error": (
+                    "Your boost quota expired while Steam was responding, and "
+                    "the remote stop could not be confirmed. Reconnect and "
+                    "retry stopping."
+                    if remote_stop_confirmed is not True
+                    else "Your boost quota expired while Steam was responding; "
+                    "the new boost was stopped."
+                ),
+            }), 409
+
         return jsonify({
             "ok": True,
             "boosting": True,
             "start_time": started.get("start_time"),
             "timer_hours": timer_hours if timer_hours > 0 else None,
+            "quota_active_accounts": quota_result.get("active_count"),
+            "quota_estimated_wall_seconds": quota_result.get(
+                "estimated_wall_seconds"
+            ),
         })
 
 # ───────────────────── İstatistikler ─────────────────────
@@ -4612,12 +6354,13 @@ def toggle_boost():
 def my_stats():
     from sqlalchemy import func
     user = g.user
+    now_utc = datetime.utcnow()
     total_seconds = (
         db.session.query(func.sum(BoostLog.duration_seconds))
         .filter_by(user_id=user.id).scalar() or 0
     )
     total_sessions = BoostLog.query.filter_by(user_id=user.id).count()
-    week_ago = datetime.utcnow() - timedelta(days=7)
+    week_ago = now_utc - timedelta(days=7)
     daily = (
         db.session.query(
             func.date(BoostLog.started_at).label("day"),
@@ -4627,19 +6370,23 @@ def my_stats():
         .group_by(func.date(BoostLog.started_at))
         .all()
     )
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    today_seconds = (
-        db.session.query(func.sum(BoostLog.duration_seconds))
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at >= today_start)
-        .scalar() or 0
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_seconds = _get_logged_seconds(
+        user.id,
+        today_start,
+        now_utc,
     )
     today_seconds += _get_active_seconds(user.id, today_start)
     
-    plan_start = user.plan_activated_at if user.plan_activated_at else datetime.utcnow() - timedelta(days=365)
-    plan_used_seconds = (
-        db.session.query(func.sum(BoostLog.duration_seconds))
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at >= plan_start)
-        .scalar() or 0
+    plan_start = (
+        user.plan_activated_at
+        or user.created_at
+        or datetime(1970, 1, 1)
+    )
+    plan_used_seconds = _get_logged_seconds(
+        user.id,
+        plan_start,
+        now_utc,
     )
     plan_used_seconds += _get_active_seconds(user.id, plan_start)
     
@@ -4784,10 +6531,10 @@ def stats_detailed():
     total_sessions = BoostLog.query.filter_by(user_id=user.id).count()
 
     today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_seconds = (
-        db.session.query(func.sum(BoostLog.duration_seconds))
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at >= today_start)
-        .scalar() or 0
+    today_seconds = _get_logged_seconds(
+        user.id,
+        today_start,
+        now_utc,
     )
     today_seconds += _get_active_seconds(user.id, today_start)
 
@@ -4903,10 +6650,33 @@ def game_search():
 @app.route("/game_info", methods=["POST"])
 @limiter.limit("30 per minute")
 def game_info():
-    app_ids = request.json.get("app_ids", [])
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
+
+    raw_app_ids = data.get("app_ids")
+    if not isinstance(raw_app_ids, list):
+        return jsonify({"ok": False, "error": "app_ids must be a list."}), 400
+
+    app_ids = []
+    for raw_app_id in raw_app_ids[:15]:
+        if type(raw_app_id) is int:
+            app_id = raw_app_id
+        elif (
+            isinstance(raw_app_id, str)
+            and re.fullmatch(r"[0-9]{1,10}", raw_app_id)
+        ):
+            app_id = int(raw_app_id)
+        else:
+            return jsonify({"ok": False, "error": "Invalid app id."}), 400
+
+        if not 1 <= app_id <= (2 ** 32 - 1):
+            return jsonify({"ok": False, "error": "Invalid app id."}), 400
+        app_ids.append(app_id)
+
     results = {}
     now = time.time()
-    for aid in app_ids[:15]:
+    for aid in app_ids:
         with game_cache_lock:
             cached = game_cache.get(aid)
         if cached and (now - cached["ts"]) < Config.STEAM_CACHE_TTL:
@@ -5050,32 +6820,96 @@ def admin_users():
 
 @app.route("/admin/users/update", methods=["POST"])
 @login_required
+@target_user_operation_locked
 def admin_update_user():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
-    target_id = data.get("user_id")
-    user = db.session.get(User, target_id)
-    if not user:
-        return jsonify({"ok": False, "error": "User not found."})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "A JSON object is required.",
+        }), 400
 
-    if "plan" in data:
-        if data["plan"] not in ("free", "basic", "premium"):
-            return jsonify({"ok": False, "error": "Invalid plan."})
+    target_id = data.get("user_id")
+    if type(target_id) is not int or target_id <= 0:
+        return jsonify({
+            "ok": False,
+            "error": "A valid user_id is required.",
+        }), 400
+
+    has_plan_update = "plan" in data
+    has_admin_update = "is_admin" in data
+    if not has_plan_update and not has_admin_update:
+        return jsonify({
+            "ok": False,
+            "error": "No supported user update was provided.",
+        }), 400
+
+    if has_plan_update and data["plan"] not in ("free", "basic", "premium"):
+        return jsonify({"ok": False, "error": "Invalid plan."}), 400
+
+    if has_admin_update and type(data["is_admin"]) is not bool:
+        return jsonify({
+            "ok": False,
+            "error": "is_admin must be a boolean.",
+        }), 400
+
+    if (
+        has_admin_update
+        and target_id == g.user.id
+        and data["is_admin"] is False
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "You cannot remove your own admin privileges.",
+        }), 409
+
+    user = (
+        db.session.query(User)
+        .filter(User.id == target_id)
+        .with_for_update()
+        .first()
+    )
+    if not user:
+        return jsonify({"ok": False, "error": "User not found."}), 404
+
+    if has_plan_update:
         if data["plan"] != "free":
-            _activate_plan(user, data["plan"])
+            current_rank = _PLAN_RANK.get(user.plan, 0)
+            requested_rank = _PLAN_RANK[data["plan"]]
+            _activate_plan(
+                user,
+                data["plan"],
+                # A downgrade keeps the original paid usage window; resetting
+                # it would silently grant a fresh quota and defeat enforcement.
+                reset_usage_window=requested_rank > current_rank,
+            )
         else:
+            _cancel_user_quota_watchdog(user.id)
             user.plan = "free"
             user.plan_expires = None
             user.plan_activated_at = None
 
-    if "is_admin" in data:
-        if str(target_id) == str(g.user.id) and not data["is_admin"]:
-            return jsonify({"ok": False, "error": "You cannot remove your own admin privileges."})
+    if has_admin_update:
         user.is_admin = data["is_admin"]
 
     db.session.commit()
+    if has_plan_update:
+        quota_result = _reconcile_user_quota_locked(
+            target_id,
+            "admin_plan_update",
+            enforce=True,
+        )
+        if not quota_result.get("ok"):
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "Plan was updated, but active boost quota reconciliation "
+                    "requires a retry."
+                ),
+            }), 503
     return jsonify({"ok": True})
 
 
@@ -5189,6 +7023,7 @@ def admin_approve_payment():
     )
     user_id = user.id
     payment_id = payment.id
+    db.session.rollback()
     with _user_operation_lock(user_id):
         # The account may have been deleted while this admin request waited for
         # its operation lock. Re-read both rows and fail closed.
@@ -5237,6 +7072,18 @@ def admin_approve_payment():
             reason=reason,
         ))
         db.session.commit()
+        if plan_changed:
+            quota_result = _reconcile_user_quota_locked(
+                user_id,
+                "manual_payment_match",
+                enforce=True,
+            )
+            if not quota_result.get("ok"):
+                logger.critical(
+                    "quota.manual_match_reschedule_failed user_id=%s payment_id=%s",
+                    user_id,
+                    payment_id,
+                )
     logger.warning(
         "shopier.payment.manual_match payment_id=%s order_id=%s admin_id=%s",
         payment.id,
@@ -5686,6 +7533,7 @@ def admin_delete_user():
         db.session.commit()
         deletion_committed = True
         _plan_expiry_cache.pop(target_id, None)
+        _cancel_user_quota_watchdog(target_id)
 
         # External side effects happen only after the financial/user database
         # transaction is durable. The pre-commit rename above means secrets are
@@ -5947,7 +7795,7 @@ def _get_steam_profile(steam_id: str) -> dict:
 
 @app.route("/steam/login")
 def steam_login():
-    lang = request.args.get("lang", "tr")
+    lang = _get_request_lang()
     state = secrets.token_hex(16)
     session["steam_state"] = state
     return_to = f"{Config.SITE_URL}/steam/callback?lang={lang}&state={state}"
@@ -5957,7 +7805,7 @@ def steam_login():
 
 @app.route("/steam/callback")
 def steam_callback():
-    lang = request.args.get("lang", "tr")
+    lang = _get_request_lang()
     returned_state = request.args.get("state", "")
     expected_state = session.pop("steam_state", None)
 

@@ -16,9 +16,10 @@ from gevent import queue
 from gevent.lock import RLock
 from gevent import subprocess
 
+from log_security import protect_logger
 from steam_compat import EPersonaState, EResult
 
-logger = logging.getLogger(__name__)
+logger = protect_logger(logging.getLogger(__name__))
 
 BASE_DIR = os.path.dirname(__file__)
 STATE_DIR = os.path.abspath(os.environ.get("STEAM_STATE_DIR") or BASE_DIR)
@@ -1199,7 +1200,8 @@ class SteamAccountManager:
 
     @staticmethod
     def _invoke_fatal_disconnect_callback(segment):
-        if not segment or segment["elapsed"] <= 0:
+        # A zero-duration segment still has DB/timer reconciliation work.
+        if not segment:
             return
         callback = boost_service.fatal_disconnect_callback
         if callback is None:
@@ -1595,6 +1597,147 @@ class SteamAccountManager:
             logger.error("[%s] Credential login hatasi: %s", self.steam_username, e)
             return EResult.Fail
 
+    def _prepare_stop_boost_segment_unlocked(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        stopped_at=None,
+        context="explicit stop",
+    ):
+        if (
+            expected_session_id is not None
+            or expected_generation is not None
+        ) and not self._active_session_matches_unlocked(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+        ):
+            return None
+        if not self.boosting:
+            return None
+
+        started_at = self.start_time
+        if stopped_at is None:
+            stopped_at = time.time()
+        else:
+            stopped_at = float(stopped_at)
+            if not math.isfinite(stopped_at):
+                raise ValueError("stopped_at must be finite")
+        if started_at is not None:
+            stopped_at = max(float(started_at), stopped_at)
+        segment = {
+            "account_id": self.account_id,
+            "session_id": self.boost_session_id,
+            "generation": self.boost_generation,
+            "started_at": started_at,
+            "stopped_at": stopped_at,
+            "elapsed": max(0, stopped_at - started_at)
+            if started_at is not None
+            else 0,
+            "app_ids": list(self.app_ids),
+        }
+
+        # Write the recovery record before yielding to IPC.  A process kill
+        # between local invalidation and the Steam response must still leave
+        # enough information for the next process to finalize this segment.
+        segment["remote_stop_confirmed"] = False
+        if not self._remember_final_segment_unlocked(segment):
+            segment["local_stop_aborted"] = True
+            logger.critical(
+                "[%s] Boost stop aborted: pending state is not durable",
+                self.steam_username,
+            )
+            return self._copy_segment_unlocked(segment)
+        # Local state is closed before IPC. A synchronous disconnected event
+        # can therefore never observe boosting=True and schedule a new loop.
+        self._invalidate_boost_unlocked(force=True)
+        return self._copy_segment_unlocked(segment)
+
+    def prepare_stop_boost_segment(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        stopped_at=None,
+        context="explicit stop",
+    ):
+        """Durably close one local run without waiting for Steam IPC.
+
+        User-level quota enforcement prepares every account with the same
+        canonical ``stopped_at`` before any network request.  This bounds
+        aggregate usage even when one account's Node worker responds slowly.
+        The returned segment must subsequently be passed to
+        :meth:`confirm_prepared_stop_segment` and persisted by the caller.
+        """
+        with self.state_lock:
+            return self._prepare_stop_boost_segment_unlocked(
+                expected_session_id=expected_session_id,
+                expected_generation=expected_generation,
+                stopped_at=stopped_at,
+                context=context,
+            )
+
+    def _confirm_prepared_stop_segment_unlocked(
+        self,
+        segment,
+        *,
+        context="explicit stop",
+    ):
+        if not segment or segment.get("local_stop_aborted"):
+            return self._copy_segment_unlocked(segment) if segment else None
+
+        pending_match = None
+        for pending in self._pending_final_segments:
+            if (
+                pending.get("session_id") == segment.get("session_id")
+                and pending.get("generation") == segment.get("generation")
+                and pending.get("stopped_at") == segment.get("stopped_at")
+            ):
+                pending_match = pending
+                break
+        if pending_match is None:
+            # Another reconciliation path may have confirmed, committed, and
+            # acknowledged this exact run while a user-level hard fence was
+            # waiting on a different account's IPC. Treat that as idempotent
+            # success instead of emitting a false durability failure.
+            finalized_key = (
+                segment.get("session_id"),
+                segment.get("generation"),
+            )
+            if finalized_key in self._finalized_segment_keys:
+                completed = self._copy_segment_unlocked(segment)
+                completed["remote_stop_confirmed"] = True
+                completed["already_persisted"] = True
+                return completed
+            logger.critical(
+                "[%s] Prepared boost segment is not durable; remote stop skipped",
+                self.steam_username,
+            )
+            failed = self._copy_segment_unlocked(segment)
+            failed["remote_stop_confirmed"] = False
+            failed["local_stop_aborted"] = True
+            return failed
+
+        if pending_match.get("remote_stop_confirmed") is not True:
+            pending_match["remote_stop_confirmed"] = (
+                self._stop_remote_games_unlocked(context)
+            )
+            self._save_pending_final_segments_unlocked()
+        return self._copy_segment_unlocked(pending_match)
+
+    def confirm_prepared_stop_segment(
+        self,
+        segment,
+        *,
+        context="explicit stop",
+    ):
+        """Confirm Steam shutdown for a previously prepared final segment."""
+        with self.state_lock:
+            return self._confirm_prepared_stop_segment_unlocked(
+                segment,
+                context=context,
+            )
+
     def _stop_boost_session(
         self,
         *,
@@ -1603,60 +1746,17 @@ class SteamAccountManager:
         context="explicit stop",
     ):
         with self.state_lock:
-            if (
-                expected_session_id is not None
-                or expected_generation is not None
-            ) and not self._active_session_matches_unlocked(
+            segment = self._prepare_stop_boost_segment_unlocked(
                 expected_session_id=expected_session_id,
                 expected_generation=expected_generation,
-            ):
-                return None
-            if not self.boosting:
-                return None
-
-            stopped_at = time.time()
-            started_at = self.start_time
-            segment = {
-                "account_id": self.account_id,
-                "session_id": self.boost_session_id,
-                "generation": self.boost_generation,
-                "started_at": started_at,
-                "stopped_at": stopped_at,
-                "elapsed": max(0, stopped_at - started_at)
-                if started_at is not None
-                else 0,
-                "app_ids": list(self.app_ids),
-            }
-
-            # Write the recovery record before yielding to IPC.  A process kill
-            # between local invalidation and the Steam response must still leave
-            # enough information for the next process to finalize this segment.
-            segment["remote_stop_confirmed"] = False
-            if not self._remember_final_segment_unlocked(segment):
-                segment["local_stop_aborted"] = True
-                logger.critical(
-                    "[%s] Boost stop aborted: pending state is not durable",
-                    self.steam_username,
-                )
-                return self._copy_segment_unlocked(segment)
-            # Local state is closed before IPC. A synchronous disconnected event
-            # can therefore never observe boosting=True and schedule a new loop.
-            self._invalidate_boost_unlocked(force=True)
-            segment["remote_stop_confirmed"] = self._stop_remote_games_unlocked(
-                context
+                context=context,
             )
-            for pending in self._pending_final_segments:
-                if (
-                    pending.get("session_id") == segment.get("session_id")
-                    and pending.get("generation") == segment.get("generation")
-                    and pending.get("stopped_at") == segment.get("stopped_at")
-                ):
-                    pending["remote_stop_confirmed"] = segment[
-                        "remote_stop_confirmed"
-                    ]
-                    break
-            self._save_pending_final_segments_unlocked()
-            return self._copy_segment_unlocked(segment)
+            if segment is None or segment.get("local_stop_aborted"):
+                return segment
+            return self._confirm_prepared_stop_segment_unlocked(
+                segment,
+                context=context,
+            )
 
     def _finalize_fatal_session(self, expected_generation, reason):
         segment = self._stop_boost_session(

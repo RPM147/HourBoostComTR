@@ -3,6 +3,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 
 db = SQLAlchemy()
+PASSWORD_HASH_METHOD = "pbkdf2:sha256:600000"
 
 
 class User(db.Model):
@@ -48,7 +49,7 @@ class User(db.Model):
     )
 
     def set_password(self, pw):
-        self.password_hash = generate_password_hash(pw, method="pbkdf2:sha256:600000")
+        self.password_hash = generate_password_hash(pw, method=PASSWORD_HASH_METHOD)
 
     def check_password(self, pw):
         return check_password_hash(self.password_hash, pw)
@@ -147,6 +148,14 @@ class PaymentAuditLog(db.Model):
 
 class BoostLog(db.Model):
     __tablename__ = "boost_logs"
+    __table_args__ = (
+        db.Index(
+            "ix_boost_logs_user_window",
+            "user_id",
+            "stopped_at",
+            "started_at",
+        ),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     account_id = db.Column(db.String(32), db.ForeignKey("steam_accounts.id"))
