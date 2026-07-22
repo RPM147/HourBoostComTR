@@ -50,11 +50,31 @@ if os.name != "nt":
 WORKER_SCRIPT = os.path.join(BASE_DIR, "steam_worker.js")
 _FERNET = None
 _QUARANTINE_SUFFIX_RE = re.compile(r"\.delete-([0-9a-f]{32})$")
+MAX_PENDING_FINAL_SEGMENTS = 128
+MAX_PENDING_STATE_BYTES = 262144
+# Keep one slot for the terminal stop record. Checkpoints are recoverable only
+# if a later hard/manual stop can still append its final boundary.
+MAX_PENDING_CHECKPOINT_SEGMENTS = MAX_PENDING_FINAL_SEGMENTS - 1
+FATAL_FINALIZATION_RETRY_SECONDS = 2.0
 
 
 def _path_exists(path):
     """Like exists(), but also sees broken symlinks without following them."""
     return os.path.lexists(path)
+
+
+def _fsync_directory(path):
+    """Persist a directory entry update after an atomic replace/remove."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_account_id(account_id):
@@ -591,6 +611,14 @@ class SteamWorkerClient:
         self.steam_id = None
         self.refresh_token = None
         self._process = None
+        self._process_generation = 0
+        # A worker is detached from the request path before termination so a
+        # blocked IPC call is released immediately.  Keep an identity-safe
+        # reference until the OS confirms that process is dead; otherwise a
+        # second force_disconnect() could incorrectly report success while a
+        # stubborn old Steam session is still alive.
+        self._detached_processes = {}
+        self._process_lock = RLock()
         self._pending = {}
         self._handlers = defaultdict(list)
         self._reader_greenlet = None
@@ -616,46 +644,98 @@ class SteamWorkerClient:
                 logger.error("Steam worker event handler hatasi (%s): %s", event_name, e)
 
     def _ensure_process(self):
-        if self._closed:
-            return False
-        if self._process and self._process.poll() is None:
+        with self._process_lock:
+            if self._closed:
+                return False
+            for generation, process in list(self._detached_processes.items()):
+                if process.poll() is not None:
+                    self._detached_processes.pop(generation, None)
+            if self._detached_processes:
+                logger.error(
+                    "Steam worker baslatilamadi: onceki worker henuz sonlanmadi"
+                )
+                return False
+            if self._process and self._process.poll() is None:
+                return True
+
+            if not os.path.exists(WORKER_SCRIPT):
+                logger.error("Steam worker bulunamadi: %s", WORKER_SCRIPT)
+                return False
+
+            if self._process is not None:
+                self._fail_pending_generation_unlocked(
+                    self._process_generation,
+                    EResult.NoConnection,
+                )
+                self._process = None
+                self.connected = False
+                self.logged_in = False
+
+            try:
+                data_directory = _ensure_private_directory(
+                    self.data_directory,
+                    _node_account_data_root(),
+                )
+                env = os.environ.copy()
+                env["STEAM_WORKER_DATA_DIR"] = data_directory
+                process = subprocess.Popen(
+                    [_node_binary(), WORKER_SCRIPT],
+                    cwd=BASE_DIR,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception as e:
+                logger.error("Steam worker baslatilamadi: %s", e)
+                self._process = None
+                return False
+
+            self._process_generation += 1
+            generation = self._process_generation
+            self._process = process
+            self.connected = True
+            self._reader_greenlet = gevent.spawn(
+                self._read_stdout,
+                process,
+                generation,
+            )
+            self._stderr_greenlet = gevent.spawn(
+                self._read_stderr,
+                process,
+                generation,
+            )
             return True
 
-        if not os.path.exists(WORKER_SCRIPT):
-            logger.error("Steam worker bulunamadi: %s", WORKER_SCRIPT)
-            return False
+    @staticmethod
+    def _pending_parts(entry, default_generation):
+        if isinstance(entry, tuple) and len(entry) == 2:
+            return entry
+        # Compatibility for an in-memory entry created by older code/tests.
+        return default_generation, entry
 
-        try:
-            data_directory = _ensure_private_directory(
-                self.data_directory,
-                _node_account_data_root(),
+    def _fail_pending_generation_unlocked(self, generation, result):
+        response = {"ok": False, "eresult": int(result)}
+        for request_id, entry in list(self._pending.items()):
+            entry_generation, response_queue = self._pending_parts(
+                entry,
+                self._process_generation,
             )
-            env = os.environ.copy()
-            env["STEAM_WORKER_DATA_DIR"] = data_directory
-            self._process = subprocess.Popen(
-                [_node_binary(), WORKER_SCRIPT],
-                cwd=BASE_DIR,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except Exception as e:
-            logger.error("Steam worker baslatilamadi: %s", e)
-            self._process = None
-            return False
+            if entry_generation != generation:
+                continue
+            if self._pending.get(request_id) is entry:
+                self._pending.pop(request_id, None)
+            try:
+                response_queue.put_nowait(dict(response))
+            except Exception:
+                pass
 
-        self.connected = True
-        self._reader_greenlet = gevent.spawn(self._read_stdout)
-        self._stderr_greenlet = gevent.spawn(self._read_stderr)
-        return True
-
-    def _read_stdout(self):
+    def _read_stdout(self, process, generation):
         try:
-            while self._process and self._process.poll() is None:
-                line = self._process.stdout.readline()
+            while process.poll() is None:
+                line = process.stdout.readline()
                 if not line:
                     break
                 try:
@@ -663,58 +743,79 @@ class SteamWorkerClient:
                 except Exception:
                     logger.warning("Steam worker gecersiz cikti: %s", line.strip())
                     continue
-                self._handle_message(message)
+                self._handle_message(message, process, generation)
         except Exception as e:
             logger.error("Steam worker stdout okuma hatasi: %s", e)
         finally:
-            self.connected = False
-            self.logged_in = False
-            for response_queue in list(self._pending.values()):
-                response_queue.put({"ok": False, "eresult": int(EResult.NoConnection)})
-            self._pending.clear()
-            self._emit("disconnected")
+            with self._process_lock:
+                self._fail_pending_generation_unlocked(
+                    generation,
+                    EResult.NoConnection,
+                )
+                if (
+                    self._process is process
+                    and self._process_generation == generation
+                ):
+                    self._process = None
+                    self.connected = False
+                    self.logged_in = False
+                    # Serialize the process transition with event publication. A
+                    # replacement worker cannot be installed between these steps.
+                    self._emit("disconnected")
 
-    def _read_stderr(self):
+    def _read_stderr(self, process, generation):
         try:
-            while self._process and self._process.poll() is None:
-                line = self._process.stderr.readline()
+            while process.poll() is None:
+                line = process.stderr.readline()
                 if not line:
                     break
                 logger.info("Steam worker: %s", line.strip())
         except Exception:
             pass
 
-    def _handle_message(self, message):
-        if self._closed:
-            return
-        if message.get("refresh_token"):
-            self.refresh_token = message.get("refresh_token")
-        if message.get("steam_id"):
-            self.steam_id = message.get("steam_id")
+    def _handle_message(self, message, process, generation):
+        with self._process_lock:
+            if (
+                self._closed
+                or self._process is not process
+                or self._process_generation != generation
+            ):
+                return
+            if message.get("refresh_token"):
+                self.refresh_token = message.get("refresh_token")
+            if message.get("steam_id"):
+                self.steam_id = message.get("steam_id")
 
-        request_id = message.get("id")
-        if request_id and request_id in self._pending:
-            response_queue = self._pending.pop(request_id)
-            response_queue.put(message)
-            return
+            request_id = message.get("id")
+            entry = self._pending.get(request_id) if request_id else None
+            if entry is not None:
+                entry_generation, response_queue = self._pending_parts(
+                    entry,
+                    generation,
+                )
+                if entry_generation == generation:
+                    if self._pending.get(request_id) is entry:
+                        self._pending.pop(request_id, None)
+                    response_queue.put_nowait(message)
+                    return
 
-        event = message.get("event")
-        if event == "logged_on":
-            self.logged_in = True
-            self.connected = True
-            self._emit("logged_on")
-        elif event == "disconnected":
-            self.logged_in = False
-            self.connected = False
-            self._emit("disconnected")
-        elif event == "error":
-            self.logged_in = False
-            logger.warning("Steam worker event error: %s", message.get("message"))
+            event = message.get("event")
+            if event == "logged_on":
+                self.logged_in = True
+                self.connected = True
+                self._emit("logged_on")
+            elif event == "disconnected":
+                self.logged_in = False
+                self.connected = False
+                self._emit("disconnected")
+            elif event == "error":
+                self.logged_in = False
+                logger.warning("Steam worker event error: %s", message.get("message"))
 
     def _request(self, action, payload=None, timeout=60):
-        if self._closed:
-            return {"ok": False, "eresult": int(EResult.NoConnection)}
         if not self._ensure_process():
+            if self._closed:
+                return {"ok": False, "eresult": int(EResult.NoConnection)}
             return {"ok": False, "eresult": int(EResult.ServiceUnavailable)}
 
         request_id = uuid.uuid4().hex
@@ -723,20 +824,41 @@ class SteamWorkerClient:
             message.update(payload)
 
         response_queue = queue.Queue(maxsize=1)
-        self._pending[request_id] = response_queue
+        with self._process_lock:
+            if self._closed or self._process is None:
+                return {"ok": False, "eresult": int(EResult.NoConnection)}
+            process = self._process
+            generation = self._process_generation
+            if process.poll() is not None:
+                return {"ok": False, "eresult": int(EResult.NoConnection)}
+            entry = (generation, response_queue)
+            self._pending[request_id] = entry
 
         try:
-            self._process.stdin.write(json.dumps(message) + "\n")
-            self._process.stdin.flush()
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
         except Exception as e:
-            self._pending.pop(request_id, None)
+            with self._process_lock:
+                if self._pending.get(request_id) is entry:
+                    self._pending.pop(request_id, None)
             logger.error("Steam worker komut gonderme hatasi: %s", e)
             return {"ok": False, "eresult": int(EResult.NoConnection)}
 
         try:
-            return response_queue.get(timeout=timeout)
+            response = response_queue.get(timeout=timeout)
+            with self._process_lock:
+                if (
+                    self._process is not process
+                    or self._process_generation != generation
+                ):
+                    return {"ok": False, "eresult": int(EResult.NoConnection)}
+                response = dict(response)
+                response["_worker_generation"] = generation
+                return response
         except queue.Empty:
-            self._pending.pop(request_id, None)
+            with self._process_lock:
+                if self._pending.get(request_id) is entry:
+                    self._pending.pop(request_id, None)
             logger.error("Steam worker timeout: %s", action)
             return {"ok": False, "eresult": int(EResult.ServiceUnavailable)}
 
@@ -755,12 +877,22 @@ class SteamWorkerClient:
             timeout=90,
         )
 
+        response_generation = response.pop("_worker_generation", None)
         result = _safe_eresult(response.get("eresult"))
         if response.get("ok") and result == EResult.OK:
-            self.logged_in = True
-            self.connected = True
-            self.steam_id = response.get("steam_id") or self.steam_id
-            self.refresh_token = response.get("refresh_token") or self.refresh_token
+            with self._process_lock:
+                if (
+                    response_generation is None
+                    or self._process is None
+                    or self._process_generation != response_generation
+                ):
+                    return EResult.NoConnection
+                self.logged_in = True
+                self.connected = True
+                self.steam_id = response.get("steam_id") or self.steam_id
+                self.refresh_token = (
+                    response.get("refresh_token") or self.refresh_token
+                )
         return result
 
     def games_played(self, app_ids):
@@ -780,18 +912,25 @@ class SteamWorkerClient:
 
     def mark_closed(self):
         """Synchronously prevent any pending or future worker resurrection."""
-        if self._closed:
-            return
-        self._closed = True
-        self.connected = False
-        self.logged_in = False
-        response = {"ok": False, "eresult": int(EResult.NoConnection)}
-        for response_queue in list(self._pending.values()):
-            try:
-                response_queue.put_nowait(response)
-            except Exception:
-                pass
-        self._pending.clear()
+        with self._process_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.connected = False
+            self.logged_in = False
+            for request_id, entry in list(self._pending.items()):
+                _generation, response_queue = self._pending_parts(
+                    entry,
+                    self._process_generation,
+                )
+                if self._pending.get(request_id) is entry:
+                    self._pending.pop(request_id, None)
+                try:
+                    response_queue.put_nowait(
+                        {"ok": False, "eresult": int(EResult.NoConnection)}
+                    )
+                except Exception:
+                    pass
 
     def force_disconnect(self):
         """Terminate a bad worker without permanently closing this client.
@@ -801,27 +940,50 @@ class SteamWorkerClient:
         game state from surviving while still allowing an explicit later login
         to create a fresh worker process.
         """
-        process = self._process
-        if process and process.poll() is None:
+        with self._process_lock:
+            process = self._process
+            generation = self._process_generation
+            if process is not None:
+                # Detach before blocking on process shutdown. Only requests
+                # issued to this exact worker generation are failed; a fresh
+                # login may safely install the next generation concurrently.
+                self._process = None
+                self._detached_processes[generation] = process
+                self._fail_pending_generation_unlocked(
+                    generation,
+                    EResult.NoConnection,
+                )
+            self.connected = False
+            self.logged_in = False
+            detached = list(self._detached_processes.items())
+        for _detached_generation, detached_process in detached:
+            if detached_process.poll() is not None:
+                continue
             try:
-                process.terminate()
+                detached_process.terminate()
             except Exception:
                 pass
             try:
                 with gevent.Timeout(5, False):
-                    process.wait()
+                    detached_process.wait()
             except Exception:
                 pass
             try:
-                if process.poll() is None:
-                    process.kill()
+                if detached_process.poll() is None:
+                    detached_process.kill()
                     with gevent.Timeout(2, False):
-                        process.wait()
+                        detached_process.wait()
             except Exception:
                 pass
-        self.connected = False
-        self.logged_in = False
-        stopped = process is None or process.poll() is not None
+        with self._process_lock:
+            for detached_generation, detached_process in detached:
+                if (
+                    self._detached_processes.get(detached_generation)
+                    is detached_process
+                    and detached_process.poll() is not None
+                ):
+                    self._detached_processes.pop(detached_generation, None)
+            stopped = not self._detached_processes
         if not stopped:
             logger.critical("Steam worker could not be terminated fail-closed")
         return stopped
@@ -829,32 +991,51 @@ class SteamWorkerClient:
     def disconnect(self, permanent=False):
         if permanent:
             self.mark_closed()
-        if not self._process:
-            self.connected = False
-            self.logged_in = False
+            self.force_disconnect()
             return
+        with self._process_lock:
+            process = self._process
+            generation = self._process_generation
+            if process is None:
+                self.connected = False
+                self.logged_in = False
+                return
         if not permanent:
             try:
                 self._request("disconnect", timeout=5)
             except Exception:
                 pass
+        with self._process_lock:
+            if (
+                self._process is process
+                and self._process_generation == generation
+            ):
+                self._process = None
+                self._fail_pending_generation_unlocked(
+                    generation,
+                    EResult.NoConnection,
+                )
+                self.connected = False
+                self.logged_in = False
         try:
-            if self._process.poll() is None:
-                self._process.terminate()
+            if process.poll() is None:
+                process.terminate()
                 with gevent.Timeout(5, False):
-                    self._process.wait()
-            if self._process.poll() is None:
-                self._process.kill()
+                    process.wait()
+            if process.poll() is None:
+                process.kill()
         except Exception:
             pass
-        self.connected = False
-        self.logged_in = False
 
 
 def _make_client(account_id):
     client = SteamWorkerClient(_node_account_data_dir(account_id))
     client.set_credential_location(SENTRY_DIR)
     return client
+
+
+class QuotaFenceActiveError(RuntimeError):
+    """A hard quota cutoff crossed an in-flight Steam boost operation."""
 
 
 class SteamAccountManager:
@@ -866,10 +1047,23 @@ class SteamAccountManager:
         # this gevent-aware lock. It is public so route/timer/checkpoint code can
         # take one coherent snapshot instead of racing individual attributes.
         self.state_lock = RLock()
+        # The hard quota fence must remain operable while state_lock is held by
+        # a slow Node IPC request. Pending-segment storage therefore has its own
+        # lock, and quota operation admission has a separate linearization lock.
+        # Lock order is state_lock -> quota_fence_lock -> pending_lock. The
+        # emergency path never acquires state_lock and never holds pending_lock
+        # while terminating a worker.
+        self._quota_fence_lock = RLock()
+        self._pending_lock = RLock()
+        self._quota_fence_serial = 0
+        self._active_quota_fences = set()
+        self._boost_operations_inflight = 0
+        self._fenced_session_keys = set()
         self.logged_in = False
         self.boosting = False
         self.start_time = None
         self.original_start_time = None
+        self._runtime_stop_deadline = None
         self.app_ids = []
         self.persona_state = 1
         self.boost_session_id = None
@@ -882,6 +1076,47 @@ class SteamAccountManager:
         self._connection_event_generation = 0
         self._removed = False
         self._setup_events()
+
+    def _begin_boost_operation_unlocked(self, session_key=None):
+        """Admit one start/resume against the current quota-fence epoch."""
+        with self._quota_fence_lock:
+            if (
+                self._active_quota_fences
+                or (
+                    session_key is not None
+                    and session_key in self._fenced_session_keys
+                )
+            ):
+                return None
+            serial = self._quota_fence_serial
+            self._boost_operations_inflight += 1
+            return serial
+
+    def _end_boost_operation(self):
+        with self._quota_fence_lock:
+            self._boost_operations_inflight = max(
+                0,
+                self._boost_operations_inflight - 1,
+            )
+
+    def _quota_fence_crossed(self, serial, session_key=None):
+        with self._quota_fence_lock:
+            return bool(
+                serial != self._quota_fence_serial
+                or self._active_quota_fences
+                or (
+                    session_key is not None
+                    and session_key in self._fenced_session_keys
+                )
+            )
+
+    def release_quota_fence(self, fence_token):
+        """Release only the exact app-level fence; its serial stays monotonic."""
+        with self._quota_fence_lock:
+            if fence_token not in self._active_quota_fences:
+                return False
+            self._active_quota_fences.remove(fence_token)
+            return True
 
     def _active_session_matches_unlocked(
         self,
@@ -903,25 +1138,56 @@ class SteamAccountManager:
         return True
 
     def _snapshot_unlocked(self):
+        with self._pending_lock:
+            pending_segments = [
+                self._copy_segment_unlocked(segment)
+                for segment in self._pending_final_segments
+            ]
         return {
             "boosting": self.boosting,
             "session_id": self.boost_session_id,
             "generation": self.boost_generation,
             "start_time": self.start_time,
             "original_start_time": self.original_start_time,
+            "runtime_stop_deadline": self._runtime_stop_deadline,
             "app_ids": list(self.app_ids),
             "persona_state": self.persona_state,
             "logged_in": self.logged_in,
-            "pending_final_segments": [
-                self._copy_segment_unlocked(segment)
-                for segment in self._pending_final_segments
-            ],
+            "pending_final_segments": pending_segments,
         }
 
     def boost_snapshot(self):
         """Return one internally consistent copy of the account runtime state."""
         with self.state_lock:
             return self._snapshot_unlocked()
+
+    def set_runtime_stop_deadline(
+        self,
+        deadline_epoch,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+    ):
+        """Publish the current session's absolute billable stop boundary.
+
+        The application scheduler owns the deadline calculation. Keeping the
+        resulting boundary beside the live run makes fatal reconnect, manual
+        stop, checkpoint and shutdown all create the same crash-durable segment
+        even when the watchdog greenlet itself is scheduled late.
+        """
+        if deadline_epoch is not None:
+            deadline_epoch = float(deadline_epoch)
+            if not math.isfinite(deadline_epoch):
+                raise ValueError("runtime stop deadline must be finite")
+        with self.state_lock:
+            if not self._active_session_matches_unlocked(
+                expected_session_id=expected_session_id,
+                expected_generation=expected_generation,
+            ):
+                return False
+            with self._quota_fence_lock:
+                self._runtime_stop_deadline = deadline_epoch
+            return True
 
     @staticmethod
     def _copy_segment_unlocked(segment):
@@ -943,11 +1209,17 @@ class SteamAccountManager:
             return []
         try:
             file_stat = os.lstat(path)
-            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > 262144:
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_size > MAX_PENDING_STATE_BYTES
+            ):
                 raise ValueError("Invalid pending segment state file")
             with open(path, "r", encoding="utf-8") as handle:
                 raw_segments = json.load(handle)
-            if not isinstance(raw_segments, list) or len(raw_segments) > 128:
+            if (
+                not isinstance(raw_segments, list)
+                or len(raw_segments) > MAX_PENDING_FINAL_SEGMENTS
+            ):
                 raise ValueError("Invalid pending segment state payload")
 
             segments = []
@@ -960,6 +1232,13 @@ class SteamAccountManager:
                 stopped_at = float(raw.get("stopped_at"))
                 app_ids = raw.get("app_ids")
                 remote_confirmed = raw.get("remote_stop_confirmed")
+                checkpoint_only = raw.get("checkpoint_only", False)
+                raw_remote_stopped_at = raw.get("remote_stopped_at")
+                remote_stopped_at = (
+                    None
+                    if raw_remote_stopped_at is None
+                    else float(raw_remote_stopped_at)
+                )
                 if (
                     raw.get("account_id") != self.account_id
                     or not isinstance(session_id, str)
@@ -973,6 +1252,11 @@ class SteamAccountManager:
                     or len(app_ids) > 64
                     or any(type(app_id) is not int or app_id <= 0 for app_id in app_ids)
                     or type(remote_confirmed) is not bool
+                    or type(checkpoint_only) is not bool
+                    or (
+                        remote_stopped_at is not None
+                        and not math.isfinite(remote_stopped_at)
+                    )
                 ):
                     raise ValueError("Invalid pending segment fields")
                 segments.append({
@@ -984,6 +1268,8 @@ class SteamAccountManager:
                     "elapsed": max(0, stopped_at - started_at),
                     "app_ids": list(app_ids),
                     "remote_stop_confirmed": remote_confirmed,
+                    "remote_stopped_at": remote_stopped_at,
+                    "checkpoint_only": checkpoint_only,
                 })
             return segments
         except Exception as exc:
@@ -1003,64 +1289,69 @@ class SteamAccountManager:
                 "elapsed": 0.0,
                 "app_ids": [],
                 "remote_stop_confirmed": False,
+                "remote_stopped_at": None,
+                "checkpoint_only": False,
                 "state_corrupt": True,
             }]
 
     def _save_pending_final_segments_unlocked(self):
-        path = _pending_final_segments_path(self.account_id)
-        if not self._pending_final_segments:
+        with self._pending_lock:
+            path = _pending_final_segments_path(self.account_id)
+            if not self._pending_final_segments:
+                try:
+                    if _path_exists(path):
+                        _remove_artifact(path)
+                        _fsync_directory(os.path.dirname(path))
+                    return True
+                except Exception as exc:
+                    logger.critical(
+                        "[%s] Pending boost state cleanup failed: %s",
+                        self.steam_username,
+                        type(exc).__name__,
+                    )
+                    return False
+
             try:
-                if _path_exists(path):
-                    _remove_artifact(path)
+                account_dir = _ensure_private_directory(
+                    _node_account_data_dir(self.account_id),
+                    _node_account_data_root(),
+                )
+                temporary = _contained_path(
+                    account_dir,
+                    f"pending-final-segments.json.tmp-{uuid.uuid4().hex}",
+                )
+                try:
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    descriptor = os.open(temporary, flags, 0o600)
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            self._pending_final_segments,
+                            handle,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, path)
+                    if os.name != "nt":
+                        os.chmod(path, 0o600)
+                    _fsync_directory(account_dir)
+                finally:
+                    if _path_exists(temporary):
+                        _remove_artifact(temporary)
                 return True
             except Exception as exc:
                 logger.critical(
-                    "[%s] Pending boost state cleanup failed: %s",
+                    "[%s] Pending boost state persistence failed: %s",
                     self.steam_username,
                     type(exc).__name__,
                 )
                 return False
 
-        try:
-            account_dir = _ensure_private_directory(
-                _node_account_data_dir(self.account_id),
-                _node_account_data_root(),
-            )
-            temporary = _contained_path(
-                account_dir,
-                f"pending-final-segments.json.tmp-{uuid.uuid4().hex}",
-            )
-            try:
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                descriptor = os.open(temporary, flags, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(
-                        self._pending_final_segments,
-                        handle,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, path)
-                if os.name != "nt":
-                    os.chmod(path, 0o600)
-            finally:
-                if _path_exists(temporary):
-                    _remove_artifact(temporary)
-            return True
-        except Exception as exc:
-            logger.critical(
-                "[%s] Pending boost state persistence failed: %s",
-                self.steam_username,
-                type(exc).__name__,
-            )
-            return False
-
     def pending_final_segments(self, *, session_id=None, generation=None):
-        with self.state_lock:
+        with self._pending_lock:
             return [
                 self._copy_segment_unlocked(segment)
                 for segment in self._pending_final_segments
@@ -1077,26 +1368,81 @@ class SteamAccountManager:
             return False
         session_id = segment.get("session_id")
         generation = segment.get("generation")
+        started_at = segment.get("started_at")
         stopped_at = segment.get("stopped_at")
-        with self.state_lock:
-            removed = False
+        checkpoint_only = bool(segment.get("checkpoint_only"))
+        with self.state_lock, self._pending_lock:
+            removed_segment = None
+            removed_index = None
             for index, pending in enumerate(list(self._pending_final_segments)):
                 if (
                     pending.get("session_id") == session_id
                     and pending.get("generation") == generation
+                    and pending.get("started_at") == started_at
                     and pending.get("stopped_at") == stopped_at
+                    and bool(pending.get("checkpoint_only")) == checkpoint_only
                 ):
-                    del self._pending_final_segments[index]
-                    removed = True
+                    removed_segment = self._pending_final_segments.pop(index)
+                    removed_index = index
                     break
-            key = (session_id, generation)
-            if key not in self._finalized_segment_keys:
-                self._finalized_segment_keys.append(key)
-                if len(self._finalized_segment_keys) > 128:
-                    del self._finalized_segment_keys[:-128]
-            if removed:
-                self._save_pending_final_segments_unlocked()
-            return removed
+            if removed_segment is not None and not self._save_pending_final_segments_unlocked():
+                self._pending_final_segments.insert(removed_index, removed_segment)
+                return False
+            if (
+                removed_segment is not None
+                and not removed_segment.get("checkpoint_only")
+            ):
+                key = (session_id, generation)
+                if key not in self._finalized_segment_keys:
+                    self._finalized_segment_keys.append(key)
+                    if len(self._finalized_segment_keys) > 128:
+                        del self._finalized_segment_keys[:-128]
+            return removed_segment is not None
+
+    def cap_final_segment_stopped_at(self, segment, maximum_stopped_at):
+        """Durably reduce a final segment to an absolute billing boundary.
+
+        This is a defensive bridge for a stop that was prepared before the
+        application could publish the session deadline. The pending identity is
+        rewritten before any DB commit, so a crash between commit and ACK cannot
+        later replay the uncapped interval.
+        """
+        if not segment:
+            return None
+        maximum_stopped_at = float(maximum_stopped_at)
+        if not math.isfinite(maximum_stopped_at):
+            raise ValueError("maximum_stopped_at must be finite")
+        with self.state_lock, self._pending_lock:
+            pending = self._find_pending_segment_unlocked(segment)
+            target = (
+                pending
+                if pending is not None
+                else self._copy_segment_unlocked(segment)
+            )
+            try:
+                current_stopped_at = float(target.get("stopped_at"))
+            except (TypeError, ValueError):
+                return None
+            capped_stopped_at = min(current_stopped_at, maximum_stopped_at)
+            started_at = target.get("started_at")
+            if started_at is not None:
+                started_at = float(started_at)
+                capped_stopped_at = max(started_at, capped_stopped_at)
+            if capped_stopped_at >= current_stopped_at:
+                return self._copy_segment_unlocked(target)
+
+            previous_elapsed = target.get("elapsed")
+            target["stopped_at"] = capped_stopped_at
+            target["elapsed"] = (
+                max(0.0, capped_stopped_at - started_at)
+                if started_at is not None
+                else 0.0
+            )
+            if pending is not None and not self._save_pending_final_segments_unlocked():
+                target["stopped_at"] = current_stopped_at
+                target["elapsed"] = previous_elapsed
+                return None
+            return self._copy_segment_unlocked(target)
 
     def was_final_segment_persisted(self, *, session_id=None, generation=None):
         if session_id is None and generation is None:
@@ -1120,55 +1466,112 @@ class SteamAccountManager:
         if not segment:
             return None
         with self.state_lock:
-            for pending in self._pending_final_segments:
-                if (
-                    pending.get("session_id") == segment.get("session_id")
-                    and pending.get("generation") == segment.get("generation")
-                    and pending.get("stopped_at") == segment.get("stopped_at")
-                ):
-                    if pending.get("remote_stop_confirmed") is not True:
-                        if pending.get("state_corrupt"):
-                            return self._copy_segment_unlocked(pending)
-                        pending["remote_stop_confirmed"] = (
-                            self._stop_remote_games_unlocked(context)
-                        )
-                        self._save_pending_final_segments_unlocked()
+            with self._pending_lock:
+                pending = self._find_pending_segment_unlocked(segment)
+                if pending is None:
+                    return None
+                if pending.get("state_corrupt"):
                     return self._copy_segment_unlocked(pending)
+                if pending.get("remote_stop_confirmed") is True:
+                    return self._copy_segment_unlocked(pending)
+            confirmed = self._stop_remote_games_unlocked(context)
+            remote_stopped_at = time.time() if confirmed else None
+            return self._record_pending_remote_stop_result(
+                segment,
+                confirmed=confirmed,
+                remote_stopped_at=remote_stopped_at,
+            )
         return None
 
-    def _remember_final_segment_unlocked(self, segment):
+    def _find_pending_segment_unlocked(self, segment):
         for pending in self._pending_final_segments:
             if (
                 pending.get("session_id") == segment.get("session_id")
                 and pending.get("generation") == segment.get("generation")
+                and pending.get("started_at") == segment.get("started_at")
                 and pending.get("stopped_at") == segment.get("stopped_at")
+                and bool(pending.get("checkpoint_only"))
+                == bool(segment.get("checkpoint_only"))
             ):
+                return pending
+        return None
+
+    def _record_pending_remote_stop_result(
+        self,
+        segment,
+        *,
+        confirmed,
+        remote_stopped_at=None,
+    ):
+        """Update a pending segment without exposing an undurable success."""
+        with self._pending_lock:
+            pending = self._find_pending_segment_unlocked(segment)
+            if pending is None:
+                return None
+            if not confirmed:
+                return self._copy_segment_unlocked(pending)
+
+            previous_confirmed = pending.get("remote_stop_confirmed")
+            previous_remote_stopped_at = pending.get("remote_stopped_at")
+            pending["remote_stop_confirmed"] = True
+            if previous_remote_stopped_at is None and remote_stopped_at is not None:
+                pending["remote_stopped_at"] = float(remote_stopped_at)
+            if not self._save_pending_final_segments_unlocked():
+                pending["remote_stop_confirmed"] = previous_confirmed
+                pending["remote_stopped_at"] = previous_remote_stopped_at
+            return self._copy_segment_unlocked(pending)
+
+    def _remember_final_segment_unlocked(self, segment):
+        with self._pending_lock:
+            if self._find_pending_segment_unlocked(segment) is not None:
                 return True
-        self._pending_final_segments.append(self._copy_segment_unlocked(segment))
-        if self._save_pending_final_segments_unlocked():
-            return True
-        self._pending_final_segments.pop()
-        return False
+            limit = (
+                MAX_PENDING_CHECKPOINT_SEGMENTS
+                if segment.get("checkpoint_only")
+                else MAX_PENDING_FINAL_SEGMENTS
+            )
+            if len(self._pending_final_segments) >= limit:
+                logger.critical(
+                    "[%s] Pending boost state capacity reached; segment rejected",
+                    self.steam_username,
+                )
+                return False
+            self._pending_final_segments.append(self._copy_segment_unlocked(segment))
+            if self._save_pending_final_segments_unlocked():
+                return True
+            self._pending_final_segments.pop()
+            return False
 
     def _invalidate_boost_unlocked(self, *, force=False):
-        had_runtime_state = bool(
-            self.boosting
-            or self.start_time is not None
-            or self.original_start_time is not None
-            or self.boost_session_id is not None
-            or self._reconnect_pending_generation is not None
-        )
-        if force or had_runtime_state:
-            self.boost_generation += 1
-        self.boosting = False
-        self.start_time = None
-        self.original_start_time = None
-        self.boost_session_id = None
-        self._reconnect_pending_generation = None
-        self._reconnect_pending_token = None
+        with self._quota_fence_lock:
+            session_key = (self.boost_session_id, self.boost_generation)
+            had_runtime_state = bool(
+                self.boosting
+                or self.start_time is not None
+                or self.original_start_time is not None
+                or self.boost_session_id is not None
+                or self._reconnect_pending_generation is not None
+            )
+            if force or had_runtime_state:
+                self.boost_generation += 1
+            self.boosting = False
+            self.start_time = None
+            self.original_start_time = None
+            self._runtime_stop_deadline = None
+            self.boost_session_id = None
+            self._reconnect_pending_generation = None
+            self._reconnect_pending_token = None
+            self._fenced_session_keys.discard(session_key)
 
     def _stop_remote_games_unlocked(self, context):
         """Stop remote game state or kill the worker session fail-closed."""
+        with self._quota_fence_lock:
+            quota_fenced = bool(self._active_quota_fences)
+        if quota_fenced:
+            self._connection_event_generation += 1
+            stopped = bool(self.client.force_disconnect())
+            self.logged_in = False
+            return stopped
         if self.client._closed:
             self.logged_in = False
             return bool(self.client.force_disconnect())
@@ -1197,6 +1600,153 @@ class SteamAccountManager:
         fail_closed = self.client.force_disconnect()
         self.logged_in = False
         return bool(fail_closed)
+
+    def _record_all_pending_remote_stop_result(self, remote_stopped_at):
+        """Mark every valid pending run stopped, atomically with its state file."""
+        with self._pending_lock:
+            changed = []
+            for pending in self._pending_final_segments:
+                if (
+                    pending.get("state_corrupt")
+                    or pending.get("remote_stop_confirmed") is True
+                ):
+                    continue
+                changed.append((
+                    pending,
+                    pending.get("remote_stop_confirmed"),
+                    pending.get("remote_stopped_at"),
+                ))
+                pending["remote_stop_confirmed"] = True
+                if pending.get("remote_stopped_at") is None:
+                    pending["remote_stopped_at"] = float(remote_stopped_at)
+            if changed and not self._save_pending_final_segments_unlocked():
+                for pending, previous_confirmed, previous_remote_at in changed:
+                    pending["remote_stop_confirmed"] = previous_confirmed
+                    pending["remote_stopped_at"] = previous_remote_at
+                return False
+            return True
+
+    def emergency_quota_cutoff(self, stopped_at, fence_token, *, reason="quota"):
+        """Fence boost IPC and kill remote state without waiting for state_lock.
+
+        The billable segment is persisted before process termination. Local
+        runtime invalidation deliberately remains on the normal state-locked
+        prepare path; the monotonic fence serial prevents an older IPC response
+        from committing in the meantime.
+        """
+        boundary_epoch = float(stopped_at)
+        if not math.isfinite(boundary_epoch):
+            raise ValueError("stopped_at must be finite")
+        fence_token = str(fence_token or "")
+        if not fence_token:
+            raise ValueError("fence_token is required")
+
+        with self._quota_fence_lock:
+            if fence_token not in self._active_quota_fences:
+                self._active_quota_fences.add(fence_token)
+                self._quota_fence_serial += 1
+            fence_serial = self._quota_fence_serial
+            inflight = self._boost_operations_inflight > 0
+            active = bool(
+                self.boosting
+                and self.boost_session_id is not None
+                and self.start_time is not None
+            )
+            segment = None
+            if active:
+                started_at = float(self.start_time)
+                billable_boundary = boundary_epoch
+                if self._runtime_stop_deadline is not None:
+                    billable_boundary = min(
+                        billable_boundary,
+                        self._runtime_stop_deadline,
+                    )
+                canonical_stop = max(started_at, billable_boundary)
+                session_key = (self.boost_session_id, self.boost_generation)
+                self._fenced_session_keys.add(session_key)
+                segment = {
+                    "account_id": self.account_id,
+                    "session_id": self.boost_session_id,
+                    "generation": self.boost_generation,
+                    "started_at": started_at,
+                    "stopped_at": canonical_stop,
+                    "elapsed": max(0, canonical_stop - started_at),
+                    "app_ids": list(self.app_ids),
+                    "remote_stop_confirmed": False,
+                    "remote_stopped_at": None,
+                    "checkpoint_only": False,
+                }
+
+        durable = True
+        if segment is not None:
+            durable = self._remember_final_segment_unlocked(segment)
+            if not durable:
+                segment["local_stop_aborted"] = True
+                logger.critical(
+                    "[%s] Hard quota cutoff segment is not durable (%s)",
+                    self.steam_username,
+                    reason,
+                )
+
+        with self._pending_lock:
+            unconfirmed_pending = any(
+                pending.get("remote_stop_confirmed") is not True
+                for pending in self._pending_final_segments
+            )
+
+        force_required = bool(active or inflight or unconfirmed_pending)
+        remote_confirmed = True
+        remote_stopped_at = None
+        remote_lag_seconds = 0.0
+        if force_required:
+            # Invalidate a successful login/reconnect response that returned
+            # just before this state-lock-free cutoff reached manager state.
+            self._connection_event_generation += 1
+            try:
+                remote_confirmed = bool(self.client.force_disconnect())
+            except Exception:
+                remote_confirmed = False
+                logger.exception(
+                    "[%s] Hard quota worker termination failed (%s)",
+                    self.steam_username,
+                    reason,
+                )
+            remote_stopped_at = time.time()
+            remote_lag_seconds = max(0.0, remote_stopped_at - boundary_epoch)
+            with self._quota_fence_lock:
+                self.logged_in = False
+            if remote_confirmed:
+                confirmations_durable = self._record_all_pending_remote_stop_result(
+                    remote_stopped_at
+                )
+                with self._pending_lock:
+                    unresolved = any(
+                        pending.get("remote_stop_confirmed") is not True
+                        for pending in self._pending_final_segments
+                    )
+                if not confirmations_durable or unresolved:
+                    # Remote state is closed, but the confirmation is not
+                    # durable; do not let the DB consume the pending record.
+                    remote_confirmed = False
+
+        if segment is not None:
+            with self._pending_lock:
+                persisted_segment = self._find_pending_segment_unlocked(segment)
+                if persisted_segment is not None:
+                    segment = self._copy_segment_unlocked(persisted_segment)
+
+        return {
+            "fence_token": fence_token,
+            "fence_serial": fence_serial,
+            "segment": segment,
+            "durable": durable,
+            "active": active,
+            "inflight": inflight,
+            "force_required": force_required,
+            "remote_stop_confirmed": remote_confirmed,
+            "remote_stopped_at": remote_stopped_at,
+            "remote_lag_seconds": remote_lag_seconds,
+        }
 
     @staticmethod
     def _invoke_fatal_disconnect_callback(segment):
@@ -1402,9 +1952,21 @@ class SteamAccountManager:
         def _on_new_key():
             logger.info("[%s] new_login_key alindi", self.steam_username)
 
-    def _schedule_reconnect(self, expected_generation=None):
+    def _schedule_reconnect(
+        self,
+        expected_generation=None,
+        expected_connection_generation=None,
+    ):
         finalize_generation = None
+        finalize_reconnect_token = None
+        finalize_connection_generation = None
         with self.state_lock:
+            if (
+                expected_connection_generation is not None
+                and self._connection_event_generation
+                != expected_connection_generation
+            ):
+                return
             if self._removed or not self._active_session_matches_unlocked(
                 expected_generation=expected_generation
             ):
@@ -1414,6 +1976,10 @@ class SteamAccountManager:
                 return
             if self._reconnect_attempts >= 5:
                 finalize_generation = generation
+                finalize_reconnect_token = uuid.uuid4().hex
+                finalize_connection_generation = self._connection_event_generation
+                self._reconnect_pending_generation = generation
+                self._reconnect_pending_token = finalize_reconnect_token
             else:
                 delay = min(30 * (2 ** self._reconnect_attempts), 300)
                 self._reconnect_attempts += 1
@@ -1426,6 +1992,8 @@ class SteamAccountManager:
             self._finalize_fatal_session(
                 finalize_generation,
                 "maximum reconnect attempts exceeded",
+                expected_reconnect_token=finalize_reconnect_token,
+                expected_connection_generation=finalize_connection_generation,
             )
             return
 
@@ -1447,25 +2015,135 @@ class SteamAccountManager:
                     self._reconnect_pending_token = None
             logger.exception("[%s] Reconnect zamanlanamadi", self.steam_username)
 
+    def _reconnect_attempt_matches_unlocked(
+        self,
+        generation,
+        reconnect_token,
+        connection_generation,
+    ):
+        return bool(
+            not self._removed
+            and self._active_session_matches_unlocked(
+                expected_generation=generation
+            )
+            and self._reconnect_pending_generation == generation
+            and self._reconnect_pending_token == reconnect_token
+            and self._connection_event_generation == connection_generation
+        )
+
+    def _reschedule_after_connection_generation_change(
+        self,
+        generation,
+        reconnect_token,
+        connection_generation,
+    ):
+        """Atomically replace a stale transport attempt with its successor."""
+        finalize_generation = None
+        finalize_reconnect_token = None
+        finalize_connection_generation = None
+        delay = None
+        successor_token = None
+        with self.state_lock:
+            if (
+                self._removed
+                or not self._active_session_matches_unlocked(
+                    expected_generation=generation
+                )
+                or self._reconnect_pending_generation != generation
+                or self._reconnect_pending_token != reconnect_token
+                or self._connection_event_generation == connection_generation
+            ):
+                return False
+
+            # Replace the ticket while holding state_lock. Clearing it first and
+            # scheduling later leaves a small gap where a newer disconnect event
+            # can observe the old ticket, decline to schedule, and strand the
+            # active session without any reconnect work.
+            if self._reconnect_attempts >= 5:
+                finalize_generation = generation
+                finalize_reconnect_token = uuid.uuid4().hex
+                finalize_connection_generation = self._connection_event_generation
+                self._reconnect_pending_generation = generation
+                self._reconnect_pending_token = finalize_reconnect_token
+            else:
+                delay = min(30 * (2 ** self._reconnect_attempts), 300)
+                self._reconnect_attempts += 1
+                successor_token = uuid.uuid4().hex
+                self._reconnect_pending_generation = generation
+                self._reconnect_pending_token = successor_token
+
+        if finalize_generation is not None:
+            logger.error("[%s] Max reconnect asildi", self.steam_username)
+            self._finalize_fatal_session(
+                finalize_generation,
+                "maximum reconnect attempts exceeded",
+                expected_reconnect_token=finalize_reconnect_token,
+                expected_connection_generation=finalize_connection_generation,
+            )
+            return True
+
+        logger.info("[%s] %dsn sonra reconnect", self.steam_username, delay)
+        try:
+            gevent.spawn_later(
+                delay,
+                self._try_reconnect,
+                generation,
+                successor_token,
+            )
+        except Exception:
+            with self.state_lock:
+                if (
+                    self._reconnect_pending_generation == generation
+                    and self._reconnect_pending_token == successor_token
+                ):
+                    self._reconnect_pending_generation = None
+                    self._reconnect_pending_token = None
+            logger.exception("[%s] Reconnect zamanlanamadi", self.steam_username)
+            return False
+        return True
+
     def _try_reconnect(self, expected_generation=None, reconnect_token=None):
         with self.state_lock:
-            if reconnect_token is not None and (
-                self._reconnect_pending_generation != expected_generation
-                or self._reconnect_pending_token != reconnect_token
-            ):
-                return
-            if self._reconnect_pending_generation == expected_generation:
-                self._reconnect_pending_generation = None
-                self._reconnect_pending_token = None
             if self._removed or not self._active_session_matches_unlocked(
                 expected_generation=expected_generation
             ):
                 return
             generation = self.boost_generation
+            if reconnect_token is not None:
+                if (
+                    self._reconnect_pending_generation != generation
+                    or self._reconnect_pending_token != reconnect_token
+                ):
+                    return
+            elif (
+                self._reconnect_pending_generation == generation
+                and self._reconnect_pending_token is not None
+            ):
+                reconnect_token = self._reconnect_pending_token
+            else:
+                # Direct/internal callers still receive the same behavior, but
+                # now participate in the same CAS protocol as scheduled work.
+                reconnect_token = uuid.uuid4().hex
+                self._reconnect_pending_generation = generation
+                self._reconnect_pending_token = reconnect_token
+            connection_generation = self._connection_event_generation
 
         try:
             creds = self.load_credentials()
             if not creds:
+                with self.state_lock:
+                    attempt_matches = self._reconnect_attempt_matches_unlocked(
+                        generation,
+                        reconnect_token,
+                        connection_generation,
+                    )
+                if not attempt_matches:
+                    self._reschedule_after_connection_generation_change(
+                        generation,
+                        reconnect_token,
+                        connection_generation,
+                    )
+                    return
                 logger.warning(
                     "[%s] Kayitli kimlik yok; aktif boost sonlandiriliyor",
                     self.steam_username,
@@ -1473,16 +2151,26 @@ class SteamAccountManager:
                 self._finalize_fatal_session(
                     generation,
                     "saved credentials unavailable",
+                    expected_reconnect_token=reconnect_token,
+                    expected_connection_generation=connection_generation,
                 )
                 return
 
             result = self._login_with_saved_credentials(creds)
-            with self.state_lock:
-                if self._removed or not self._active_session_matches_unlocked(
-                    expected_generation=generation
-                ):
-                    return
             if result == EResult.OK:
+                return
+            with self.state_lock:
+                attempt_matches = self._reconnect_attempt_matches_unlocked(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
+            if not attempt_matches:
+                self._reschedule_after_connection_generation_change(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
                 return
             if result in (
                 EResult.AccountLogonDenied,
@@ -1500,18 +2188,71 @@ class SteamAccountManager:
                 self._finalize_fatal_session(
                     generation,
                     f"terminal reconnect result {int(result)}",
+                    expected_reconnect_token=reconnect_token,
+                    expected_connection_generation=connection_generation,
                 )
                 return
 
             self.client.reconnect(maxdelay=30)
-            self._schedule_reconnect(generation)
+            with self.state_lock:
+                attempt_matches = self._reconnect_attempt_matches_unlocked(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
+                if attempt_matches:
+                    self._reconnect_pending_generation = None
+                    self._reconnect_pending_token = None
+            if not attempt_matches:
+                self._reschedule_after_connection_generation_change(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
+                return
+            self._schedule_reconnect(
+                generation,
+                expected_connection_generation=connection_generation,
+            )
         except Exception as e:
             logger.error("[%s] Reconnect hatasi: %s", self.steam_username, e)
-            self._schedule_reconnect(generation)
+            with self.state_lock:
+                attempt_matches = self._reconnect_attempt_matches_unlocked(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
+                if attempt_matches:
+                    self._reconnect_pending_generation = None
+                    self._reconnect_pending_token = None
+            if not attempt_matches:
+                self._reschedule_after_connection_generation_change(
+                    generation,
+                    reconnect_token,
+                    connection_generation,
+                )
+                return
+            self._schedule_reconnect(
+                generation,
+                expected_connection_generation=connection_generation,
+            )
 
-    def _record_login_success(self, password=None):
+    def _record_login_success(
+        self,
+        password=None,
+        *,
+        expected_connection_generation=None,
+    ):
         with self.state_lock:
-            if self._removed or self.client._closed:
+            if (
+                self._removed
+                or self.client._closed
+                or (
+                    expected_connection_generation is not None
+                    and self._connection_event_generation
+                    != expected_connection_generation
+                )
+            ):
                 self.logged_in = False
                 return False
             # The synchronous login response is newer than any event task that
@@ -1539,6 +2280,8 @@ class SteamAccountManager:
         password = creds.get("password")
 
         if refresh_token and not code:
+            with self.state_lock:
+                connection_generation = self._connection_event_generation
             result = self.client.login(
                 username=self.steam_username,
                 refresh_token=refresh_token,
@@ -1546,8 +2289,11 @@ class SteamAccountManager:
             if self._removed:
                 return EResult.NoConnection
             if result == EResult.OK:
-                self._record_login_success()
-                return result
+                if self._record_login_success(
+                    expected_connection_generation=connection_generation
+                ):
+                    return result
+                return EResult.NoConnection
             logger.warning(
                 "[%s] Refresh token login basarisiz: %s, sifre fallback deneniyor",
                 self.steam_username,
@@ -1562,6 +2308,8 @@ class SteamAccountManager:
         try:
             if self._removed:
                 return EResult.NoConnection
+            with self.state_lock:
+                connection_generation = self._connection_event_generation
             if code:
                 if code_type == "email":
                     result = self.client.login(
@@ -1584,7 +2332,11 @@ class SteamAccountManager:
             if self._removed:
                 return EResult.NoConnection
             if result == EResult.OK:
-                self._record_login_success(password=password)
+                if not self._record_login_success(
+                    password=password,
+                    expected_connection_generation=connection_generation,
+                ):
+                    return EResult.NoConnection
                 logger.info("[%s] Kimlik bilgileriyle giris basarili", self.steam_username)
             else:
                 logger.warning(
@@ -1605,53 +2357,58 @@ class SteamAccountManager:
         stopped_at=None,
         context="explicit stop",
     ):
-        if (
-            expected_session_id is not None
-            or expected_generation is not None
-        ) and not self._active_session_matches_unlocked(
-            expected_session_id=expected_session_id,
-            expected_generation=expected_generation,
-        ):
-            return None
-        if not self.boosting:
-            return None
+        with self._quota_fence_lock:
+            if (
+                expected_session_id is not None
+                or expected_generation is not None
+            ) and not self._active_session_matches_unlocked(
+                expected_session_id=expected_session_id,
+                expected_generation=expected_generation,
+            ):
+                return None
+            if not self.boosting:
+                return None
 
-        started_at = self.start_time
-        if stopped_at is None:
-            stopped_at = time.time()
-        else:
-            stopped_at = float(stopped_at)
-            if not math.isfinite(stopped_at):
-                raise ValueError("stopped_at must be finite")
-        if started_at is not None:
-            stopped_at = max(float(started_at), stopped_at)
-        segment = {
-            "account_id": self.account_id,
-            "session_id": self.boost_session_id,
-            "generation": self.boost_generation,
-            "started_at": started_at,
-            "stopped_at": stopped_at,
-            "elapsed": max(0, stopped_at - started_at)
-            if started_at is not None
-            else 0,
-            "app_ids": list(self.app_ids),
-        }
+            started_at = self.start_time
+            if stopped_at is None:
+                stopped_at = time.time()
+            else:
+                stopped_at = float(stopped_at)
+                if not math.isfinite(stopped_at):
+                    raise ValueError("stopped_at must be finite")
+            if self._runtime_stop_deadline is not None:
+                stopped_at = min(stopped_at, self._runtime_stop_deadline)
+            if started_at is not None:
+                stopped_at = max(float(started_at), stopped_at)
+            segment = {
+                "account_id": self.account_id,
+                "session_id": self.boost_session_id,
+                "generation": self.boost_generation,
+                "started_at": started_at,
+                "stopped_at": stopped_at,
+                "elapsed": max(0, stopped_at - started_at)
+                if started_at is not None
+                else 0,
+                "app_ids": list(self.app_ids),
+                "remote_stop_confirmed": False,
+                "remote_stopped_at": None,
+                "checkpoint_only": False,
+            }
 
-        # Write the recovery record before yielding to IPC.  A process kill
-        # between local invalidation and the Steam response must still leave
-        # enough information for the next process to finalize this segment.
-        segment["remote_stop_confirmed"] = False
-        if not self._remember_final_segment_unlocked(segment):
-            segment["local_stop_aborted"] = True
-            logger.critical(
-                "[%s] Boost stop aborted: pending state is not durable",
-                self.steam_username,
-            )
+            # Write the recovery record before yielding to IPC. A process kill
+            # between local invalidation and the Steam response must still leave
+            # enough information for the next process to finalize this segment.
+            if not self._remember_final_segment_unlocked(segment):
+                segment["local_stop_aborted"] = True
+                logger.critical(
+                    "[%s] Boost stop aborted: pending state is not durable",
+                    self.steam_username,
+                )
+                return self._copy_segment_unlocked(segment)
+            # Local state is closed before IPC. A synchronous disconnected event
+            # can therefore never observe boosting=True and schedule a new loop.
+            self._invalidate_boost_unlocked(force=True)
             return self._copy_segment_unlocked(segment)
-        # Local state is closed before IPC. A synchronous disconnected event
-        # can therefore never observe boosting=True and schedule a new loop.
-        self._invalidate_boost_unlocked(force=True)
-        return self._copy_segment_unlocked(segment)
 
     def prepare_stop_boost_segment(
         self,
@@ -1686,15 +2443,13 @@ class SteamAccountManager:
         if not segment or segment.get("local_stop_aborted"):
             return self._copy_segment_unlocked(segment) if segment else None
 
-        pending_match = None
-        for pending in self._pending_final_segments:
-            if (
-                pending.get("session_id") == segment.get("session_id")
-                and pending.get("generation") == segment.get("generation")
-                and pending.get("stopped_at") == segment.get("stopped_at")
-            ):
-                pending_match = pending
-                break
+        with self._pending_lock:
+            pending_match = self._find_pending_segment_unlocked(segment)
+            pending_copy = (
+                self._copy_segment_unlocked(pending_match)
+                if pending_match is not None
+                else None
+            )
         if pending_match is None:
             # Another reconciliation path may have confirmed, committed, and
             # acknowledged this exact run while a user-level hard fence was
@@ -1718,12 +2473,20 @@ class SteamAccountManager:
             failed["local_stop_aborted"] = True
             return failed
 
-        if pending_match.get("remote_stop_confirmed") is not True:
-            pending_match["remote_stop_confirmed"] = (
-                self._stop_remote_games_unlocked(context)
+        if pending_copy.get("remote_stop_confirmed") is not True:
+            confirmed = self._stop_remote_games_unlocked(context)
+            updated = self._record_pending_remote_stop_result(
+                segment,
+                confirmed=confirmed,
+                remote_stopped_at=time.time() if confirmed else None,
             )
-            self._save_pending_final_segments_unlocked()
-        return self._copy_segment_unlocked(pending_match)
+            if updated is None:
+                failed = self._copy_segment_unlocked(segment)
+                failed["remote_stop_confirmed"] = False
+                failed["local_stop_aborted"] = True
+                return failed
+            return updated
+        return pending_copy
 
     def confirm_prepared_stop_segment(
         self,
@@ -1744,8 +2507,22 @@ class SteamAccountManager:
         expected_session_id=None,
         expected_generation=None,
         context="explicit stop",
+        expected_reconnect_token=None,
+        expected_connection_generation=None,
     ):
         with self.state_lock:
+            if expected_reconnect_token is not None:
+                if (
+                    self._reconnect_pending_generation != expected_generation
+                    or self._reconnect_pending_token
+                    != expected_reconnect_token
+                    or (
+                        expected_connection_generation is not None
+                        and self._connection_event_generation
+                        != expected_connection_generation
+                    )
+                ):
+                    return None
             segment = self._prepare_stop_boost_segment_unlocked(
                 expected_session_id=expected_session_id,
                 expected_generation=expected_generation,
@@ -1758,17 +2535,91 @@ class SteamAccountManager:
                 context=context,
             )
 
-    def _finalize_fatal_session(self, expected_generation, reason):
+    def _schedule_fatal_finalization_retry(
+        self,
+        expected_generation,
+        reason,
+        *,
+        expected_reconnect_token=None,
+    ):
+        """Publish one CAS-protected retry after a fatal stop could not commit."""
+        with self.state_lock:
+            if (
+                self._removed
+                or not self._active_session_matches_unlocked(
+                    expected_generation=expected_generation
+                )
+                or (
+                    expected_reconnect_token is not None
+                    and (
+                        self._reconnect_pending_generation != expected_generation
+                        or self._reconnect_pending_token
+                        != expected_reconnect_token
+                    )
+                )
+            ):
+                return False
+
+            retry_token = uuid.uuid4().hex
+            connection_generation = self._connection_event_generation
+            self._reconnect_pending_generation = expected_generation
+            self._reconnect_pending_token = retry_token
+
+        try:
+            gevent.spawn_later(
+                FATAL_FINALIZATION_RETRY_SECONDS,
+                self._finalize_fatal_session,
+                expected_generation,
+                reason,
+                expected_reconnect_token=retry_token,
+                expected_connection_generation=connection_generation,
+            )
+        except Exception:
+            with self.state_lock:
+                if (
+                    self._reconnect_pending_generation == expected_generation
+                    and self._reconnect_pending_token == retry_token
+                ):
+                    self._reconnect_pending_generation = None
+                    self._reconnect_pending_token = None
+            logger.critical(
+                "[%s] Fatal boost finalization retry could not be scheduled",
+                self.steam_username,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _finalize_fatal_session(
+        self,
+        expected_generation,
+        reason,
+        *,
+        expected_reconnect_token=None,
+        expected_connection_generation=None,
+    ):
         segment = self._stop_boost_session(
             expected_generation=expected_generation,
             context=f"fatal reconnect: {reason}",
+            expected_reconnect_token=expected_reconnect_token,
+            expected_connection_generation=expected_connection_generation,
         )
         if segment is None:
+            self._schedule_fatal_finalization_retry(
+                expected_generation,
+                reason,
+                expected_reconnect_token=expected_reconnect_token,
+            )
             return False
         if segment.get("local_stop_aborted"):
             logger.critical(
                 "[%s] Fatal boost finalization postponed: pending state is not durable",
                 self.steam_username,
+            )
+            self._schedule_fatal_finalization_retry(
+                expected_generation,
+                reason,
+                expected_reconnect_token=expected_reconnect_token,
             )
             return False
         logger.error(
@@ -1790,6 +2641,8 @@ class SteamAccountManager:
 
     def _resume_boost(self, expected_generation=None):
         failure = None
+        fenced = False
+        operation_started = False
         with self.state_lock:
             if (
                 self._removed
@@ -1800,19 +2653,54 @@ class SteamAccountManager:
             ):
                 return False
             generation = self.boost_generation
+            session_key = (self.boost_session_id, generation)
+            operation_serial = self._begin_boost_operation_unlocked(session_key)
+            if operation_serial is None:
+                return False
+            operation_started = True
             try:
                 result = self.client.change_status(
                     persona_state=EPersonaState(self.persona_state)
                 )
-                if result != EResult.OK:
+                fenced = self._quota_fence_crossed(
+                    operation_serial,
+                    session_key,
+                )
+                if fenced:
+                    failure = "quota fence"
+                elif result != EResult.OK:
                     failure = f"persona result {int(result)}"
                 else:
                     result = self.client.games_played(list(self.app_ids))
-                    if result != EResult.OK:
+                    fenced = self._quota_fence_crossed(
+                        operation_serial,
+                        session_key,
+                    )
+                    if fenced:
+                        failure = "quota fence"
+                    elif result != EResult.OK:
                         failure = f"games result {int(result)}"
             except Exception as exc:
                 failure = f"{type(exc).__name__}"
+                fenced = self._quota_fence_crossed(
+                    operation_serial,
+                    session_key,
+                )
+            finally:
+                if operation_started:
+                    self._end_boost_operation()
 
+            if fenced:
+                self.logged_in = False
+
+        if fenced:
+            if self.client.connected:
+                self.client.force_disconnect()
+            logger.info(
+                "[%s] Boost resume hard quota fence tarafindan iptal edildi",
+                self.steam_username,
+            )
+            return False
         if failure is not None:
             logger.error("[%s] Resume hatasi: %s", self.steam_username, failure)
             self._finalize_fatal_session(generation, f"resume failed: {failure}")
@@ -1843,30 +2731,66 @@ class SteamAccountManager:
                 raise Exception("Steam bagli degil")
             if self.boosting:
                 raise Exception("Steam boost zaten aktif")
+            operation_serial = self._begin_boost_operation_unlocked()
+            if operation_serial is None:
+                raise QuotaFenceActiveError("Hard quota fence is active")
+            try:
+                result = self.client.change_status(
+                    persona_state=EPersonaState(persona_state)
+                )
+                if self._quota_fence_crossed(operation_serial):
+                    if self.client.connected:
+                        self.client.force_disconnect()
+                    self.logged_in = False
+                    raise QuotaFenceActiveError(
+                        "Hard quota fence crossed Steam status IPC"
+                    )
+                if result != EResult.OK:
+                    self._stop_remote_games_unlocked("start persona failure")
+                    raise Exception(f"Steam status degistirilemedi: {result}")
 
-            result = self.client.change_status(
-                persona_state=EPersonaState(persona_state)
-            )
-            if result != EResult.OK:
-                self._stop_remote_games_unlocked("start persona failure")
-                raise Exception(f"Steam status degistirilemedi: {result}")
-            result = self.client.games_played(candidate_app_ids)
-            if result != EResult.OK:
-                self._stop_remote_games_unlocked("start games failure")
-                raise Exception(f"Steam boost baslatilamadi: {result}")
+                result = self.client.games_played(candidate_app_ids)
+                if self._quota_fence_crossed(operation_serial):
+                    if self.client.connected:
+                        self.client.force_disconnect()
+                    self.logged_in = False
+                    raise QuotaFenceActiveError(
+                        "Hard quota fence crossed Steam games IPC"
+                    )
+                if result != EResult.OK:
+                    self._stop_remote_games_unlocked("start games failure")
+                    raise Exception(f"Steam boost baslatilamadi: {result}")
 
-            now = time.time()
-            self.boost_generation += 1
-            self.boost_session_id = uuid.uuid4().hex
-            self.app_ids = candidate_app_ids
-            self.persona_state = persona_state
-            self.boosting = True
-            self.start_time = now
-            self.original_start_time = now
-            self._reconnect_attempts = 0
-            self._reconnect_pending_generation = None
-            self._reconnect_pending_token = None
-            return self._snapshot_unlocked()
+                with self._quota_fence_lock:
+                    if (
+                        operation_serial != self._quota_fence_serial
+                        or self._active_quota_fences
+                    ):
+                        fenced_before_commit = True
+                    else:
+                        fenced_before_commit = False
+                        now = time.time()
+                        self.boost_generation += 1
+                        self.boost_session_id = uuid.uuid4().hex
+                        self.app_ids = candidate_app_ids
+                        self.persona_state = persona_state
+                        self.boosting = True
+                        self.start_time = now
+                        self.original_start_time = now
+                        self._runtime_stop_deadline = None
+                        self._reconnect_attempts = 0
+                        self._reconnect_pending_generation = None
+                        self._reconnect_pending_token = None
+                if fenced_before_commit:
+                    if self.client.connected:
+                        self.client.force_disconnect()
+                    self.logged_in = False
+                    raise QuotaFenceActiveError(
+                        "Hard quota fence crossed before boost commit"
+                    )
+                return self._snapshot_unlocked()
+            finally:
+                self._end_boost_operation()
 
     def stop_boost(
         self,
@@ -1900,6 +2824,64 @@ class SteamAccountManager:
             context=context,
         )
 
+    def prepare_boost_checkpoint(
+        self,
+        *,
+        expected_session_id=None,
+        expected_generation=None,
+        min_elapsed=0,
+        now=None,
+    ):
+        """Durably capture and advance one active usage segment.
+
+        The pending record is written before ``start_time`` advances. A hard
+        quota fence can therefore cut the new interval while the checkpoint DB
+        commit is yielding without ever double-billing the old interval.
+        """
+        with self.state_lock:
+            with self._quota_fence_lock:
+                if not self._active_session_matches_unlocked(
+                    expected_session_id=expected_session_id,
+                    expected_generation=expected_generation,
+                ):
+                    return None
+                session_key = (self.boost_session_id, self.boost_generation)
+                if (
+                    self._active_quota_fences
+                    or session_key in self._fenced_session_keys
+                    or self.start_time is None
+                ):
+                    return None
+                stopped_at = time.time() if now is None else float(now)
+                if not math.isfinite(stopped_at):
+                    raise ValueError("checkpoint time must be finite")
+                if self._runtime_stop_deadline is not None:
+                    stopped_at = min(stopped_at, self._runtime_stop_deadline)
+                stopped_at = max(float(self.start_time), stopped_at)
+                elapsed = max(0, stopped_at - self.start_time)
+                if elapsed < max(0, float(min_elapsed or 0)):
+                    return None
+                checkpoint = {
+                    "account_id": self.account_id,
+                    "session_id": self.boost_session_id,
+                    "generation": self.boost_generation,
+                    "started_at": self.start_time,
+                    "stopped_at": stopped_at,
+                    "elapsed": elapsed,
+                    "app_ids": list(self.app_ids),
+                    "remote_stop_confirmed": True,
+                    "remote_stopped_at": None,
+                    "checkpoint_only": True,
+                }
+                if not self._remember_final_segment_unlocked(checkpoint):
+                    logger.critical(
+                        "[%s] Boost checkpoint aborted: pending state is not durable",
+                        self.steam_username,
+                    )
+                    return None
+                self.start_time = stopped_at
+                return self._copy_segment_unlocked(checkpoint)
+
     def advance_boost_checkpoint(
         self,
         *,
@@ -1908,46 +2890,43 @@ class SteamAccountManager:
         min_elapsed=0,
         now=None,
     ):
-        """Atomically capture and advance one active usage segment."""
-        with self.state_lock:
-            if not self._active_session_matches_unlocked(
-                expected_session_id=expected_session_id,
-                expected_generation=expected_generation,
-            ):
-                return None
-            if self.start_time is None:
-                return None
-            stopped_at = time.time() if now is None else float(now)
-            elapsed = max(0, stopped_at - self.start_time)
-            if elapsed < max(0, float(min_elapsed or 0)):
-                return None
-            checkpoint = {
-                "account_id": self.account_id,
-                "session_id": self.boost_session_id,
-                "generation": self.boost_generation,
-                "started_at": self.start_time,
-                "stopped_at": stopped_at,
-                "elapsed": elapsed,
-                "app_ids": list(self.app_ids),
-            }
-            self.start_time = stopped_at
-            return checkpoint
+        """Backward-compatible alias for the durable checkpoint transition."""
+        return self.prepare_boost_checkpoint(
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            min_elapsed=min_elapsed,
+            now=now,
+        )
 
     def rollback_boost_checkpoint(self, checkpoint):
         """Restore an uncommitted checkpoint without rewinding newer state."""
         if not isinstance(checkpoint, dict):
             return False
-        with self.state_lock:
+        with self.state_lock, self._quota_fence_lock:
             if not self._active_session_matches_unlocked(
                 expected_session_id=checkpoint.get("session_id"),
                 expected_generation=checkpoint.get("generation"),
             ):
                 return False
-            if self.start_time != checkpoint.get("stopped_at"):
+            session_key = (self.boost_session_id, self.boost_generation)
+            if (
+                self._active_quota_fences
+                or session_key in self._fenced_session_keys
+                or self.start_time != checkpoint.get("stopped_at")
+            ):
                 return False
             started_at = checkpoint.get("started_at")
             if started_at is None:
                 return False
+            with self._pending_lock:
+                pending = self._find_pending_segment_unlocked(checkpoint)
+                if pending is None or not pending.get("checkpoint_only"):
+                    return False
+                index = self._pending_final_segments.index(pending)
+                removed = self._pending_final_segments.pop(index)
+                if not self._save_pending_final_segments_unlocked():
+                    self._pending_final_segments.insert(index, removed)
+                    return False
             self.start_time = started_at
             return True
 

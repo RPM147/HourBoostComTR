@@ -8,7 +8,7 @@ bind = "127.0.0.1:5000"
 # limit kaçağı olur.
 #
 # Yatay ölçek (workers>1 veya birden fazla sunucu) için önce şu durum Redis'e
-# taşınmalıdır (bkz. ISSUES.md #15):
+# taşınmalıdır (bkz. PHASE_ROADMAP.md, Phase 5H ve Phase 5I):
 #   - JWT blacklist (_token_blacklist set)      -> Redis Set
 #   - brute-force sayaçları (_failed_logins)    -> Redis (TTL'li key)
 #   - game_cache                                -> Redis (TTL'li key)

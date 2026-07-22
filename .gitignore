@@ -1,10 +1,15 @@
 .env
 *.db
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
 
 # Sanal ortam
 venv/
 env/
+.venv/
+.venv-*/
 
 # Gizli veriler — ASLA commit etme
 tokens/

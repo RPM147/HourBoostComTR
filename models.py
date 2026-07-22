@@ -162,6 +162,11 @@ class BoostLog(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     started_at = db.Column(db.DateTime, nullable=False)
     stopped_at = db.Column(db.DateTime)
+    # Canonical quota accounting stops at ``stopped_at``.  This separate audit
+    # timestamp records when the Steam worker was actually confirmed dead or
+    # accepted stop-games, so enforcement latency is observable rather than
+    # hidden by backdating the billable boundary.
+    remote_stopped_at = db.Column(db.DateTime, nullable=True)
     duration_seconds = db.Column(db.Integer, default=0)
     games_count = db.Column(db.Integer, default=0)
     app_ids_json = db.Column(db.Text, nullable=True)
