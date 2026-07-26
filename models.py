@@ -160,6 +160,14 @@ class BoostLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     account_id = db.Column(db.String(32), db.ForeignKey("steam_accounts.id"))
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    # Operational foreign keys are deliberately nullable.  Before an account
+    # or site user is deleted, its immutable identity is retained here and the
+    # live FK is detached in the same transaction.  Do not use snapshot IDs for
+    # authorization: SQLite can reuse deleted integer user IDs.
+    account_id_snapshot = db.Column(db.String(32), nullable=True)
+    steam_username_snapshot = db.Column(db.String(100), nullable=True)
+    owner_user_id_snapshot = db.Column(db.Integer, nullable=True)
+    owner_username_snapshot = db.Column(db.String(80), nullable=True)
     started_at = db.Column(db.DateTime, nullable=False)
     stopped_at = db.Column(db.DateTime)
     # Canonical quota accounting stops at ``stopped_at``.  This separate audit

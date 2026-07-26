@@ -159,6 +159,10 @@ from sqlalchemy import and_, or_, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from config import Config
+from boost_log_migration import (
+    enable_sqlite_foreign_keys,
+    migrate_boost_log_history,
+)
 from models import (
     db, User, SteamAccount, BoostGame, Payment, PaymentAuditLog, BoostLog,
     Announcement, UserSession, RevokedToken, PASSWORD_HASH_METHOD,
@@ -256,24 +260,32 @@ if not app.debug and "sqlite" in app.config["SQLALCHEMY_DATABASE_URI"].lower():
 # ── SQLite eşzamanlılık sertleştirme ──────────────────────────────
 # gevent altında çok sayıda greenlet eşzamanlı yazınca SQLite "database is
 # locked" hatası verebilir. WAL modu + busy_timeout bunu büyük ölçüde önler.
-# Listener Engine sınıfına bağlandığından sadece SQLite bağlantılarına
-# uygulanır (isinstance kontrolü); PostgreSQL'de no-op'tur.
+# Listener Engine sınıfına bağlandığından helper yalnız SQLite bağlantılarında
+# PRAGMA uygular; PostgreSQL'de no-op'tur.
 from sqlalchemy import event as _sa_event
 from sqlalchemy.engine import Engine as _SAEngine
-import sqlite3 as _sqlite3
 
 
 @_sa_event.listens_for(_SAEngine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
-    if isinstance(dbapi_connection, _sqlite3.Connection):
+    try:
+        is_sqlite = enable_sqlite_foreign_keys(dbapi_connection)
+    except Exception:
+        logger.critical(
+            "SQLite foreign-key enforcement etkinlestirilemedi",
+            exc_info=True,
+        )
+        raise
+    if is_sqlite:
+        cur = dbapi_connection.cursor()
         try:
-            cur = dbapi_connection.cursor()
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA synchronous=NORMAL")
-            cur.close()
         except Exception as _e:
             logger.error("SQLite PRAGMA ayarlanamadi: %s", _e)
+        finally:
+            cur.close()
 
 
 # ── DB Migration (Flask-Migrate / Alembic) ────────────────────────
@@ -463,9 +475,23 @@ def _add_boost_log_if_missing(
         return False
 
     normalized_app_ids = [int(app_id) for app_id in (app_ids or [])]
+    account = db.session.get(SteamAccount, acct_id)
+    owner = db.session.get(User, user_id)
+    if (
+        account is None
+        or owner is None
+        or account.user_id != user_id
+    ):
+        raise ValueError(
+            "BoostLog owner/account snapshot could not be verified"
+        )
     db.session.add(BoostLog(
         account_id=acct_id,
         user_id=user_id,
+        account_id_snapshot=acct_id,
+        steam_username_snapshot=account.steam_username,
+        owner_user_id_snapshot=user_id,
+        owner_username_snapshot=owner.username,
         started_at=started_at,
         stopped_at=stopped_at,
         remote_stopped_at=remote_stopped_at,
@@ -498,6 +524,16 @@ def _persist_stopped_boost_state(
         try:
             acct = db.session.get(SteamAccount, acct_id)
             if acct is None:
+                db.session.rollback()
+                return False
+            if acct.user_id != user_id:
+                logger.critical(
+                    "boost_log.owner_mismatch account_id=%s "
+                    "expected_user_id=%s actual_user_id=%s",
+                    acct_id,
+                    user_id,
+                    acct.user_id,
+                )
                 db.session.rollback()
                 return False
             if clear_account_state:
@@ -2689,6 +2725,27 @@ def _ensure_schema():
             logger.info(
                 "Sema guncellendi: boost_logs.remote_stopped_at eklendi"
             )
+
+        boost_history_report = migrate_boost_log_history(db.engine)
+        logger.info(
+            "phase5f.boost_log_migration rows=%s duration_seconds=%s "
+            "added_columns=%s account_snapshots=%s steam_usernames=%s "
+            "owner_ids=%s owner_usernames=%s detached_accounts=%s "
+            "detached_users=%s unknown_accounts=%s unknown_usernames=%s "
+            "fk_violations=%s",
+            boost_history_report["rows"],
+            boost_history_report["duration_seconds"],
+            boost_history_report["added_columns"],
+            boost_history_report["account_snapshot_backfilled"],
+            boost_history_report["steam_username_backfilled"],
+            boost_history_report["owner_id_backfilled"],
+            boost_history_report["owner_username_backfilled"],
+            boost_history_report["orphan_accounts_detached"],
+            boost_history_report["orphan_users_detached"],
+            boost_history_report["unknown_account_snapshots"],
+            boost_history_report["unknown_steam_usernames"],
+            boost_history_report["foreign_key_violations"],
+        )
 
         session_cols = {
             c["name"] for c in inspector.get_columns("user_sessions")
@@ -5646,7 +5703,25 @@ def remove_account():
             return jsonify({"ok": False, "error": "Account not found."}), 404
 
         steam_username = acct_db.steam_username
+        owner_username = g.user.username
         app_ids = acct_db.app_ids()
+        cross_owner_log = BoostLog.query.filter(
+            BoostLog.account_id == acct_id,
+            BoostLog.user_id.isnot(None),
+            BoostLog.user_id != user_id,
+        ).first()
+        if cross_owner_log is not None:
+            logger.critical(
+                "steam_account.delete_history_owner_mismatch "
+                "user_id=%s account_id=%s log_id=%s",
+                user_id,
+                acct_id,
+                cross_owner_log.id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "Historical account ownership is inconsistent.",
+            }), 409
         # Construction is side-effect free until an IPC command is sent and it
         # reloads any crash-durable pending final segment from disk.
         manager = boost_service.get_or_create(acct_id, steam_username)
@@ -5744,7 +5819,25 @@ def remove_account():
             # Keep historical usage, but sever the foreign key before deleting
             # the operational account. This prevents new BoostLog FK debt.
             BoostLog.query.filter_by(account_id=acct_id).update(
-                {BoostLog.account_id: None},
+                {
+                    BoostLog.account_id_snapshot: db.func.coalesce(
+                        BoostLog.account_id_snapshot,
+                        BoostLog.account_id,
+                    ),
+                    BoostLog.steam_username_snapshot: db.func.coalesce(
+                        BoostLog.steam_username_snapshot,
+                        steam_username,
+                    ),
+                    BoostLog.owner_user_id_snapshot: db.func.coalesce(
+                        BoostLog.owner_user_id_snapshot,
+                        user_id,
+                    ),
+                    BoostLog.owner_username_snapshot: db.func.coalesce(
+                        BoostLog.owner_username_snapshot,
+                        owner_username,
+                    ),
+                    BoostLog.account_id: None,
+                },
                 synchronize_session=False,
             )
             db.session.delete(acct_db)
@@ -8022,6 +8115,34 @@ def admin_delete_user():
             "ok": False,
             "error": "Admin accounts cannot be deleted.",
         }), 409
+    cross_owner_history = (
+        db.session.query(BoostLog.id)
+        .join(SteamAccount, SteamAccount.id == BoostLog.account_id)
+        .filter(
+            db.or_(
+                db.and_(
+                    BoostLog.user_id == target_id,
+                    SteamAccount.user_id != target_id,
+                ),
+                db.and_(
+                    SteamAccount.user_id == target_id,
+                    BoostLog.user_id.isnot(None),
+                    BoostLog.user_id != target_id,
+                ),
+            ),
+        )
+        .first()
+    )
+    if cross_owner_history is not None:
+        logger.critical(
+            "user.delete_history_owner_mismatch target_id=%s log_id=%s",
+            target_id,
+            cross_owner_history[0],
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Historical account ownership is inconsistent.",
+        }), 409
 
     # Validate non-runtime blockers before stopping a customer's active Steam
     # service.  The same predicate is checked again after the yielding runtime
@@ -8212,7 +8333,52 @@ def admin_delete_user():
                 ),
             ))
 
-        BoostLog.query.filter_by(user_id=target_id).delete(synchronize_session=False)
+        # Detach operational identities without destroying historical usage.
+        # Account snapshots are filled while the account rows and usernames
+        # still exist.  Owner snapshots then cover all remaining history,
+        # including already-detached legacy account rows.
+        for account in steam_accounts:
+            BoostLog.query.filter_by(account_id=account.id).update(
+                {
+                    BoostLog.account_id_snapshot: db.func.coalesce(
+                        BoostLog.account_id_snapshot,
+                        BoostLog.account_id,
+                    ),
+                    BoostLog.steam_username_snapshot: db.func.coalesce(
+                        BoostLog.steam_username_snapshot,
+                        account.steam_username,
+                    ),
+                    BoostLog.owner_user_id_snapshot: db.func.coalesce(
+                        BoostLog.owner_user_id_snapshot,
+                        target_id,
+                    ),
+                    BoostLog.owner_username_snapshot: db.func.coalesce(
+                        BoostLog.owner_username_snapshot,
+                        username,
+                    ),
+                    BoostLog.account_id: None,
+                },
+                synchronize_session=False,
+            )
+        BoostLog.query.filter_by(user_id=target_id).update(
+            {
+                BoostLog.account_id_snapshot: db.func.coalesce(
+                    BoostLog.account_id_snapshot,
+                    BoostLog.account_id,
+                ),
+                BoostLog.owner_user_id_snapshot: db.func.coalesce(
+                    BoostLog.owner_user_id_snapshot,
+                    BoostLog.user_id,
+                ),
+                BoostLog.owner_username_snapshot: db.func.coalesce(
+                    BoostLog.owner_username_snapshot,
+                    username,
+                ),
+                BoostLog.account_id: None,
+                BoostLog.user_id: None,
+            },
+            synchronize_session=False,
+        )
         UserSession.query.filter_by(user_id=target_id).delete(synchronize_session=False)
         RevokedToken.query.filter_by(user_id=target_id).delete(synchronize_session=False)
 
