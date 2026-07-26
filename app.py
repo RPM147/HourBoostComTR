@@ -171,6 +171,7 @@ from steam_manager import (
     QuotaFenceActiveError,
     boost_service,
     migrate_legacy_node_credentials,
+    pending_final_segments_accounting_high_water,
     purge_quarantined_credentials,
     quarantine_saved_credentials,
     reconcile_credential_quarantines,
@@ -183,6 +184,16 @@ from payment_verification import (
     extract_single_token,
     token_fingerprint,
     validate_canonical_order,
+)
+from time_utils import (
+    UTC_EPOCH,
+    as_utc,
+    clock,
+    storage_utc,
+    utc_from_epoch,
+    utc_iso_z,
+    utc_now,
+    utc_to_epoch,
 )
 
 from gevent.event import Event
@@ -320,7 +331,7 @@ game_cache: dict = {}
 game_cache_lock = RLock()
 GAME_CACHE_MAX = 500
 
-SERVER_START = time.time()
+SERVER_START = clock.monotonic()
 
 _active_timers = {}
 _timer_lock = RLock()
@@ -422,13 +433,13 @@ def _add_boost_log_if_missing(
         remote_epoch = float(remote_stopped_epoch)
         if not math.isfinite(remote_epoch):
             raise ValueError("remote_stopped_epoch must be finite")
-        remote_stopped_at = datetime.utcfromtimestamp(remote_epoch)
+        remote_stopped_at = utc_from_epoch(remote_epoch)
     stopped_at = None
     if stopped_epoch is not None:
         stopped_value = float(stopped_epoch)
         if not math.isfinite(stopped_value):
             raise ValueError("stopped_epoch must be finite")
-        stopped_at = datetime.utcfromtimestamp(stopped_value)
+        stopped_at = utc_from_epoch(stopped_value)
 
     if duration_seconds <= 0 or started_epoch is None:
         # A checkpoint can commit at the exact instant a hard quota fence
@@ -460,7 +471,7 @@ def _add_boost_log_if_missing(
 
     if stopped_at is None:
         raise ValueError("stopped_epoch is required for billable segments")
-    started_at = datetime.utcfromtimestamp(float(started_epoch))
+    started_at = utc_from_epoch(float(started_epoch))
     existing = BoostLog.query.filter_by(
         account_id=acct_id,
         user_id=user_id,
@@ -625,7 +636,7 @@ def _persist_manager_final_segment(
         acct_id,
         user_id,
         started_epoch=segment.get("started_at"),
-        stopped_epoch=segment.get("stopped_at") or time.time(),
+        stopped_epoch=segment.get("stopped_at") or clock.steady_epoch(),
         duration_seconds=segment.get("elapsed"),
         app_ids=segment.get("app_ids") or [],
         remote_stopped_epoch=segment.get("remote_stopped_at"),
@@ -782,7 +793,7 @@ def _handle_fatal_disconnect(
                             acct_id,
                             owner_id,
                             started_epoch=None,
-                            stopped_epoch=time.time(),
+                            stopped_epoch=clock.steady_epoch(),
                             duration_seconds=0,
                             app_ids=fallback_app_ids,
                         )
@@ -796,7 +807,7 @@ def _handle_fatal_disconnect(
                     return
 
                 elapsed = max(0, float(elapsed or 0))
-                stopped_epoch = stopped_epoch or time.time()
+                stopped_epoch = stopped_epoch or clock.steady_epoch()
                 if started_epoch is None:
                     started_epoch = stopped_epoch - elapsed
                 if not segments:
@@ -894,6 +905,10 @@ def _boost_log_seconds_in_window(
     """
     if started_at is None:
         return 0.0
+    started_at = as_utc(started_at)
+    stopped_at = as_utc(stopped_at) if stopped_at is not None else None
+    window_start = as_utc(window_start) if window_start is not None else None
+    window_end = as_utc(window_end) if window_end is not None else None
     try:
         duration = float(duration_seconds or 0)
     except (TypeError, ValueError):
@@ -946,21 +961,28 @@ def _get_logged_seconds(user_id, start_time_filter=None, end_time_filter=None):
 
 def _get_active_seconds(user_id, start_time_filter=None):
     active = 0
-    now = time.time()
-    now_utc = datetime.utcfromtimestamp(now)
+    if start_time_filter is not None:
+        start_time_filter = as_utc(start_time_filter)
     accounts = SteamAccount.query.filter_by(user_id=user_id).all()
     for acct in accounts:
         mgr = boost_service.get(acct.id)
         snapshot = mgr.boost_snapshot() if mgr else None
         if snapshot and snapshot.get("boosting") and snapshot.get("start_time"):
             active_start = snapshot["start_time"]
-            active_start_utc = datetime.utcfromtimestamp(active_start)
+            active_start_utc = utc_from_epoch(active_start)
+            active_stop_epoch = snapshot.get("observed_stop_time")
+            if active_stop_epoch is None:
+                active_stop_epoch = clock.steady_epoch()
+            active_stop_utc = utc_from_epoch(active_stop_epoch)
             counted_start = (
                 max(active_start_utc, start_time_filter)
                 if start_time_filter is not None
                 else active_start_utc
             )
-            active += max(0.0, (now_utc - counted_start).total_seconds())
+            active += max(
+                0.0,
+                (active_stop_utc - counted_start).total_seconds(),
+            )
     return active
 
 
@@ -968,16 +990,12 @@ def _utc_datetime_epoch(value):
     """Convert a naive-or-aware UTC datetime to an epoch without local-TZ drift."""
     if value is None:
         return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    else:
-        value = value.astimezone(timezone.utc)
-    return value.timestamp()
+    return utc_to_epoch(value)
 
 
 def _active_user_runs_snapshot(user_id, now_epoch=None):
     """Freeze the user's active runtime set for one quota calculation."""
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    now_epoch = clock.steady_epoch() if now_epoch is None else float(now_epoch)
     runs = []
     accounts = (
         SteamAccount.query.filter_by(user_id=user_id)
@@ -990,11 +1008,19 @@ def _active_user_runs_snapshot(user_id, now_epoch=None):
         if not snapshot or not snapshot.get("boosting"):
             continue
         start_time = snapshot.get("start_time")
+        observed_stop_time = snapshot.get("observed_stop_time")
+        if observed_stop_time is None:
+            observed_stop_time = now_epoch
         runs.append({
             "account": account,
             "manager": manager,
             "snapshot": snapshot,
             "start_time": float(start_time) if start_time is not None else None,
+            "observed_stop_time": float(observed_stop_time),
+            "segment_elapsed": max(
+                0.0,
+                float(snapshot.get("segment_elapsed") or 0.0),
+            ),
             "now_epoch": now_epoch,
         })
     return runs
@@ -1008,8 +1034,10 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
     The caller must hold ``_user_operation_lock(user_id)`` so start/stop and
     plan mutations cannot change the snapshot midway through the decision.
     """
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    now_utc = datetime.utcfromtimestamp(now_epoch)
+    now_epoch = clock.steady_epoch() if now_epoch is None else float(now_epoch)
+    now_monotonic = clock.monotonic()
+    now_utc = utc_from_epoch(now_epoch)
+    wall_now_epoch = clock.epoch()
     user = db.session.get(User, user_id)
     if user is None:
         return None
@@ -1017,6 +1045,11 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
     limits = Config.PLANS.get(user.plan, Config.PLANS["free"])
     runs = _active_user_runs_snapshot(user_id, now_epoch)
     active_count = len(runs)
+    accounting_now_epoch = (
+        sum(run["observed_stop_time"] for run in runs) / active_count
+        if active_count > 0
+        else now_epoch
+    )
     invalid_runtime = any(run["start_time"] is None for run in runs)
 
     today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1037,7 +1070,8 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
             if run["start_time"] is not None:
                 daily_active += max(
                     0.0,
-                    now_epoch - max(run["start_time"], today_epoch),
+                    run["observed_stop_time"]
+                    - max(run["start_time"], today_epoch),
                 )
     daily_used = daily_logged + daily_active
     daily_remaining = (
@@ -1053,9 +1087,12 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
     # Legacy paid rows without an activation timestamp must not receive a new
     # quota window accidentally. Count from account creation instead of an
     # arbitrary recent cutoff.
-    plan_start = user.plan_activated_at or user.created_at or datetime(1970, 1, 1)
+    plan_start = user.plan_activated_at or user.created_at or UTC_EPOCH
     total_logged = (
-        _get_logged_seconds(user_id, plan_start, now_utc)
+        # Finalized total-plan usage is cumulative from activation. Its
+        # duration is authoritative, so an upper "now" bound is unnecessary
+        # and could hide a durable segment after a backward wall correction.
+        _get_logged_seconds(user_id, plan_start, None)
         if total_limit_seconds is not None
         else 0.0
     )
@@ -1066,7 +1103,8 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
             if run["start_time"] is not None:
                 total_active += max(
                     0.0,
-                    now_epoch - max(run["start_time"], plan_start_epoch),
+                    run["observed_stop_time"]
+                    - max(run["start_time"], plan_start_epoch),
                 )
     total_used = total_logged + total_active
     total_remaining = (
@@ -1097,11 +1135,16 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
     exhausted = bool(active_count > 0 and quota_depleted)
 
     events = []
-    daily_hard_delay = None
-    total_hard_delay = None
+    daily_hard_deadline = None
+    total_hard_deadline = None
     plan_expiry_delay = (
-        max(0.0, _utc_datetime_epoch(user.plan_expires) - now_epoch)
+        max(0.0, _utc_datetime_epoch(user.plan_expires) - wall_now_epoch)
         if user.plan != "free" and user.plan_expires is not None
+        else None
+    )
+    plan_expiry_deadline_epoch = (
+        accounting_now_epoch + plan_expiry_delay
+        if plan_expiry_delay is not None
         else None
     )
     if active_count > 0 and not exhausted:
@@ -1114,15 +1157,26 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
             # At an exact tie the UTC reset wins: daily windows are [start,end)
             # and the next day's quota becomes available at midnight.
             if midnight_delay <= daily_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS:
-                events.append((midnight_delay, 0, "utc_midnight"))
+                events.append((
+                    midnight_delay,
+                    0,
+                    "utc_midnight",
+                    _utc_datetime_epoch(tomorrow_start),
+                ))
             else:
-                events.append((daily_delay, 1, "daily_limit"))
+                daily_deadline = accounting_now_epoch + daily_delay
+                events.append((
+                    daily_delay,
+                    1,
+                    "daily_limit",
+                    daily_deadline,
+                ))
                 if (
                     plan_expiry_delay is None
                     or daily_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS
                     < plan_expiry_delay
                 ):
-                    daily_hard_delay = daily_delay
+                    daily_hard_deadline = daily_deadline
         if total_remaining is not None:
             total_delay = max(0.0, total_remaining / active_count)
             if (
@@ -1130,31 +1184,57 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
                 or total_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS
                 < plan_expiry_delay
             ):
-                total_hard_delay = total_delay
-            events.append((total_delay, 1, "total_limit"))
+                total_hard_deadline = accounting_now_epoch + total_delay
+            events.append((
+                total_delay,
+                1,
+                "total_limit",
+                accounting_now_epoch + total_delay,
+            ))
         if plan_expiry_delay is not None:
-            events.append((plan_expiry_delay, 0, "plan_expiry"))
+            events.append((
+                plan_expiry_delay,
+                0,
+                "plan_expiry",
+                plan_expiry_deadline_epoch,
+            ))
 
     next_event = min(events, key=lambda item: (item[0], item[1])) if events else None
     next_deadline_epoch = (
-        now_epoch + next_event[0] if next_event is not None else None
+        next_event[3] if next_event is not None else None
+    )
+    next_deadline_monotonic = (
+        now_monotonic + next_event[0] if next_event is not None else None
     )
     if exhausted:
-        quota_deadline_epoch = now_epoch
+        quota_deadline_epoch = accounting_now_epoch
+        quota_deadline_monotonic = now_monotonic
     else:
-        hard_delays = [
-            delay for delay in (daily_hard_delay, total_hard_delay)
-            if delay is not None
+        hard_deadlines = [
+            deadline
+            for deadline in (daily_hard_deadline, total_hard_deadline)
+            if deadline is not None
         ]
         quota_deadline_epoch = (
-            now_epoch + min(hard_delays) if hard_delays else None
+            min(hard_deadlines) if hard_deadlines else None
+        )
+        quota_deadline_monotonic = (
+            now_monotonic
+            + min(hard_deadlines) - accounting_now_epoch
+            if hard_deadlines
+            else None
         )
     return {
         "user": user,
         "plan": user.plan,
         "plan_expires_epoch": _utc_datetime_epoch(user.plan_expires),
+        "plan_expiry_remaining_seconds": plan_expiry_delay,
+        "plan_expiry_deadline_epoch": plan_expiry_deadline_epoch,
         "limits": limits,
         "now_epoch": now_epoch,
+        "wall_now_epoch": wall_now_epoch,
+        "now_monotonic": now_monotonic,
+        "accounting_now_epoch": accounting_now_epoch,
         "now_utc": now_utc,
         "runs": runs,
         "active_count": active_count,
@@ -1169,11 +1249,13 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
         "remaining_usage_seconds": remaining_usage,
         "estimated_wall_seconds": estimated_wall,
         "quota_deadline_epoch": quota_deadline_epoch,
+        "quota_deadline_monotonic": quota_deadline_monotonic,
         "quota_depleted": quota_depleted,
         "exhausted": exhausted,
         "exhaustion_reason": limiting[1] if limiting else None,
         "next_delay_seconds": next_event[0] if next_event else None,
         "next_deadline_epoch": next_deadline_epoch,
+        "next_deadline_monotonic": next_deadline_monotonic,
         "next_reason": next_event[2] if next_event else None,
     }
 
@@ -1206,15 +1288,30 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
     elapsed = max(0.0, started_epoch - snapshot_epoch)
     previous_active_count = max(0, int(quota_ready.get("active_count") or 0))
     active_count = previous_active_count + 1
-    plan_expiry_epoch = quota_ready.get("plan_expires_epoch")
-    if plan_expiry_epoch is not None:
-        plan_expiry_epoch = float(plan_expiry_epoch)
+    plan_expiry_remaining = quota_ready.get(
+        "plan_expiry_remaining_seconds"
+    )
+    if (
+        plan_expiry_remaining is None
+        and quota_ready.get("plan_expires_epoch") is not None
+    ):
+        plan_expiry_remaining = max(
+            0.0,
+            float(quota_ready["plan_expires_epoch"])
+            - float(quota_ready.get("wall_now_epoch", snapshot_epoch)),
+        )
+    plan_expiry_epoch = None
+    if plan_expiry_remaining is not None:
+        plan_expiry_epoch = started_epoch + max(
+            0.0,
+            float(plan_expiry_remaining) - elapsed,
+        )
 
     events = []
     hard_candidates = []
     daily_remaining = quota_ready.get("daily_remaining_seconds")
     if daily_remaining is not None:
-        started_utc = datetime.utcfromtimestamp(started_epoch)
+        started_utc = utc_from_epoch(started_epoch)
         started_midnight = started_utc.replace(
             hour=0,
             minute=0,
@@ -1222,7 +1319,7 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
             microsecond=0,
         )
         started_midnight_epoch = _utc_datetime_epoch(started_midnight)
-        snapshot_utc = datetime.utcfromtimestamp(snapshot_epoch)
+        snapshot_utc = utc_from_epoch(snapshot_epoch)
         snapshot_midnight = snapshot_utc.replace(
             hour=0,
             minute=0,
@@ -1297,9 +1394,11 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
         if hard_candidates
         else None
     )
+    delay_seconds = max(0.0, deadline - clock.steady_epoch())
     return {
         "deadline_epoch": deadline,
-        "delay_seconds": max(0.0, deadline - time.time()),
+        "deadline_monotonic": clock.monotonic() + delay_seconds,
+        "delay_seconds": delay_seconds,
         "reason": reason,
         "hard_deadline_epoch": hard_deadline,
     }
@@ -1354,7 +1453,7 @@ def _sync_user_target_stop_times_locked(user_id, quota_deadline_epoch=None):
                 expected_session_id=snapshot.get("session_id"),
                 expected_generation=snapshot.get("generation"),
             )
-        target = datetime.utcfromtimestamp(effective) if effective is not None else None
+        target = utc_from_epoch(effective) if effective is not None else None
         if account.is_boosting != runtime_active:
             account.is_boosting = runtime_active
             changed = True
@@ -1390,6 +1489,7 @@ def _install_user_quota_watchdog(
     reason,
     *,
     deadline_epoch=None,
+    deadline_monotonic=None,
     expected_generation=None,
     expected_token=None,
 ):
@@ -1408,6 +1508,16 @@ def _install_user_quota_watchdog(
     )
     if requested_deadline is not None and not math.isfinite(requested_deadline):
         raise ValueError("quota watchdog deadline must be finite")
+    requested_monotonic_deadline = (
+        float(deadline_monotonic)
+        if deadline_monotonic is not None
+        else None
+    )
+    if (
+        requested_monotonic_deadline is not None
+        and not math.isfinite(requested_monotonic_deadline)
+    ):
+        raise ValueError("quota watchdog monotonic deadline must be finite")
     with _quota_watchdog_lock:
         if expected_generation is not None or expected_token is not None:
             current_entry = _user_quota_watchdogs.get(user_id)
@@ -1420,13 +1530,23 @@ def _install_user_quota_watchdog(
                 )
             ):
                 return None
-        install_now = time.time()
+        install_now = clock.steady_epoch()
+        install_monotonic = clock.monotonic()
         if requested_deadline is None:
             effective_deadline = install_now + delay_seconds
             scheduled_delay = delay_seconds
         else:
             effective_deadline = requested_deadline
-            scheduled_delay = max(0.0, effective_deadline - install_now)
+            scheduled_delay = (
+                max(0.0, requested_monotonic_deadline - install_monotonic)
+                if requested_monotonic_deadline is not None
+                else max(0.0, effective_deadline - install_now)
+            )
+        effective_monotonic_deadline = (
+            requested_monotonic_deadline
+            if requested_monotonic_deadline is not None
+            else install_monotonic + scheduled_delay
+        )
         _quota_watchdog_generation += 1
         generation = _quota_watchdog_generation
         greenlet = gevent.spawn_later(
@@ -1442,6 +1562,7 @@ def _install_user_quota_watchdog(
             "token": token,
             "greenlet": greenlet,
             "deadline_epoch": effective_deadline,
+            "deadline_monotonic": effective_monotonic_deadline,
             "reason": reason,
         }
         previous = _user_quota_watchdogs.get(user_id)
@@ -1463,7 +1584,8 @@ def _install_user_quota_watchdog(
 def _claim_user_quota_hard_fence(user_id, generation, token):
     """Atomically linearize a hard quota deadline against plan changes."""
     user_id = int(user_id)
-    now_epoch = time.time()
+    now_epoch = clock.epoch()
+    now_monotonic = clock.monotonic()
     with _quota_watchdog_lock:
         entry = _user_quota_watchdogs.get(user_id)
         if not (
@@ -1475,13 +1597,17 @@ def _claim_user_quota_hard_fence(user_id, generation, token):
             return {"claimed": False, "stale": True}
 
         deadline_epoch = float(entry.get("deadline_epoch") or 0.0)
-        remaining = deadline_epoch - now_epoch
+        deadline_monotonic = float(
+            entry.get("deadline_monotonic") or now_monotonic
+        )
+        remaining = deadline_monotonic - now_monotonic
         if remaining > QUOTA_EXHAUSTION_EPSILON_SECONDS:
             return {
                 "claimed": False,
                 "early": True,
                 "remaining": remaining,
                 "deadline_epoch": deadline_epoch,
+                "deadline_monotonic": deadline_monotonic,
                 "reason": entry.get("reason"),
             }
 
@@ -1498,6 +1624,7 @@ def _claim_user_quota_hard_fence(user_id, generation, token):
             "generation": generation,
             "token": token,
             "deadline_epoch": deadline_epoch,
+            "deadline_monotonic": deadline_monotonic,
             "reason": entry.get("reason"),
             "claimed_at": now_epoch,
         }
@@ -1835,7 +1962,7 @@ def _stop_all_user_boosts_locked(user_id, reason, *, stopped_epoch=None):
     to keep SQLite safe.
     """
     observed_stop_epoch = (
-        time.time() if stopped_epoch is None else float(stopped_epoch)
+        clock.steady_epoch() if stopped_epoch is None else float(stopped_epoch)
     )
     stopped_epoch = _cap_user_hard_quota_stop_epoch(
         user_id,
@@ -1915,7 +2042,7 @@ def _stop_all_user_boosts_locked(user_id, reason, *, stopped_epoch=None):
 
 
 def _expire_user_plan_if_needed_locked(user, now_utc=None):
-    now_utc = now_utc or datetime.utcnow()
+    now_utc = as_utc(now_utc) if now_utc is not None else utc_now()
     if (
         user.plan != "free"
         and user.plan_expires is not None
@@ -2026,6 +2153,7 @@ def _reconcile_user_quota_locked(user_id, cause, *, enforce=True):
                 delay,
                 reason,
                 deadline_epoch=state.get("next_deadline_epoch"),
+                deadline_monotonic=state.get("next_deadline_monotonic"),
             )
         except Exception:
             logger.exception(
@@ -2073,6 +2201,7 @@ def _run_user_quota_watchdog(user_id, generation, token, reason):
                     claim["remaining"],
                     claim["reason"],
                     deadline_epoch=claim["deadline_epoch"],
+                    deadline_monotonic=claim["deadline_monotonic"],
                     expected_generation=generation,
                     expected_token=token,
                 )
@@ -2220,12 +2349,12 @@ def _run_user_quota_watchdog(user_id, generation, token, reason):
 
 _token_blacklist: set = set()
 _blacklist_lock = RLock()
-_blacklist_cleanup_last = time.time()
+_blacklist_cleanup_last = clock.monotonic()
 
 
 def _cleanup_blacklist():
     global _blacklist_cleanup_last
-    now = time.time()
+    now = clock.monotonic()
     if now - _blacklist_cleanup_last < 3600:
         return
     _blacklist_cleanup_last = now
@@ -2254,10 +2383,11 @@ def _cleanup_revoked_tokens():
 
 
 def generate_api_token(user_id, expires_hours=24 * 30):
+    issued_at = utc_now()
     payload = {
         "user_id": user_id,
-        "exp": datetime.utcnow() + timedelta(hours=expires_hours),
-        "iat": datetime.utcnow(),
+        "exp": issued_at + timedelta(hours=expires_hours),
+        "iat": issued_at,
         "jti": secrets.token_hex(16),
     }
     return pyjwt.encode(payload, Config.SECRET_KEY, algorithm="HS256")
@@ -2297,7 +2427,7 @@ def _verified_token_session(token):
     revoked = RevokedToken.query.filter_by(token_jti=jti).first()
     if revoked:
         # Kayıt hâlâ geçerliyse reddet; süresi gectiyse temizle.
-        if revoked.expires_at > datetime.utcnow():
+        if revoked.expires_at > utc_now():
             logger.info("Token iptal edilmiş (kalıcı): jti=%s", jti)
             return None
         try:
@@ -2317,14 +2447,14 @@ def _verified_token_session(token):
         is_active=True,
     ).filter(
         UserSession.expires_at.isnot(None),
-        UserSession.expires_at > datetime.utcnow(),
+        UserSession.expires_at > utc_now(),
     ).first()
     if active_session is None:
         return None
 
     iat = payload.get("iat")
     try:
-        iat_dt = datetime.utcfromtimestamp(int(iat))
+        iat_dt = utc_from_epoch(int(iat))
     except (TypeError, ValueError, OSError):
         return None
     user = db.session.get(User, user_id)
@@ -2357,7 +2487,7 @@ def _decode_token_for_revocation(token):
         )
         user_id = payload.get("user_id")
         jti = payload.get("jti")
-        expires_at = datetime.utcfromtimestamp(int(payload.get("exp")))
+        expires_at = utc_from_epoch(int(payload.get("exp")))
     except (pyjwt.InvalidTokenError, TypeError, ValueError, OSError):
         return None
     if (
@@ -2390,7 +2520,7 @@ def _stage_session_revocations(session_records, token_identities=()):
         if identity:
             identities[identity["jti"]] = identity
 
-    now = datetime.utcnow()
+    now = utc_now()
     valid_user_ids = set()
     if identities:
         valid_user_ids = {
@@ -2457,7 +2587,7 @@ def blacklist_token(token):
 def _invalidate_all_user_tokens(user):
     """Kullanıcının tüm JWT token'larını ve aktif oturumlarını geçersiz kıl.
     tokens_valid_after güncellenir; çağıran taraf commit etmelidir."""
-    user.tokens_valid_after = datetime.utcnow()
+    user.tokens_valid_after = utc_now()
     active_sessions = UserSession.query.filter_by(
         user_id=user.id,
         is_active=True,
@@ -2478,7 +2608,7 @@ _LOCKOUT_SECONDS = 300
 
 
 def is_locked_out(identifier: str) -> bool:
-    now = time.time()
+    now = clock.monotonic()
     with _failed_logins_lock:
         recent = [
             t for t in _failed_logins.get(identifier, [])
@@ -2494,7 +2624,7 @@ def is_locked_out(identifier: str) -> bool:
 
 def record_failed_login(identifier: str):
     with _failed_logins_lock:
-        _failed_logins[identifier].append(time.time())
+        _failed_logins[identifier].append(clock.monotonic())
         count = len(_failed_logins[identifier])
     if count >= _LOCKOUT_MAX_ATTEMPTS:
         logger.warning("Hesap/IP kilitlendi: %s (%d deneme)", identifier, count)
@@ -2539,8 +2669,8 @@ def _create_session_record(user_id: int, token: str):
         token_user_id = payload.get("user_id")
         token_jti = payload.get("jti")
         try:
-            expires_at = datetime.utcfromtimestamp(int(payload.get("exp")))
-            datetime.utcfromtimestamp(int(payload.get("iat")))
+            expires_at = utc_from_epoch(int(payload.get("exp")))
+            utc_from_epoch(int(payload.get("iat")))
         except (TypeError, ValueError, OSError):
             raise ValueError("JWT timestamps are invalid")
         if (
@@ -2549,7 +2679,7 @@ def _create_session_record(user_id: int, token: str):
             or token_user_id != user_id
             or not isinstance(token_jti, str)
             or not re.fullmatch(r"[0-9a-f]{32}", token_jti)
-            or expires_at <= datetime.utcnow()
+            or expires_at <= utc_now()
         ):
             raise ValueError("JWT session identity is invalid")
 
@@ -2610,7 +2740,7 @@ def _active_cookie_session():
         is_active=True,
     ).filter(
         UserSession.expires_at.isnot(None),
-        UserSession.expires_at > datetime.utcnow(),
+        UserSession.expires_at > utc_now(),
     ).first()
     if record is None:
         return None
@@ -2702,7 +2832,7 @@ def _ensure_schema():
                     f"AND plan IN ({plan_placeholders})"
                 ), {
                     **plan_params,
-                    "legacy_plan_epoch": datetime(1970, 1, 1),
+                    "legacy_plan_epoch": storage_utc(UTC_EPOCH),
                 })
             if backfilled.rowcount:
                 logger.warning(
@@ -2789,7 +2919,7 @@ def _ensure_schema():
         # cutoff'u eski kodun da bu JWT'leri reddetmesini sağlar; ardından satır
         # kapatılır. Böylece auth migration sonrası güvenli kod rollback'i
         # iptal edilmiş legacy oturumları yeniden canlandırmaz.
-        legacy_cutoff = datetime.utcnow()
+        legacy_cutoff = storage_utc(utc_now())
         with db.engine.begin() as conn:
             conn.execute(text(
                 "UPDATE users SET tokens_valid_after = :cutoff "
@@ -3038,6 +3168,144 @@ def _reconcile_boost_state_on_startup():
         raise
 
 
+def _restore_accounting_clock_on_startup():
+    """Restore the nondecreasing boost-accounting timeline from durable facts.
+
+    ``Clock.steady_epoch()`` deliberately ignores wall-clock steps, but its
+    anchor is process-local. A restart while wall UTC is still behind the
+    previous process must therefore derive a high-water mark from the quota
+    ledger, plan-window boundaries, and crash-durable pending segments before
+    any reconciliation or request can use the clock.
+
+    This operation is read-only. Values implausibly far ahead of wall UTC abort
+    startup for explicit operator review instead of silently skipping usage or
+    blindly moving the accounting timeline to corrupt data.
+    """
+
+    high_water = None
+    boost_log_count = 0
+    plan_boundary_count = 0
+
+    def include_epoch(value):
+        nonlocal high_water
+        value = float(value)
+        if not math.isfinite(value):
+            raise RuntimeError("Non-finite durable accounting timestamp")
+        high_water = value if high_water is None else max(high_water, value)
+
+    try:
+        rows = db.session.query(
+            BoostLog.started_at,
+            BoostLog.stopped_at,
+            BoostLog.duration_seconds,
+        ).yield_per(1000)
+        for started_at, stopped_at, duration_seconds in rows:
+            if started_at is None:
+                raise RuntimeError("BoostLog.started_at cannot be NULL")
+            started_epoch = utc_to_epoch(started_at)
+            try:
+                duration = float(duration_seconds or 0)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Invalid BoostLog.duration_seconds") from exc
+            if not math.isfinite(duration) or duration < 0:
+                raise RuntimeError("Invalid BoostLog.duration_seconds")
+
+            stopped_epoch = (
+                utc_to_epoch(stopped_at) if stopped_at is not None else None
+            )
+            effective_stop = stopped_epoch
+            if effective_stop is None or effective_stop <= started_epoch:
+                effective_stop = started_epoch + duration
+            include_epoch(started_epoch)
+            include_epoch(effective_stop)
+            boost_log_count += 1
+
+        total_plan_names = tuple(
+            name
+            for name, limits in Config.PLANS.items()
+            if limits.get("total_hours") is not None
+        )
+        if total_plan_names:
+            plan_boundaries = db.session.query(
+                User.plan_activated_at
+            ).filter(
+                User.plan.in_(total_plan_names),
+                User.plan_activated_at.isnot(None),
+            ).yield_per(1000)
+            for (plan_activated_at,) in plan_boundaries:
+                include_epoch(utc_to_epoch(plan_activated_at))
+                plan_boundary_count += 1
+
+        account_pairs = (
+            db.session.query(SteamAccount.id, SteamAccount.steam_username)
+            .order_by(SteamAccount.id)
+            .all()
+        )
+        pending_high_water = pending_final_segments_accounting_high_water(
+            account_pairs
+        )
+        if pending_high_water is not None:
+            include_epoch(pending_high_water)
+
+        wall_epoch = clock.epoch()
+        current_steady = clock.steady_epoch()
+        if high_water is None:
+            logger.info(
+                "Accounting clock restore: durable accounting history is empty"
+            )
+            return {
+                "advanced": False,
+                "high_water": None,
+                "steady_epoch": current_steady,
+                "boost_logs": 0,
+                "plan_boundaries": 0,
+                "accounts_scanned": len(account_pairs),
+            }
+
+        future_lead = high_water - wall_epoch
+        max_future = float(Config.ACCOUNTING_CLOCK_MAX_FUTURE_SECONDS)
+        if not math.isfinite(max_future) or max_future <= 0:
+            raise RuntimeError(
+                "ACCOUNTING_CLOCK_MAX_FUTURE_SECONDS must be positive"
+            )
+        if future_lead > max_future:
+            raise RuntimeError(
+                "Durable accounting timestamp exceeds wall UTC by "
+                f"{future_lead:.3f}s (limit={max_future:.3f}s)"
+            )
+
+        advanced = high_water > current_steady
+        restored = clock.advance_steady_floor(high_water)
+        log_method = logger.warning if advanced else logger.info
+        log_method(
+            "Accounting clock restore: advanced=%s high_water=%.6f "
+            "steady_epoch=%.6f wall_lead_seconds=%.3f boost_logs=%d "
+            "plan_boundaries=%d accounts_scanned=%d",
+            advanced,
+            high_water,
+            restored,
+            future_lead,
+            boost_log_count,
+            plan_boundary_count,
+            len(account_pairs),
+        )
+        return {
+            "advanced": advanced,
+            "high_water": high_water,
+            "steady_epoch": restored,
+            "boost_logs": boost_log_count,
+            "plan_boundaries": plan_boundary_count,
+            "accounts_scanned": len(account_pairs),
+        }
+    except Exception:
+        db.session.rollback()
+        logger.critical(
+            "Accounting clock restore failed; startup aborted",
+            exc_info=True,
+        )
+        raise
+
+
 def _reconcile_steam_credentials_on_startup():
     """Resolve interrupted deletions, then remove the legacy shared-token layout."""
     account_pairs = [
@@ -3061,6 +3329,7 @@ def _reconcile_steam_credentials_on_startup():
 with app.app_context():
     db.create_all()
     _ensure_schema()
+    _restore_accounting_clock_on_startup()
     _reconcile_steam_credentials_on_startup()
     _reconcile_boost_state_on_startup()
 
@@ -3116,7 +3385,9 @@ def _checkpoint_active_boosts_once():
                     if not snapshot.get("boosting") or snapshot.get("start_time") is None:
                         continue
 
-                    observed_stop_epoch = time.time()
+                    observed_stop_epoch = snapshot.get("observed_stop_time")
+                    if observed_stop_epoch is None:
+                        observed_stop_epoch = clock.steady_epoch()
                     stopped_epoch = _cap_user_hard_quota_stop_epoch(
                         owner_id,
                         observed_stop_epoch,
@@ -3129,7 +3400,11 @@ def _checkpoint_active_boosts_once():
                         expected_session_id=snapshot.get("session_id"),
                         expected_generation=snapshot.get("generation"),
                         min_elapsed=60,
-                        now=stopped_epoch,
+                        now=(
+                            None
+                            if stopped_epoch >= observed_stop_epoch
+                            else stopped_epoch
+                        ),
                     )
                     if checkpoint is None:
                         continue
@@ -3338,7 +3613,7 @@ def login_required(f):
                 UserSession.token_jti == g.get("_auth_jti"),
                 UserSession.is_active.is_(True),
                 UserSession.expires_at.isnot(None),
-                UserSession.expires_at > datetime.utcnow(),
+                UserSession.expires_at > utc_now(),
             ).first()
             if active_session is None:
                 session.clear()
@@ -3418,7 +3693,9 @@ def is_strong_password(pw) -> bool:
 
 
 def _checkout_cutoff(reference_time=None):
-    reference_time = reference_time or datetime.utcnow()
+    reference_time = (
+        as_utc(reference_time) if reference_time is not None else utc_now()
+    )
     return reference_time - timedelta(hours=Config.SHOPIER_CHECKOUT_TTL_HOURS)
 
 
@@ -3451,7 +3728,8 @@ def resolve_payment_from_note(note: str, reference_time=None):
 def _activate_plan(user, plan: str, *, reset_usage_window=True):
     """Kullanıcıya planı tanımla; süre Config.PLANS[plan]['duration_days']'ten
     okunur. None ise plan süresizdir (plan_expires=None). Çağıran commit eder."""
-    now_utc = datetime.utcnow()
+    now_utc = utc_from_epoch(clock.epoch())
+    accounting_now_utc = utc_from_epoch(clock.steady_epoch())
     # Watchdog replacement belongs to the caller's post-commit quota
     # reconciliation. Cancelling here would make a failed commit/rollback drop
     # enforcement for boosts that are still running under the old plan.
@@ -3461,7 +3739,10 @@ def _activate_plan(user, plan: str, *, reset_usage_window=True):
         now_utc + timedelta(days=duration_days) if duration_days else None
     )
     if reset_usage_window or user.plan_activated_at is None:
-        user.plan_activated_at = now_utc
+        # This is the quota-ledger boundary, not the payment audit timestamp.
+        # Keep it in the same steady UTC-shaped domain as BoostLog timestamps;
+        # ``verified_at`` and ``plan_expires`` remain real wall UTC.
+        user.plan_activated_at = accounting_now_utc
 
 
 _PLAN_RANK = {"free": 0, "basic": 1, "premium": 2}
@@ -3470,7 +3751,7 @@ _PLAN_RANK = {"free": 0, "basic": 1, "premium": 2}
 def _activate_paid_plan(user, plan: str) -> bool:
     """Apply a paid plan without allowing out-of-order payment downgrades."""
     current_rank = _PLAN_RANK.get(user.plan, 0)
-    if user.plan_expires and user.plan_expires <= datetime.utcnow():
+    if user.plan_expires and user.plan_expires <= utc_now():
         current_rank = 0
     if current_rank > _PLAN_RANK.get(plan, -1):
         return False
@@ -3520,7 +3801,7 @@ def _verification_retry_delay(attempt: int, retry_after=None) -> int:
 
 def _claim_due_payment(now=None):
     """Atomically lease one due row. Requires an active Flask app context."""
-    now = now or datetime.utcnow()
+    now = as_utc(now) if now is not None else utc_now()
     candidate = (
         Payment.query
         .filter(
@@ -3625,7 +3906,7 @@ def _schedule_verification_retry(payment_id, attempt, error):
     )
     payment.verification_error = reason
     payment.verification_last_http_status = http_status
-    payment.next_verification_at = datetime.utcnow() + timedelta(seconds=delay)
+    payment.next_verification_at = utc_now() + timedelta(seconds=delay)
     payment.verification_lock_until = None
     db.session.commit()
     logger.warning(
@@ -3646,7 +3927,7 @@ def _mark_financially_verified_unmatched(payment, canonical, reason):
     payment.plan = canonical.plan
     payment.amount = float(canonical.amount)
     payment.verified_amount_minor = canonical.amount_minor
-    payment.verified_at = datetime.utcnow()
+    payment.verified_at = utc_now()
     payment.status = "unmatched"
     payment.verification_error = _safe_verification_reason(reason)
     payment.verification_last_http_status = 200
@@ -3699,7 +3980,7 @@ def _finalize_canonical_order(
         if owner_id is None and not payment.match_token and canonical.token:
             checkout = _find_active_checkout_by_token(
                 canonical.token,
-                payment.webhook_received_at or datetime.utcnow(),
+                payment.webhook_received_at or utc_now(),
             )
             owner_id = checkout.user_id if checkout else None
         if owner_id is not None:
@@ -3739,14 +4020,14 @@ def _finalize_canonical_order(
                 payment.owner_user_id_snapshot or payment.user_id
             )
             if payment.user_id is not None and payment.owner_detached_at is None:
-                payment.owner_detached_at = datetime.utcnow()
+                payment.owner_detached_at = utc_now()
             return _commit_financially_verified_unmatched(
                 payment, canonical, "owner_not_found"
             )
     else:
         target = _find_active_checkout_by_token(
             canonical.token,
-            payment.webhook_received_at or datetime.utcnow(),
+            payment.webhook_received_at or utc_now(),
         )
         if not target or not target.user_id:
             return _commit_financially_verified_unmatched(
@@ -3755,7 +4036,7 @@ def _finalize_canonical_order(
 
         user = _locked_user(target.user_id)
         if not user:
-            detached_at = target.owner_detached_at or datetime.utcnow()
+            detached_at = target.owner_detached_at or utc_now()
             payment.owner_user_id_snapshot = (
                 target.owner_user_id_snapshot or target.user_id
             )
@@ -3810,7 +4091,7 @@ def _finalize_canonical_order(
             target.owner_user_id_snapshot or target.user_id
         )
         if target.user_id is not None and target.owner_detached_at is None:
-            target.owner_detached_at = datetime.utcnow()
+            target.owner_detached_at = utc_now()
         return _commit_financially_verified_unmatched(
             target, canonical, "owner_not_found"
         )
@@ -3819,7 +4100,7 @@ def _finalize_canonical_order(
     target.plan = canonical.plan
     target.amount = float(canonical.amount)
     target.verified_amount_minor = canonical.amount_minor
-    target.verified_at = datetime.utcnow()
+    target.verified_at = utc_now()
     target.verification_error = None
     target.verification_last_http_status = 200
     target.next_verification_at = None
@@ -3991,7 +4272,7 @@ def set_maintenance_mode(enabled: bool) -> None:
     if enabled:
         os.makedirs(app.instance_path, exist_ok=True)
         with open(MAINTENANCE_FLAG_PATH, "w") as f:
-            f.write(datetime.utcnow().isoformat() + "\n")
+            f.write(utc_iso_z(utc_now()) + "\n")
     else:
         try:
             os.remove(MAINTENANCE_FLAG_PATH)
@@ -4165,7 +4446,7 @@ def check_plan_expiry():
     uid = g.get("_auth_user_id")
     if not uid:
         return
-    now = time.time()
+    now = clock.monotonic()
     last = _plan_expiry_cache.get(uid, 0)
     if now - last < _PLAN_CHECK_INTERVAL:
         return
@@ -4181,7 +4462,7 @@ def check_plan_expiry():
     plan_may_be_expired = bool(
         user.plan != "free"
         and user.plan_expires
-        and user.plan_expires <= datetime.utcnow()
+        and user.plan_expires <= utc_now()
     )
     db.session.rollback()
     if plan_may_be_expired:
@@ -4205,7 +4486,7 @@ def check_plan_expiry():
                 user_id=uid,
                 is_active=True,
             ).update(
-                {"last_seen": datetime.utcnow()}, synchronize_session=False
+                {"last_seen": utc_now()}, synchronize_session=False
             )
             db.session.commit()
         except Exception:
@@ -4437,7 +4718,7 @@ def plan_info():
             "total_hours": limits.get("total_hours"),
             "price": limits["price"],
             "current_accounts": acct_count,
-            "plan_expires": user.plan_expires.isoformat() if user.plan_expires else None,
+            "plan_expires": utc_iso_z(user.plan_expires),
             "all_plans": Config.PLANS,
             "is_verified": user.is_verified,
             "quota_remaining_seconds": (
@@ -4483,7 +4764,7 @@ def register():
         email=e,
         is_verified=False,
         verification_token=verification_token,
-        verification_sent_at=datetime.utcnow(),
+        verification_sent_at=utc_now(),
         lang=lang,
     )
     from sqlalchemy.exc import IntegrityError
@@ -4570,7 +4851,7 @@ def verify_email():
             ),
         }), 400
 
-    elapsed = datetime.utcnow() - user.verification_sent_at
+    elapsed = utc_now() - user.verification_sent_at
     if elapsed.total_seconds() > 86400:
         return jsonify({
             "ok": False,
@@ -4623,14 +4904,14 @@ def resend_verification():
         return jsonify({"ok": False, "error": "Your account is already verified." if lang == "en" else "Hesabiniz zaten dogrulanmis."})
 
     if user.verification_sent_at:
-        elapsed = (datetime.utcnow() - user.verification_sent_at).total_seconds()
+        elapsed = (utc_now() - user.verification_sent_at).total_seconds()
         if elapsed < 300:
             remaining = int(300 - elapsed)
             return jsonify({"ok": False, "error": f"Please wait {remaining} seconds." if lang == "en" else f"Lutfen {remaining} saniye bekleyin."})
 
     token = secrets.token_urlsafe(32)
     user.verification_token = token
-    user.verification_sent_at = datetime.utcnow()
+    user.verification_sent_at = utc_now()
     db.session.commit()
 
     # Mail gönderimini bloklamadan arka planda yap (register/forgot ile tutarlı).
@@ -4664,13 +4945,13 @@ def forgot_password():
         return jsonify(_generic_msg)
 
     if user.reset_token_expires:
-        remaining = (user.reset_token_expires - datetime.utcnow()).total_seconds()
+        remaining = (user.reset_token_expires - utc_now()).total_seconds()
         if remaining > (3600 - 300):
             return jsonify(_generic_msg)
 
     token = secrets.token_urlsafe(32)
     user.reset_token = token
-    user.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
+    user.reset_token_expires = utc_now() + timedelta(hours=1)
     db.session.commit()
 
     user_lang = getattr(user, "lang", "tr") or "tr"
@@ -4712,7 +4993,7 @@ def validate_reset_password_token():
                 else "Geçersiz veya süresi dolmuş link."
             ),
         }), 400
-    if datetime.utcnow() > user.reset_token_expires:
+    if utc_now() > user.reset_token_expires:
         return jsonify({
             "ok": False,
             "error": (
@@ -4757,7 +5038,7 @@ def reset_password():
             "ok": False,
             "error": "Invalid link." if lang == "en" else "Geçersiz link.",
         }), 400
-    if datetime.utcnow() > user.reset_token_expires:
+    if utc_now() > user.reset_token_expires:
         return jsonify({
             "ok": False,
             "error": (
@@ -4884,7 +5165,7 @@ def change_email():
         return jsonify({"ok": False, "error": "This is already your current email address."})
 
     if user.email_change_expires:
-        remaining = (user.email_change_expires - datetime.utcnow()).total_seconds()
+        remaining = (user.email_change_expires - utc_now()).total_seconds()
         if remaining > 0:
             return jsonify({"ok": False, "error": "Please wait."})
 
@@ -4898,7 +5179,7 @@ def change_email():
     token = secrets.token_urlsafe(32)
     user.email_change_token = token
     user.email_change_new = new_email
-    user.email_change_expires = datetime.utcnow() + timedelta(hours=1)
+    user.email_change_expires = utc_now() + timedelta(hours=1)
     try:
         db.session.commit()
     except Exception as e:
@@ -4969,7 +5250,7 @@ def confirm_email_change():
                 else "Geçersiz veya süresi dolmuş link."
             ),
         }), 400
-    if datetime.utcnow() > user.email_change_expires:
+    if utc_now() > user.email_change_expires:
         return jsonify({
             "ok": False,
             "error": (
@@ -5047,7 +5328,7 @@ def site_login():
 
     clear_failed_logins(ip_key)
 
-    user.last_login = db.func.now()
+    user.last_login = utc_now()
     db.session.commit()
 
     token = generate_api_token(user.id)
@@ -5116,7 +5397,7 @@ def list_sessions():
         .filter(
             UserSession.token_jti.isnot(None),
             UserSession.expires_at.isnot(None),
-            UserSession.expires_at > datetime.utcnow(),
+            UserSession.expires_at > utc_now(),
         )
         .order_by(UserSession.last_seen.desc())
         .all()
@@ -5143,8 +5424,8 @@ def list_sessions():
             "ip": s.ip_address or "Unknown",
             "device": device,
             "user_agent": ua[:80] + ("..." if len(ua) > 80 else ""),
-            "created_at": s.created_at.isoformat(),
-            "last_seen": s.last_seen.isoformat(),
+            "created_at": utc_iso_z(s.created_at),
+            "last_seen": utc_iso_z(s.last_seen),
             "is_current": s.id == current_session_id,
         })
 
@@ -5399,7 +5680,7 @@ def shopier_webhook():
         shopier_timestamp = int(timestamp_raw)
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid timestamp"}), 400
-    if shopier_timestamp <= 0 or shopier_timestamp > int(time.time()) + 300:
+    if shopier_timestamp <= 0 or shopier_timestamp > int(clock.epoch()) + 300:
         return jsonify({"error": "Invalid timestamp"}), 400
 
     if not hmac.compare_digest(account_id, str(Config.SHOPIER_ACCOUNT_ID)):
@@ -5433,7 +5714,7 @@ def shopier_webhook():
         )
         return jsonify({"ok": True, "duplicate": True}), 200
 
-    received_at = datetime.utcnow()
+    received_at = utc_now()
     body_sha256 = hashlib.sha256(raw_body).hexdigest()
     _user, matched_payment = resolve_payment_from_note(
         data.get("note"), received_at
@@ -6190,7 +6471,7 @@ def _stop_boost_session_and_persist(
             acct_id,
             user_id,
             started_epoch=None,
-            stopped_epoch=time.time(),
+            stopped_epoch=clock.steady_epoch(),
             duration_seconds=0,
             app_ids=snapshot.get("app_ids") or [],
         )
@@ -6203,8 +6484,12 @@ def _stop_boost_session_and_persist(
 
     requested_stop_epoch = stopped_epoch
     observed_stop_epoch = (
-        time.time() if requested_stop_epoch is None else float(requested_stop_epoch)
+        snapshot.get("observed_stop_time")
+        if requested_stop_epoch is None
+        else float(requested_stop_epoch)
     )
+    if observed_stop_epoch is None:
+        observed_stop_epoch = clock.steady_epoch()
     stopped_epoch = _cap_user_hard_quota_stop_epoch(
         user_id,
         observed_stop_epoch,
@@ -6345,7 +6630,7 @@ def _run_boost_stop_timer(acct_id, user_id, session_id, generation, reason):
                         acct_id,
                         user_id,
                         started_epoch=None,
-                        stopped_epoch=time.time(),
+                        stopped_epoch=clock.steady_epoch(),
                         duration_seconds=0,
                         app_ids=acct.app_ids(),
                     )
@@ -6414,7 +6699,7 @@ def _schedule_boost_stop_timer(
     reason,
 ):
     delay_seconds = max(0.0, float(delay_seconds))
-    deadline_epoch = time.time() + delay_seconds
+    deadline_epoch = clock.steady_epoch() + delay_seconds
     timer = gevent.spawn_later(
         delay_seconds,
         _run_boost_stop_timer,
@@ -6645,7 +6930,7 @@ def toggle_boost():
                 acct_id,
                 user_id,
                 started_epoch=None,
-                stopped_epoch=time.time(),
+                stopped_epoch=clock.steady_epoch(),
                 duration_seconds=0,
                 app_ids=ids,
             )
@@ -6663,7 +6948,7 @@ def toggle_boost():
                 acct_id,
                 user_id,
                 started_epoch=None,
-                stopped_epoch=time.time(),
+                stopped_epoch=clock.steady_epoch(),
                 duration_seconds=0,
                 app_ids=ids,
             )
@@ -6714,6 +6999,7 @@ def toggle_boost():
                     provisional["delay_seconds"],
                     provisional["reason"],
                     deadline_epoch=provisional["deadline_epoch"],
+                    deadline_monotonic=provisional["deadline_monotonic"],
                 )
                 if reserved_watchdog is None:
                     raise RuntimeError("provisional quota watchdog was stale")
@@ -6792,16 +7078,23 @@ def toggle_boost():
                 next_delay = 0.0
                 next_reason = quota_after_start.get("exhaustion_reason")
                 next_deadline = quota_deadline
+                next_monotonic_deadline = quota_after_start.get(
+                    "quota_deadline_monotonic"
+                )
             else:
                 next_delay = quota_after_start.get("next_delay_seconds")
                 next_reason = quota_after_start.get("next_reason")
                 next_deadline = quota_after_start.get("next_deadline_epoch")
+                next_monotonic_deadline = quota_after_start.get(
+                    "next_deadline_monotonic"
+                )
             if next_delay is not None and next_reason is not None:
                 reserved_watchdog = _install_user_quota_watchdog(
                     user_id,
                     next_delay,
                     next_reason,
                     deadline_epoch=next_deadline,
+                    deadline_monotonic=next_monotonic_deadline,
                 )
                 if reserved_watchdog is None:
                     raise RuntimeError("quota watchdog reservation was stale")
@@ -6915,7 +7208,7 @@ def toggle_boost():
 
         acct_db.is_boosting = True
         acct_db.target_stop_time = (
-            datetime.utcfromtimestamp(effective_deadline)
+            utc_from_epoch(effective_deadline)
             if effective_deadline is not None
             else None
         )
@@ -6962,7 +7255,7 @@ def toggle_boost():
                     user_id,
                     started.get("session_id"),
                     started.get("generation"),
-                    max(0.0, user_timer_deadline - time.time()),
+                    max(0.0, user_timer_deadline - clock.steady_epoch()),
                     "user_timer",
                 )
             except Exception:
@@ -7140,7 +7433,7 @@ def toggle_boost():
 def my_stats():
     from sqlalchemy import func
     user = g.user
-    now_utc = datetime.utcnow()
+    now_utc = utc_now()
     total_seconds = (
         db.session.query(func.sum(BoostLog.duration_seconds))
         .filter_by(user_id=user.id).scalar() or 0
@@ -7167,7 +7460,7 @@ def my_stats():
     plan_start = (
         user.plan_activated_at
         or user.created_at
-        or datetime(1970, 1, 1)
+        or UTC_EPOCH
     )
     plan_used_seconds = _get_logged_seconds(
         user.id,
@@ -7187,7 +7480,7 @@ def my_stats():
         "total_sessions": total_sessions,
         "accounts_count": SteamAccount.query.filter_by(user_id=user.id).count(),
         "plan": user.plan,
-        "member_since": user.created_at.isoformat(),
+        "member_since": utc_iso_z(user.created_at),
         "daily": [{"day": str(d.day), "hours": round(d.total / 3600, 1)} for d in daily],
     })
 
@@ -7226,7 +7519,7 @@ def game_stats():
 def stats_detailed():
     from sqlalchemy import func
     user = g.user
-    now_utc = datetime.utcnow()
+    now_utc = utc_now()
 
     # ── Son 7 gün: günlük saat dağılımı ──
     week_ago = now_utc - timedelta(days=7)
@@ -7362,7 +7655,7 @@ def get_announcements():
     )
     return jsonify([{
         "id": a.id, "title": a.title, "content": a.content,
-        "type": a.type, "date": a.created_at.isoformat(),
+        "type": a.type, "date": utc_iso_z(a.created_at),
     } for a in anns])
 
 
@@ -7370,7 +7663,7 @@ def get_announcements():
 
 @app.route("/server_status")
 def server_status():
-    uptime = int(time.time() - SERVER_START)
+    uptime = int(clock.monotonic() - SERVER_START)
     stats = boost_service.stats()
     total_users = User.query.count()
     return jsonify({"uptime": uptime, "active_boosts": stats["active_boosts"], "total_users": total_users})
@@ -7461,7 +7754,7 @@ def game_info():
         app_ids.append(app_id)
 
     results = {}
-    now = time.time()
+    now = clock.monotonic()
     for aid in app_ids:
         with game_cache_lock:
             cached = game_cache.get(aid)
@@ -7512,7 +7805,7 @@ def admin_stats():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    now = datetime.utcnow()
+    now = utc_now()
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
@@ -7594,10 +7887,10 @@ def admin_users():
     return jsonify({
         "users": [{
             "id": u.id, "username": u.username, "email": u.email, "plan": u.plan,
-            "plan_expires": u.plan_expires.isoformat() if u.plan_expires else None,
+            "plan_expires": utc_iso_z(u.plan_expires),
             "accounts": SteamAccount.query.filter_by(user_id=u.id).count(),
-            "created_at": u.created_at.isoformat(),
-            "last_login": u.last_login.isoformat() if u.last_login else None,
+            "created_at": utc_iso_z(u.created_at),
+            "last_login": utc_iso_z(u.last_login),
             "is_admin": u.is_admin,
         } for u in users.items],
         "total": users.total, "pages": users.pages, "current_page": page,
@@ -7750,7 +8043,7 @@ def admin_payments():
         "transaction_id": p.transaction_id or "",
         "verification_error": p.verification_error or "",
         "verification_attempts": p.verification_attempts or 0,
-        "verified_at": p.verified_at.isoformat() if p.verified_at else None,
+        "verified_at": utc_iso_z(p.verified_at),
         "can_match": bool(
             p.status == "unmatched"
             and p.verified_at
@@ -7759,7 +8052,7 @@ def admin_payments():
             and p.plan in ("basic", "premium")
         ),
         "can_retry": bool(p.status == "verification_failed" and p.transaction_id),
-        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "created_at": utc_iso_z(p.created_at),
     } for p in payments]})
 
 
@@ -7988,7 +8281,7 @@ def admin_retry_payment():
                 verification_attempts=0,
                 verification_error=None,
                 verification_last_http_status=None,
-                next_verification_at=datetime.utcnow(),
+                next_verification_at=utc_now(),
                 verification_lock_until=None,
             )
         )
@@ -8307,7 +8600,7 @@ def admin_delete_user():
 
     deletion_committed = False
     try:
-        detached_at = datetime.utcnow()
+        detached_at = utc_now()
         for payment in payments:
             old_status = payment.status
             payment.owner_user_id_snapshot = target_id
@@ -8689,7 +8982,7 @@ def steam_callback():
     user = User.query.filter_by(steam_id=steam_id).first()
 
     if user:
-        user.last_login = datetime.utcnow()
+        user.last_login = utc_now()
         user.steam_avatar = avatar
         user.steam_display_name = display_name
         db.session.commit()

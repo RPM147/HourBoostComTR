@@ -92,6 +92,12 @@ class Config:
 
     STEAM_CACHE_TTL = 86400
     RECONNECT_MAX = 5
+    # Restore the monotonic accounting timeline from durable boost facts after
+    # restart. A larger lead over wall UTC fails startup for operator review.
+    ACCOUNTING_CLOCK_MAX_FUTURE_SECONDS = _env_positive_int(
+        "ACCOUNTING_CLOCK_MAX_FUTURE_SECONDS",
+        7 * 24 * 3600,
+    )
 
     # ── Shopier ───────────────────────────────────────
     SHOPIER_PAT = os.environ.get("SHOPIER_PAT")

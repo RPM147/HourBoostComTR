@@ -1,6 +1,6 @@
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from time_utils import UTCDateTime, utc_now
 
 db = SQLAlchemy()
 PASSWORD_HASH_METHOD = "pbkdf2:sha256:600000"
@@ -14,14 +14,14 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
     plan = db.Column(db.String(20), default="free")
-    plan_expires = db.Column(db.DateTime, nullable=True)
-    plan_activated_at = db.Column(db.DateTime, nullable=True)
+    plan_expires = db.Column(UTCDateTime(), nullable=True)
+    plan_activated_at = db.Column(UTCDateTime(), nullable=True)
     is_admin = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_login = db.Column(db.DateTime)
+    created_at = db.Column(UTCDateTime(), default=utc_now)
+    last_login = db.Column(UTCDateTime())
     # Bu tarihten ÖNCE üretilmiş JWT token'lar geçersiz sayılır
     # (şifre değişimi / oturum iptali sonrası set edilir).
-    tokens_valid_after = db.Column(db.DateTime, nullable=True)
+    tokens_valid_after = db.Column(UTCDateTime(), nullable=True)
     lang = db.Column(db.String(5), default="tr", nullable=True)
     steam_id = db.Column(db.String(20), nullable=True, unique=True)
     steam_avatar = db.Column(db.String(256), nullable=True)
@@ -30,16 +30,16 @@ class User(db.Model):
     # ── E-posta doğrulama ──────────────────────────
     is_verified = db.Column(db.Boolean, default=False)
     verification_token = db.Column(db.String(64), nullable=True, unique=True)
-    verification_sent_at = db.Column(db.DateTime, nullable=True)
+    verification_sent_at = db.Column(UTCDateTime(), nullable=True)
 
     # ── Şifre sıfırlama ───────────────────────────
     reset_token = db.Column(db.String(64), nullable=True, unique=True)
-    reset_token_expires = db.Column(db.DateTime, nullable=True)
+    reset_token_expires = db.Column(UTCDateTime(), nullable=True)
 
     # ── E-posta değiştirme ────────────────────────
     email_change_token = db.Column(db.String(64), nullable=True, unique=True)
     email_change_new = db.Column(db.String(120), nullable=True)
-    email_change_expires = db.Column(db.DateTime, nullable=True)
+    email_change_expires = db.Column(UTCDateTime(), nullable=True)
 
     steam_accounts = db.relationship(
         "SteamAccount", backref="owner", lazy=True, cascade="all, delete-orphan"
@@ -68,8 +68,8 @@ class SteamAccount(db.Model):
     steam_id = db.Column(db.String(20))
     persona_state = db.Column(db.Integer, default=1)
     is_boosting = db.Column(db.Boolean, default=False)
-    target_stop_time = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    target_stop_time = db.Column(UTCDateTime(), nullable=True)
+    created_at = db.Column(UTCDateTime(), default=utc_now)
 
     games = db.relationship(
         "BoostGame", backref="account", lazy=True, cascade="all, delete-orphan"
@@ -97,7 +97,7 @@ class Payment(db.Model):
     # destroying the payment ledger or reattaching history to a reused ID.
     owner_user_id_snapshot = db.Column(db.Integer, nullable=True)
     owner_username_snapshot = db.Column(db.String(80), nullable=True)
-    owner_detached_at = db.Column(db.DateTime, nullable=True)
+    owner_detached_at = db.Column(UTCDateTime(), nullable=True)
     amount = db.Column(db.Float)
     plan = db.Column(db.String(20))
     status = db.Column(db.String(32), default="pending")
@@ -115,19 +115,19 @@ class Payment(db.Model):
     shopier_account_id = db.Column(db.String(100), nullable=True)
     shopier_timestamp = db.Column(db.BigInteger, nullable=True)
     webhook_body_sha256 = db.Column(db.String(64), nullable=True)
-    webhook_received_at = db.Column(db.DateTime, nullable=True)
+    webhook_received_at = db.Column(UTCDateTime(), nullable=True)
     verification_attempts = db.Column(
         db.Integer, nullable=False, default=0, server_default="0"
     )
     verification_error = db.Column(db.String(255), nullable=True)
     verification_last_http_status = db.Column(db.Integer, nullable=True)
-    next_verification_at = db.Column(db.DateTime, nullable=True)
-    verification_lock_until = db.Column(db.DateTime, nullable=True)
-    verified_at = db.Column(db.DateTime, nullable=True)
+    next_verification_at = db.Column(UTCDateTime(), nullable=True)
+    verification_lock_until = db.Column(UTCDateTime(), nullable=True)
+    verified_at = db.Column(UTCDateTime(), nullable=True)
     # Finansal doğrulamanın tam sayı kuruş karşılığı; amount yalnız gösterim ve
     # eski raporlarla uyumluluk içindir.
     verified_amount_minor = db.Column(db.Integer, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(UTCDateTime(), default=utc_now)
 
 
 class PaymentAuditLog(db.Model):
@@ -143,7 +143,7 @@ class PaymentAuditLog(db.Model):
     from_status = db.Column(db.String(32), nullable=True)
     to_status = db.Column(db.String(32), nullable=True)
     reason = db.Column(db.String(255), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(UTCDateTime(), default=utc_now, nullable=False)
 
 
 class BoostLog(db.Model):
@@ -168,13 +168,13 @@ class BoostLog(db.Model):
     steam_username_snapshot = db.Column(db.String(100), nullable=True)
     owner_user_id_snapshot = db.Column(db.Integer, nullable=True)
     owner_username_snapshot = db.Column(db.String(80), nullable=True)
-    started_at = db.Column(db.DateTime, nullable=False)
-    stopped_at = db.Column(db.DateTime)
+    started_at = db.Column(UTCDateTime(), nullable=False)
+    stopped_at = db.Column(UTCDateTime())
     # Canonical quota accounting stops at ``stopped_at``.  This separate audit
     # timestamp records when the Steam worker was actually confirmed dead or
     # accepted stop-games, so enforcement latency is observable rather than
     # hidden by backdating the billable boundary.
-    remote_stopped_at = db.Column(db.DateTime, nullable=True)
+    remote_stopped_at = db.Column(UTCDateTime(), nullable=True)
     duration_seconds = db.Column(db.Integer, default=0)
     games_count = db.Column(db.Integer, default=0)
     app_ids_json = db.Column(db.Text, nullable=True)
@@ -188,7 +188,7 @@ class Announcement(db.Model):
     content = db.Column(db.Text, nullable=False)
     type = db.Column(db.String(20), default="info")
     is_active = db.Column(db.Boolean, default=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(UTCDateTime(), default=utc_now)
 
 
 class UserSession(db.Model):
@@ -205,11 +205,11 @@ class UserSession(db.Model):
     token_hint = db.Column(db.String(32), nullable=True)
     # JWT ve Flask cookie aynı mutlak sona erme zamanını paylaşır; aksi halde
     # Flask'ın yenilenen permanent cookie'si JWT'den daha uzun yaşayabilir.
-    expires_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(UTCDateTime(), nullable=True)
     ip_address = db.Column(db.String(64), nullable=True)
     user_agent = db.Column(db.String(256), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(UTCDateTime(), default=utc_now)
+    last_seen = db.Column(UTCDateTime(), default=utc_now)
     is_active = db.Column(db.Boolean, default=True)
 
 
@@ -220,13 +220,13 @@ class RevokedToken(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     token_jti = db.Column(db.String(128), unique=True, nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
+    revoked_at = db.Column(UTCDateTime(), default=utc_now, nullable=False)
+    expires_at = db.Column(UTCDateTime(), nullable=False)
 
     @classmethod
     def cleanup_expired(cls):
         """Süresi dolmuş token'ları veritabanından temizle."""
         from sqlalchemy import delete
-        now = datetime.utcnow()
+        now = utc_now()
         db.session.execute(delete(cls).where(cls.expires_at < now))
         db.session.commit()

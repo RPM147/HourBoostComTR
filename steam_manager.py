@@ -18,6 +18,7 @@ from gevent import subprocess
 
 from log_security import protect_logger
 from steam_compat import EPersonaState, EResult
+from time_utils import clock
 
 logger = protect_logger(logging.getLogger(__name__))
 
@@ -152,6 +153,124 @@ def _pending_final_segments_path(account_id):
         _node_account_data_dir(account_id),
         "pending-final-segments.json",
     )
+
+
+def _read_pending_final_segments(account_id, steam_username):
+    """Load and validate one account's crash-durable segment journal."""
+
+    path = _pending_final_segments_path(account_id)
+    if not _path_exists(path):
+        return []
+    try:
+        file_stat = os.lstat(path)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_size > MAX_PENDING_STATE_BYTES
+        ):
+            raise ValueError("Invalid pending segment state file")
+        with open(path, "r", encoding="utf-8") as handle:
+            raw_segments = json.load(handle)
+        if (
+            not isinstance(raw_segments, list)
+            or len(raw_segments) > MAX_PENDING_FINAL_SEGMENTS
+        ):
+            raise ValueError("Invalid pending segment state payload")
+
+        segments = []
+        for raw in raw_segments:
+            if not isinstance(raw, dict):
+                raise ValueError("Invalid pending segment")
+            session_id = raw.get("session_id")
+            generation = raw.get("generation")
+            started_at = float(raw.get("started_at"))
+            stopped_at = float(raw.get("stopped_at"))
+            app_ids = raw.get("app_ids")
+            remote_confirmed = raw.get("remote_stop_confirmed")
+            checkpoint_only = raw.get("checkpoint_only", False)
+            raw_remote_stopped_at = raw.get("remote_stopped_at")
+            remote_stopped_at = (
+                None
+                if raw_remote_stopped_at is None
+                else float(raw_remote_stopped_at)
+            )
+            if (
+                raw.get("account_id") != account_id
+                or not isinstance(session_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id)
+                or type(generation) is not int
+                or generation < 0
+                or not math.isfinite(started_at)
+                or not math.isfinite(stopped_at)
+                or stopped_at < started_at
+                or not isinstance(app_ids, list)
+                or len(app_ids) > 64
+                or any(type(app_id) is not int or app_id <= 0 for app_id in app_ids)
+                or type(remote_confirmed) is not bool
+                or type(checkpoint_only) is not bool
+                or (
+                    remote_stopped_at is not None
+                    and not math.isfinite(remote_stopped_at)
+                )
+            ):
+                raise ValueError("Invalid pending segment fields")
+            segments.append({
+                "account_id": account_id,
+                "session_id": session_id,
+                "generation": generation,
+                "started_at": started_at,
+                "stopped_at": stopped_at,
+                "elapsed": max(0, stopped_at - started_at),
+                "app_ids": list(app_ids),
+                "remote_stop_confirmed": remote_confirmed,
+                "remote_stopped_at": remote_stopped_at,
+                "checkpoint_only": checkpoint_only,
+            })
+        return segments
+    except Exception as exc:
+        logger.critical(
+            "[%s] Pending boost state could not be loaded: %s",
+            steam_username,
+            type(exc).__name__,
+        )
+        # Normal account hydration remains fail-closed at account scope. The
+        # startup high-water restoration below escalates this sentinel to a
+        # boot failure because ignoring a durable segment could grant quota.
+        return [{
+            "account_id": account_id,
+            "session_id": "corrupt-pending-state",
+            "generation": 0,
+            "started_at": 0.0,
+            "stopped_at": 0.0,
+            "elapsed": 0.0,
+            "app_ids": [],
+            "remote_stop_confirmed": False,
+            "remote_stopped_at": None,
+            "checkpoint_only": False,
+            "state_corrupt": True,
+        }]
+
+
+def pending_final_segments_accounting_high_water(account_pairs):
+    """Return the highest validated pending accounting instant.
+
+    Only database-known account IDs are supplied by the application. A corrupt
+    current-account journal aborts startup instead of silently skipping usage.
+    """
+
+    high_water = None
+    for account_id, steam_username in account_pairs:
+        segments = _read_pending_final_segments(account_id, steam_username)
+        if any(segment.get("state_corrupt") for segment in segments):
+            raise RuntimeError(
+                f"Corrupt pending boost state for account_id={account_id}"
+            )
+        for segment in segments:
+            high_water = max(
+                high_water if high_water is not None else segment["started_at"],
+                segment["started_at"],
+                segment["stopped_at"],
+            )
+    return high_water
 
 
 def _account_node_machine_auth_path(account_id, steam_username):
@@ -1039,9 +1158,10 @@ class QuotaFenceActiveError(RuntimeError):
 
 
 class SteamAccountManager:
-    def __init__(self, account_id, steam_username):
+    def __init__(self, account_id, steam_username, clock_source=None):
         self.account_id = account_id
         self.steam_username = steam_username
+        self._clock = clock_source or clock
         self.client = _make_client(account_id)
         # All mutable runtime state for one Steam account is serialized through
         # this gevent-aware lock. It is public so route/timer/checkpoint code can
@@ -1063,7 +1183,15 @@ class SteamAccountManager:
         self.boosting = False
         self.start_time = None
         self.original_start_time = None
+        # Persistent/audit timestamps remain wall-clock UTC epochs. Billable
+        # elapsed time is measured against this process-local monotonic shadow,
+        # so an NTP/manual clock correction cannot create negative or inflated
+        # boost usage. The paired epoch detects legacy/tests that directly
+        # replace ``start_time`` and safely falls back to wall-clock semantics.
+        self._segment_clock_epoch = None
+        self._segment_clock_monotonic = None
         self._runtime_stop_deadline = None
+        self._runtime_stop_deadline_monotonic = None
         self.app_ids = []
         self.persona_state = 1
         self.boost_session_id = None
@@ -1137,18 +1265,68 @@ class SteamAccountManager:
             return False
         return True
 
+    def _observe_active_segment_unlocked(self, stopped_at=None):
+        """Return a stable stop epoch, elapsed seconds and monotonic sample.
+
+        Default observations use the monotonic shadow established at boost
+        start/checkpoint. Explicit stop boundaries remain authoritative because
+        hard quota fences need one canonical epoch across multiple accounts.
+        """
+        if self.start_time is None:
+            return None, 0.0, None
+
+        started_at = float(self.start_time)
+        monotonic_now = self._clock.monotonic()
+        if stopped_at is None:
+            if (
+                self._segment_clock_epoch == started_at
+                and self._segment_clock_monotonic is not None
+            ):
+                elapsed = max(
+                    0.0,
+                    monotonic_now - float(self._segment_clock_monotonic),
+                )
+                observed_stop = started_at + elapsed
+            else:
+                # Compatibility for legacy/runtime fixtures that predate the
+                # monotonic shadow or directly mutate ``start_time``.
+                observed_stop = self._clock.epoch()
+        else:
+            observed_stop = float(stopped_at)
+            if not math.isfinite(observed_stop):
+                raise ValueError("stopped_at must be finite")
+
+        if self._runtime_stop_deadline is not None:
+            observed_stop = min(observed_stop, self._runtime_stop_deadline)
+        observed_stop = max(started_at, observed_stop)
+        return (
+            observed_stop,
+            max(0.0, observed_stop - started_at),
+            monotonic_now,
+        )
+
     def _snapshot_unlocked(self):
         with self._pending_lock:
             pending_segments = [
                 self._copy_segment_unlocked(segment)
                 for segment in self._pending_final_segments
             ]
+        observed_stop_time = None
+        segment_elapsed = 0.0
+        if self.boosting and self.start_time is not None:
+            (
+                observed_stop_time,
+                segment_elapsed,
+                _monotonic_now,
+            ) = self._observe_active_segment_unlocked()
         return {
             "boosting": self.boosting,
             "session_id": self.boost_session_id,
             "generation": self.boost_generation,
             "start_time": self.start_time,
             "original_start_time": self.original_start_time,
+            "observed_stop_time": observed_stop_time,
+            "segment_elapsed": segment_elapsed,
             "runtime_stop_deadline": self._runtime_stop_deadline,
             "app_ids": list(self.app_ids),
             "persona_state": self.persona_state,
@@ -1186,7 +1364,17 @@ class SteamAccountManager:
             ):
                 return False
             with self._quota_fence_lock:
+                if deadline_epoch == self._runtime_stop_deadline:
+                    return True
                 self._runtime_stop_deadline = deadline_epoch
+                if deadline_epoch is None:
+                    self._runtime_stop_deadline_monotonic = None
+                else:
+                    epoch_now = self._clock.steady_epoch()
+                    monotonic_now = self._clock.monotonic()
+                    self._runtime_stop_deadline_monotonic = (
+                        monotonic_now + deadline_epoch - epoch_now
+                    )
             return True
 
     @staticmethod
@@ -1204,95 +1392,10 @@ class SteamAccountManager:
         return True
 
     def _load_pending_final_segments(self):
-        path = _pending_final_segments_path(self.account_id)
-        if not _path_exists(path):
-            return []
-        try:
-            file_stat = os.lstat(path)
-            if (
-                not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_size > MAX_PENDING_STATE_BYTES
-            ):
-                raise ValueError("Invalid pending segment state file")
-            with open(path, "r", encoding="utf-8") as handle:
-                raw_segments = json.load(handle)
-            if (
-                not isinstance(raw_segments, list)
-                or len(raw_segments) > MAX_PENDING_FINAL_SEGMENTS
-            ):
-                raise ValueError("Invalid pending segment state payload")
-
-            segments = []
-            for raw in raw_segments:
-                if not isinstance(raw, dict):
-                    raise ValueError("Invalid pending segment")
-                session_id = raw.get("session_id")
-                generation = raw.get("generation")
-                started_at = float(raw.get("started_at"))
-                stopped_at = float(raw.get("stopped_at"))
-                app_ids = raw.get("app_ids")
-                remote_confirmed = raw.get("remote_stop_confirmed")
-                checkpoint_only = raw.get("checkpoint_only", False)
-                raw_remote_stopped_at = raw.get("remote_stopped_at")
-                remote_stopped_at = (
-                    None
-                    if raw_remote_stopped_at is None
-                    else float(raw_remote_stopped_at)
-                )
-                if (
-                    raw.get("account_id") != self.account_id
-                    or not isinstance(session_id, str)
-                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id)
-                    or type(generation) is not int
-                    or generation < 0
-                    or not math.isfinite(started_at)
-                    or not math.isfinite(stopped_at)
-                    or stopped_at < started_at
-                    or not isinstance(app_ids, list)
-                    or len(app_ids) > 64
-                    or any(type(app_id) is not int or app_id <= 0 for app_id in app_ids)
-                    or type(remote_confirmed) is not bool
-                    or type(checkpoint_only) is not bool
-                    or (
-                        remote_stopped_at is not None
-                        and not math.isfinite(remote_stopped_at)
-                    )
-                ):
-                    raise ValueError("Invalid pending segment fields")
-                segments.append({
-                    "account_id": self.account_id,
-                    "session_id": session_id,
-                    "generation": generation,
-                    "started_at": started_at,
-                    "stopped_at": stopped_at,
-                    "elapsed": max(0, stopped_at - started_at),
-                    "app_ids": list(app_ids),
-                    "remote_stop_confirmed": remote_confirmed,
-                    "remote_stopped_at": remote_stopped_at,
-                    "checkpoint_only": checkpoint_only,
-                })
-            return segments
-        except Exception as exc:
-            logger.critical(
-                "[%s] Pending boost state could not be loaded: %s",
-                self.steam_username,
-                type(exc).__name__,
-            )
-            # Do not silently start a new run over state that could not be
-            # reconciled.  Callers see a pending sentinel and fail closed.
-            return [{
-                "account_id": self.account_id,
-                "session_id": "corrupt-pending-state",
-                "generation": 0,
-                "started_at": 0.0,
-                "stopped_at": 0.0,
-                "elapsed": 0.0,
-                "app_ids": [],
-                "remote_stop_confirmed": False,
-                "remote_stopped_at": None,
-                "checkpoint_only": False,
-                "state_corrupt": True,
-            }]
+        return _read_pending_final_segments(
+            self.account_id,
+            self.steam_username,
+        )
 
     def _save_pending_final_segments_unlocked(self):
         with self._pending_lock:
@@ -1475,7 +1578,7 @@ class SteamAccountManager:
                 if pending.get("remote_stop_confirmed") is True:
                     return self._copy_segment_unlocked(pending)
             confirmed = self._stop_remote_games_unlocked(context)
-            remote_stopped_at = time.time() if confirmed else None
+            remote_stopped_at = self._clock.epoch() if confirmed else None
             return self._record_pending_remote_stop_result(
                 segment,
                 confirmed=confirmed,
@@ -1557,7 +1660,10 @@ class SteamAccountManager:
             self.boosting = False
             self.start_time = None
             self.original_start_time = None
+            self._segment_clock_epoch = None
+            self._segment_clock_monotonic = None
             self._runtime_stop_deadline = None
+            self._runtime_stop_deadline_monotonic = None
             self.boost_session_id = None
             self._reconnect_pending_generation = None
             self._reconnect_pending_token = None
@@ -1702,6 +1808,25 @@ class SteamAccountManager:
             # Invalidate a successful login/reconnect response that returned
             # just before this state-lock-free cutoff reached manager state.
             self._connection_event_generation += 1
+            cutoff_started_epoch = self._clock.steady_epoch()
+            cutoff_started_monotonic = self._clock.monotonic()
+            with self._quota_fence_lock:
+                if (
+                    self._runtime_stop_deadline_monotonic is not None
+                    and self._runtime_stop_deadline is not None
+                    and math.isclose(
+                        boundary_epoch,
+                        self._runtime_stop_deadline,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                ):
+                    boundary_monotonic = self._runtime_stop_deadline_monotonic
+                else:
+                    boundary_monotonic = (
+                        cutoff_started_monotonic
+                        - (cutoff_started_epoch - boundary_epoch)
+                    )
             try:
                 remote_confirmed = bool(self.client.force_disconnect())
             except Exception:
@@ -1711,8 +1836,11 @@ class SteamAccountManager:
                     self.steam_username,
                     reason,
                 )
-            remote_stopped_at = time.time()
-            remote_lag_seconds = max(0.0, remote_stopped_at - boundary_epoch)
+            remote_stopped_at = self._clock.epoch()
+            remote_lag_seconds = max(
+                0.0,
+                self._clock.monotonic() - boundary_monotonic,
+            )
             with self._quota_fence_lock:
                 self.logged_in = False
             if remote_confirmed:
@@ -1818,7 +1946,7 @@ class SteamAccountManager:
             data = {
                 "password": existing.get("password"),
                 "refresh_token": existing.get("refresh_token"),
-                "saved_at": time.time(),
+                "saved_at": self._clock.epoch(),
             }
 
             if password:
@@ -2370,25 +2498,18 @@ class SteamAccountManager:
                 return None
 
             started_at = self.start_time
-            if stopped_at is None:
-                stopped_at = time.time()
-            else:
-                stopped_at = float(stopped_at)
-                if not math.isfinite(stopped_at):
-                    raise ValueError("stopped_at must be finite")
-            if self._runtime_stop_deadline is not None:
-                stopped_at = min(stopped_at, self._runtime_stop_deadline)
-            if started_at is not None:
-                stopped_at = max(float(started_at), stopped_at)
+            (
+                stopped_at,
+                elapsed,
+                _monotonic_now,
+            ) = self._observe_active_segment_unlocked(stopped_at)
             segment = {
                 "account_id": self.account_id,
                 "session_id": self.boost_session_id,
                 "generation": self.boost_generation,
                 "started_at": started_at,
                 "stopped_at": stopped_at,
-                "elapsed": max(0, stopped_at - started_at)
-                if started_at is not None
-                else 0,
+                "elapsed": elapsed,
                 "app_ids": list(self.app_ids),
                 "remote_stop_confirmed": False,
                 "remote_stopped_at": None,
@@ -2478,7 +2599,7 @@ class SteamAccountManager:
             updated = self._record_pending_remote_stop_result(
                 segment,
                 confirmed=confirmed,
-                remote_stopped_at=time.time() if confirmed else None,
+                remote_stopped_at=self._clock.epoch() if confirmed else None,
             )
             if updated is None:
                 failed = self._copy_segment_unlocked(segment)
@@ -2769,7 +2890,8 @@ class SteamAccountManager:
                         fenced_before_commit = True
                     else:
                         fenced_before_commit = False
-                        now = time.time()
+                        now = self._clock.steady_epoch()
+                        monotonic_now = self._clock.monotonic()
                         self.boost_generation += 1
                         self.boost_session_id = uuid.uuid4().hex
                         self.app_ids = candidate_app_ids
@@ -2777,7 +2899,10 @@ class SteamAccountManager:
                         self.boosting = True
                         self.start_time = now
                         self.original_start_time = now
+                        self._segment_clock_epoch = now
+                        self._segment_clock_monotonic = monotonic_now
                         self._runtime_stop_deadline = None
+                        self._runtime_stop_deadline_monotonic = None
                         self._reconnect_attempts = 0
                         self._reconnect_pending_generation = None
                         self._reconnect_pending_token = None
@@ -2852,13 +2977,11 @@ class SteamAccountManager:
                     or self.start_time is None
                 ):
                     return None
-                stopped_at = time.time() if now is None else float(now)
-                if not math.isfinite(stopped_at):
-                    raise ValueError("checkpoint time must be finite")
-                if self._runtime_stop_deadline is not None:
-                    stopped_at = min(stopped_at, self._runtime_stop_deadline)
-                stopped_at = max(float(self.start_time), stopped_at)
-                elapsed = max(0, stopped_at - self.start_time)
+                (
+                    stopped_at,
+                    elapsed,
+                    monotonic_now,
+                ) = self._observe_active_segment_unlocked(now)
                 if elapsed < max(0, float(min_elapsed or 0)):
                     return None
                 checkpoint = {
@@ -2879,8 +3002,19 @@ class SteamAccountManager:
                         self.steam_username,
                     )
                     return None
+                previous_clock_epoch = self._segment_clock_epoch
+                previous_clock_monotonic = self._segment_clock_monotonic
                 self.start_time = stopped_at
-                return self._copy_segment_unlocked(checkpoint)
+                self._segment_clock_epoch = stopped_at
+                self._segment_clock_monotonic = monotonic_now
+                returned = self._copy_segment_unlocked(checkpoint)
+                # Process-local rollback metadata is deliberately added only to
+                # the returned copy; it never enters the crash-durable JSON.
+                returned["_previous_segment_clock_epoch"] = previous_clock_epoch
+                returned["_previous_segment_clock_monotonic"] = (
+                    previous_clock_monotonic
+                )
+                return returned
 
     def advance_boost_checkpoint(
         self,
@@ -2928,6 +3062,24 @@ class SteamAccountManager:
                     self._pending_final_segments.insert(index, removed)
                     return False
             self.start_time = started_at
+            previous_clock_epoch = checkpoint.get(
+                "_previous_segment_clock_epoch"
+            )
+            previous_clock_monotonic = checkpoint.get(
+                "_previous_segment_clock_monotonic"
+            )
+            if (
+                previous_clock_epoch == started_at
+                and previous_clock_monotonic is not None
+            ):
+                self._segment_clock_epoch = previous_clock_epoch
+                self._segment_clock_monotonic = previous_clock_monotonic
+            else:
+                # Legacy/reloaded checkpoints do not have a process-local
+                # monotonic anchor. Invalidating the shadow is safer than
+                # reconstructing one from an explicit wall-clock boundary.
+                self._segment_clock_epoch = None
+                self._segment_clock_monotonic = None
             return True
 
     def set_persona(self, state):
