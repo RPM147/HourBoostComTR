@@ -19,6 +19,12 @@ from gevent import subprocess
 from log_security import protect_logger
 from steam_compat import EPersonaState, EResult
 from time_utils import clock
+from usage_ledger import (
+    billable_microseconds,
+    capped_microseconds,
+    effective_microseconds,
+    microseconds_to_seconds,
+)
 
 logger = protect_logger(logging.getLogger(__name__))
 
@@ -187,6 +193,7 @@ def _read_pending_final_segments(account_id, steam_username):
             app_ids = raw.get("app_ids")
             remote_confirmed = raw.get("remote_stop_confirmed")
             checkpoint_only = raw.get("checkpoint_only", False)
+            raw_elapsed_microseconds = raw.get("elapsed_microseconds")
             raw_remote_stopped_at = raw.get("remote_stopped_at")
             remote_stopped_at = (
                 None
@@ -213,13 +220,30 @@ def _read_pending_final_segments(account_id, steam_username):
                 )
             ):
                 raise ValueError("Invalid pending segment fields")
+            calculated_microseconds = billable_microseconds(
+                max(0.0, stopped_at - started_at)
+            )
+            if raw_elapsed_microseconds is None:
+                # Pre-5G.2 journal: preserve only the precision derivable from
+                # its durable boundaries.
+                elapsed_microseconds = calculated_microseconds
+            elif (
+                type(raw_elapsed_microseconds) is not int
+                or raw_elapsed_microseconds < 0
+                or raw_elapsed_microseconds > calculated_microseconds
+                or calculated_microseconds - raw_elapsed_microseconds > 1
+            ):
+                raise ValueError("Invalid pending segment duration ledger")
+            else:
+                elapsed_microseconds = raw_elapsed_microseconds
             segments.append({
                 "account_id": account_id,
                 "session_id": session_id,
                 "generation": generation,
                 "started_at": started_at,
                 "stopped_at": stopped_at,
-                "elapsed": max(0, stopped_at - started_at),
+                "elapsed": microseconds_to_seconds(elapsed_microseconds),
+                "elapsed_microseconds": elapsed_microseconds,
                 "app_ids": list(app_ids),
                 "remote_stop_confirmed": remote_confirmed,
                 "remote_stopped_at": remote_stopped_at,
@@ -242,6 +266,7 @@ def _read_pending_final_segments(account_id, steam_username):
             "started_at": 0.0,
             "stopped_at": 0.0,
             "elapsed": 0.0,
+            "elapsed_microseconds": 0,
             "app_ids": [],
             "remote_stop_confirmed": False,
             "remote_stopped_at": None,
@@ -1531,19 +1556,44 @@ class SteamAccountManager:
             if started_at is not None:
                 started_at = float(started_at)
                 capped_stopped_at = max(started_at, capped_stopped_at)
-            if capped_stopped_at >= current_stopped_at:
+            # A maximum later than the segment is not a cap. Equality is a cap:
+            # large epoch subtraction can otherwise sit fractionally above the
+            # intended microsecond and ordinary ceiling would overbill by 1 us.
+            if maximum_stopped_at > current_stopped_at:
                 return self._copy_segment_unlocked(target)
 
             previous_elapsed = target.get("elapsed")
+            previous_elapsed_microseconds = target.get(
+                "elapsed_microseconds"
+            )
             target["stopped_at"] = capped_stopped_at
-            target["elapsed"] = (
+            capped_elapsed = (
                 max(0.0, capped_stopped_at - started_at)
                 if started_at is not None
                 else 0.0
             )
+            target["elapsed_microseconds"] = capped_microseconds(
+                capped_elapsed
+            )
+            target["elapsed"] = microseconds_to_seconds(
+                target["elapsed_microseconds"]
+            )
+            if (
+                capped_stopped_at == current_stopped_at
+                and target["elapsed_microseconds"]
+                == previous_elapsed_microseconds
+                and target["elapsed"] == previous_elapsed
+            ):
+                return self._copy_segment_unlocked(target)
             if pending is not None and not self._save_pending_final_segments_unlocked():
                 target["stopped_at"] = current_stopped_at
                 target["elapsed"] = previous_elapsed
+                if previous_elapsed_microseconds is None:
+                    target.pop("elapsed_microseconds", None)
+                else:
+                    target["elapsed_microseconds"] = (
+                        previous_elapsed_microseconds
+                    )
                 return None
             return self._copy_segment_unlocked(target)
 
@@ -1625,8 +1675,29 @@ class SteamAccountManager:
             return self._copy_segment_unlocked(pending)
 
     def _remember_final_segment_unlocked(self, segment):
+        observed_microseconds = billable_microseconds(segment.get("elapsed"))
+        supplied_microseconds = segment.get("elapsed_microseconds")
+        if supplied_microseconds is None:
+            elapsed_microseconds = observed_microseconds
+        else:
+            elapsed_microseconds = effective_microseconds(
+                supplied_microseconds,
+                0,
+            )
+            if (
+                elapsed_microseconds > observed_microseconds
+                or observed_microseconds - elapsed_microseconds > 1
+            ):
+                raise ValueError("Segment duration ledger does not match bounds")
+        segment["elapsed_microseconds"] = elapsed_microseconds
+        segment["elapsed"] = microseconds_to_seconds(elapsed_microseconds)
         with self._pending_lock:
-            if self._find_pending_segment_unlocked(segment) is not None:
+            existing = self._find_pending_segment_unlocked(segment)
+            if existing is not None:
+                segment["elapsed_microseconds"] = existing[
+                    "elapsed_microseconds"
+                ]
+                segment["elapsed"] = existing["elapsed"]
                 return True
             limit = (
                 MAX_PENDING_CHECKPOINT_SEGMENTS
@@ -1777,6 +1848,10 @@ class SteamAccountManager:
                     "started_at": started_at,
                     "stopped_at": canonical_stop,
                     "elapsed": max(0, canonical_stop - started_at),
+                    "elapsed_microseconds": capped_microseconds(max(
+                        0.0,
+                        canonical_stop - started_at,
+                    )),
                     "app_ids": list(self.app_ids),
                     "remote_stop_confirmed": False,
                     "remote_stopped_at": None,
@@ -2484,6 +2559,7 @@ class SteamAccountManager:
         expected_generation=None,
         stopped_at=None,
         context="explicit stop",
+        hard_cap=False,
     ):
         with self._quota_fence_lock:
             if (
@@ -2515,6 +2591,12 @@ class SteamAccountManager:
                 "remote_stopped_at": None,
                 "checkpoint_only": False,
             }
+            runtime_deadline_capped = (
+                self._runtime_stop_deadline is not None
+                and stopped_at >= float(self._runtime_stop_deadline)
+            )
+            if hard_cap or runtime_deadline_capped:
+                segment["elapsed_microseconds"] = capped_microseconds(elapsed)
 
             # Write the recovery record before yielding to IPC. A process kill
             # between local invalidation and the Steam response must still leave
@@ -2538,6 +2620,7 @@ class SteamAccountManager:
         expected_generation=None,
         stopped_at=None,
         context="explicit stop",
+        hard_cap=False,
     ):
         """Durably close one local run without waiting for Steam IPC.
 
@@ -2553,6 +2636,7 @@ class SteamAccountManager:
                 expected_generation=expected_generation,
                 stopped_at=stopped_at,
                 context=context,
+                hard_cap=hard_cap,
             )
 
     def _confirm_prepared_stop_segment_unlocked(
@@ -2956,6 +3040,7 @@ class SteamAccountManager:
         expected_generation=None,
         min_elapsed=0,
         now=None,
+        hard_cap=False,
     ):
         """Durably capture and advance one active usage segment.
 
@@ -2996,6 +3081,14 @@ class SteamAccountManager:
                     "remote_stopped_at": None,
                     "checkpoint_only": True,
                 }
+                runtime_deadline_capped = (
+                    self._runtime_stop_deadline is not None
+                    and stopped_at >= float(self._runtime_stop_deadline)
+                )
+                if hard_cap or runtime_deadline_capped:
+                    checkpoint["elapsed_microseconds"] = capped_microseconds(
+                        elapsed
+                    )
                 if not self._remember_final_segment_unlocked(checkpoint):
                     logger.critical(
                         "[%s] Boost checkpoint aborted: pending state is not durable",
@@ -3023,6 +3116,7 @@ class SteamAccountManager:
         expected_generation=None,
         min_elapsed=0,
         now=None,
+        hard_cap=False,
     ):
         """Backward-compatible alias for the durable checkpoint transition."""
         return self.prepare_boost_checkpoint(
@@ -3030,6 +3124,7 @@ class SteamAccountManager:
             expected_generation=expected_generation,
             min_elapsed=min_elapsed,
             now=now,
+            hard_cap=hard_cap,
         )
 
     def rollback_boost_checkpoint(self, checkpoint):

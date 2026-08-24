@@ -155,12 +155,13 @@ from flask import redirect as flask_redirect
 from flask_limiter import Limiter
 from steam_compat import EResult
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import and_, or_, update
+from sqlalchemy import BigInteger, and_, cast, func, or_, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from config import Config
 from boost_log_migration import (
     enable_sqlite_foreign_keys,
+    migrate_boost_duration_ledger,
     migrate_boost_log_history,
 )
 from models import (
@@ -194,6 +195,14 @@ from time_utils import (
     utc_iso_z,
     utc_now,
     utc_to_epoch,
+)
+from usage_ledger import (
+    MICROSECONDS_PER_SECOND,
+    billable_microseconds,
+    capped_microseconds,
+    effective_microseconds,
+    legacy_seconds_for_microseconds,
+    microseconds_to_seconds,
 )
 
 from gevent.event import Event
@@ -343,7 +352,7 @@ _quota_watchdog_generation = 0
 _bg_reconnect_locks = set()
 
 QUOTA_RECONCILE_RETRY_SECONDS = 2.0
-QUOTA_EXHAUSTION_EPSILON_SECONDS = 0.05
+QUOTA_DEADLINE_EPSILON_SECONDS = 1.0 / MICROSECONDS_PER_SECOND
 
 
 def _kill_greenlet_nonblocking(greenlet):
@@ -406,6 +415,10 @@ def _same_boost_session(snapshot, session_id=None, generation=None):
     return has_expectation
 
 
+class UsageLedgerConflictError(RuntimeError):
+    """Raised when one durable segment identity has conflicting usage data."""
+
+
 def _add_boost_log_if_missing(
     acct_id,
     user_id,
@@ -414,19 +427,19 @@ def _add_boost_log_if_missing(
     duration_seconds,
     app_ids,
     remote_stopped_epoch=None,
+    duration_microseconds=None,
 ):
     """Stage one deterministic segment and make an immediate retry idempotent."""
-    try:
-        raw_duration = float(duration_seconds or 0)
-    except (TypeError, ValueError):
-        raw_duration = 0.0
-    # Integer storage must not make repeated sub-second sessions free.  Round
-    # billable usage up; the maximum accounting bias is below one second per
-    # finalized segment and quota can never be silently under-counted.
-    duration_seconds = (
-        max(0, int(math.ceil(max(0.0, raw_duration - 1e-9))))
-        if math.isfinite(raw_duration)
-        else 0
+    duration_microseconds = (
+        billable_microseconds(duration_seconds)
+        if duration_microseconds is None
+        else effective_microseconds(duration_microseconds, 0)
+    )
+    # The seconds column remains a conservative dual-write solely for safe
+    # rollback to the pre-5G.2 source.  New readers never aggregate it when the
+    # canonical microsecond value exists.
+    duration_seconds = legacy_seconds_for_microseconds(
+        duration_microseconds
     )
     remote_stopped_at = None
     if remote_stopped_epoch is not None:
@@ -441,14 +454,14 @@ def _add_boost_log_if_missing(
             raise ValueError("stopped_epoch must be finite")
         stopped_at = utc_from_epoch(stopped_value)
 
-    if duration_seconds <= 0 or started_epoch is None:
+    if duration_microseconds <= 0 or started_epoch is None:
         # A checkpoint can commit at the exact instant a hard quota fence
         # stops the remote worker.  The final fence segment is then correctly
         # zero-length and must not create another billing row, but its actual
         # remote stop time still belongs on the checkpoint that ends at this
         # boundary.
         if (
-            duration_seconds <= 0
+            duration_microseconds <= 0
             and stopped_at is not None
             and remote_stopped_at is not None
         ):
@@ -472,20 +485,6 @@ def _add_boost_log_if_missing(
     if stopped_at is None:
         raise ValueError("stopped_epoch is required for billable segments")
     started_at = utc_from_epoch(float(started_epoch))
-    existing = BoostLog.query.filter_by(
-        account_id=acct_id,
-        user_id=user_id,
-        started_at=started_at,
-        stopped_at=stopped_at,
-        duration_seconds=duration_seconds,
-    ).first()
-    if existing is not None:
-        if existing.remote_stopped_at is None and remote_stopped_at is not None:
-            existing.remote_stopped_at = remote_stopped_at
-            return True
-        return False
-
-    normalized_app_ids = [int(app_id) for app_id in (app_ids or [])]
     account = db.session.get(SteamAccount, acct_id)
     owner = db.session.get(User, user_id)
     if (
@@ -496,6 +495,67 @@ def _add_boost_log_if_missing(
         raise ValueError(
             "BoostLog owner/account snapshot could not be verified"
         )
+
+    # Identity deliberately excludes duration. This keeps an old writer's
+    # committed seconds-only row and a crash-durable fractional replay from
+    # being billed twice after rollback/upgrade. Unexplained mismatches fail
+    # closed below.
+    identity_matches = (
+        BoostLog.query.filter_by(
+            account_id=acct_id,
+            user_id=user_id,
+            started_at=started_at,
+            stopped_at=stopped_at,
+        )
+        .order_by(BoostLog.id.asc())
+        .limit(2)
+        .all()
+    )
+    if len(identity_matches) > 1:
+        raise UsageLedgerConflictError(
+            "multiple BoostLog rows share one segment identity"
+        )
+    existing = identity_matches[0] if identity_matches else None
+    if existing is not None:
+        if (
+            existing.account_id_snapshot not in (None, acct_id)
+            or existing.owner_user_id_snapshot not in (None, user_id)
+        ):
+            raise UsageLedgerConflictError(
+                "BoostLog segment identity has conflicting owner snapshots"
+            )
+        existing_microseconds = effective_microseconds(
+            existing.duration_microseconds,
+            existing.duration_seconds,
+        )
+        if existing_microseconds != duration_microseconds:
+            existing_seconds = int(existing.duration_seconds)
+            rollback_compatible = (
+                existing_microseconds
+                == existing_seconds * MICROSECONDS_PER_SECOND
+                and legacy_seconds_for_microseconds(duration_microseconds)
+                == existing_seconds
+                and duration_microseconds <= existing_microseconds
+            )
+            if not rollback_compatible:
+                raise UsageLedgerConflictError(
+                    "BoostLog segment identity has conflicting durations"
+                )
+            logger.warning(
+                "boost_log.rollback_replay_deduplicated account_id=%s "
+                "user_id=%s existing_microseconds=%s "
+                "incoming_microseconds=%s",
+                acct_id,
+                user_id,
+                existing_microseconds,
+                duration_microseconds,
+            )
+        if existing.remote_stopped_at is None and remote_stopped_at is not None:
+            existing.remote_stopped_at = remote_stopped_at
+            return True
+        return False
+
+    normalized_app_ids = [int(app_id) for app_id in (app_ids or [])]
     db.session.add(BoostLog(
         account_id=acct_id,
         user_id=user_id,
@@ -507,6 +567,7 @@ def _add_boost_log_if_missing(
         stopped_at=stopped_at,
         remote_stopped_at=remote_stopped_at,
         duration_seconds=duration_seconds,
+        duration_microseconds=duration_microseconds,
         games_count=len(normalized_app_ids),
         app_ids_json=json.dumps(normalized_app_ids),
     ))
@@ -522,6 +583,7 @@ def _persist_stopped_boost_state(
     duration_seconds,
     app_ids,
     remote_stopped_epoch=None,
+    duration_microseconds=None,
     clear_account_state=True,
     max_attempts=2,
 ):
@@ -558,9 +620,19 @@ def _persist_stopped_boost_state(
                 duration_seconds,
                 app_ids,
                 remote_stopped_epoch,
+                duration_microseconds,
             )
             db.session.commit()
             return True
+        except UsageLedgerConflictError as exc:
+            db.session.rollback()
+            logger.critical(
+                "boost_log.duration_conflict account_id=%s user_id=%s: %s",
+                acct_id,
+                user_id,
+                exc,
+            )
+            return False
         except SQLAlchemyError as exc:
             db.session.rollback()
             if attempt == max_attempts:
@@ -592,11 +664,14 @@ def _persist_manager_final_segment(
         return False
     original_stopped_epoch = segment.get("stopped_at")
     if original_stopped_epoch is not None:
-        billable_stopped_epoch = _cap_user_hard_quota_stop_epoch(
+        (
+            billable_stopped_epoch,
+            hard_cap_applied,
+        ) = _cap_user_hard_quota_stop(
             user_id,
             original_stopped_epoch,
         )
-        if billable_stopped_epoch < float(original_stopped_epoch):
+        if hard_cap_applied:
             if manager is not None:
                 segment = manager.cap_final_segment_stopped_at(
                     segment,
@@ -621,17 +696,25 @@ def _persist_manager_final_segment(
                         0.0,
                         billable_stopped_epoch - float(started_epoch),
                     )
+                    segment["elapsed_microseconds"] = capped_microseconds(
+                        segment["elapsed"]
+                    )
+                    segment["elapsed"] = microseconds_to_seconds(
+                        segment["elapsed_microseconds"]
+                    )
                 else:
                     segment["elapsed"] = 0.0
+                    segment["elapsed_microseconds"] = 0
                 segment["stopped_at"] = billable_stopped_epoch
-            logger.warning(
-                "quota.segment_billing_capped user_id=%s account_id=%s "
-                "observed_stop=%.6f billable_stop=%.6f",
-                user_id,
-                acct_id,
-                float(original_stopped_epoch),
-                float(segment.get("stopped_at")),
-            )
+            if billable_stopped_epoch < float(original_stopped_epoch):
+                logger.warning(
+                    "quota.segment_billing_capped user_id=%s account_id=%s "
+                    "observed_stop=%.6f billable_stop=%.6f",
+                    user_id,
+                    acct_id,
+                    float(original_stopped_epoch),
+                    float(segment.get("stopped_at")),
+                )
     persisted = _persist_stopped_boost_state(
         acct_id,
         user_id,
@@ -640,6 +723,7 @@ def _persist_manager_final_segment(
         duration_seconds=segment.get("elapsed"),
         app_ids=segment.get("app_ids") or [],
         remote_stopped_epoch=segment.get("remote_stopped_at"),
+        duration_microseconds=segment.get("elapsed_microseconds"),
         clear_account_state=clear_account_state,
     )
     if persisted and manager is not None:
@@ -890,6 +974,71 @@ def _handle_fatal_disconnect(
 boost_service.fatal_disconnect_callback = _handle_fatal_disconnect
 
 
+def _timedelta_microseconds(value):
+    """Return an exact integer count for a Python timedelta."""
+
+    return (
+        (value.days * 86400 + value.seconds) * MICROSECONDS_PER_SECOND
+        + value.microseconds
+    )
+
+
+def _boost_log_microseconds_in_window(
+    started_at,
+    stopped_at,
+    duration_microseconds,
+    duration_seconds,
+    window_start=None,
+    window_end=None,
+):
+    """Return the exact ledger share belonging to one UTC half-open window.
+
+    Canonical duration is apportioned by cumulative integer ratios.  Adjacent
+    windows therefore sum back to the original value exactly, without float
+    drift or a one-microsecond gain at each boundary.
+    """
+    if started_at is None:
+        return 0
+    started_at = as_utc(started_at)
+    stopped_at = as_utc(stopped_at) if stopped_at is not None else None
+    window_start = as_utc(window_start) if window_start is not None else None
+    window_end = as_utc(window_end) if window_end is not None else None
+    duration = effective_microseconds(
+        duration_microseconds,
+        duration_seconds,
+    )
+    if duration <= 0:
+        return 0
+
+    effective_stop = stopped_at
+    if effective_stop is None or effective_stop <= started_at:
+        effective_stop = started_at + timedelta(microseconds=duration)
+
+    segment_span = _timedelta_microseconds(effective_stop - started_at)
+    if segment_span <= 0:
+        return 0
+
+    overlap_start = max(started_at, window_start) if window_start else started_at
+    overlap_end = min(effective_stop, window_end) if window_end else effective_stop
+    if overlap_end <= overlap_start:
+        return 0
+
+    start_offset = max(
+        0,
+        min(segment_span, _timedelta_microseconds(overlap_start - started_at)),
+    )
+    end_offset = max(
+        0,
+        min(segment_span, _timedelta_microseconds(overlap_end - started_at)),
+    )
+    if end_offset <= start_offset:
+        return 0
+    return (
+        duration * end_offset // segment_span
+        - duration * start_offset // segment_span
+    )
+
+
 def _boost_log_seconds_in_window(
     started_at,
     stopped_at,
@@ -897,60 +1046,60 @@ def _boost_log_seconds_in_window(
     window_start=None,
     window_end=None,
 ):
-    """Return the recorded segment duration that belongs to one UTC window.
+    """Compatibility wrapper for seconds-only callers and older tests."""
 
-    ``duration_seconds`` remains the accounting source of truth. Timestamps are
-    used only to split that duration across boundaries such as midnight or plan
-    activation, so rounding differences cannot create extra quota usage.
-    """
-    if started_at is None:
-        return 0.0
-    started_at = as_utc(started_at)
-    stopped_at = as_utc(stopped_at) if stopped_at is not None else None
-    window_start = as_utc(window_start) if window_start is not None else None
-    window_end = as_utc(window_end) if window_end is not None else None
-    try:
-        duration = float(duration_seconds or 0)
-    except (TypeError, ValueError):
-        return 0.0
-    if not math.isfinite(duration) or duration <= 0:
-        return 0.0
-
-    effective_stop = stopped_at
-    if effective_stop is None or effective_stop <= started_at:
-        effective_stop = started_at + timedelta(seconds=duration)
-
-    segment_span = (effective_stop - started_at).total_seconds()
-    if segment_span <= 0:
-        return 0.0
-
-    overlap_start = max(started_at, window_start) if window_start else started_at
-    overlap_end = min(effective_stop, window_end) if window_end else effective_stop
-    overlap_span = (overlap_end - overlap_start).total_seconds()
-    if overlap_span <= 0:
-        return 0.0
-
-    return duration * min(1.0, overlap_span / segment_span)
+    return microseconds_to_seconds(_boost_log_microseconds_in_window(
+        started_at,
+        stopped_at,
+        None,
+        duration_seconds,
+        window_start,
+        window_end,
+    ))
 
 
-def _get_logged_seconds(user_id, start_time_filter=None, end_time_filter=None):
+def _boost_duration_microseconds_sql():
+    """SQL expression implementing the canonical-reader fallback contract."""
+
+    return func.coalesce(
+        BoostLog.duration_microseconds,
+        cast(func.coalesce(BoostLog.duration_seconds, 0), BigInteger)
+        * MICROSECONDS_PER_SECOND,
+    )
+
+
+def _boost_log_effective_microseconds(log):
+    return effective_microseconds(
+        log.duration_microseconds,
+        log.duration_seconds,
+    )
+
+
+def _get_logged_microseconds(
+    user_id,
+    start_time_filter=None,
+    end_time_filter=None,
+):
     query = db.session.query(
         BoostLog.started_at,
         BoostLog.stopped_at,
+        BoostLog.duration_microseconds,
         BoostLog.duration_seconds,
     ).filter(BoostLog.user_id == user_id)
     if start_time_filter is not None:
         query = query.filter(or_(
             BoostLog.stopped_at > start_time_filter,
             BoostLog.stopped_at.is_(None),
+            BoostLog.stopped_at <= BoostLog.started_at,
         ))
     if end_time_filter is not None:
         query = query.filter(BoostLog.started_at < end_time_filter)
 
     return sum(
-        _boost_log_seconds_in_window(
+        _boost_log_microseconds_in_window(
             row.started_at,
             row.stopped_at,
+            row.duration_microseconds,
             row.duration_seconds,
             start_time_filter,
             end_time_filter,
@@ -959,7 +1108,76 @@ def _get_logged_seconds(user_id, start_time_filter=None, end_time_filter=None):
     )
 
 
-def _get_active_seconds(user_id, start_time_filter=None):
+def _get_logged_seconds(user_id, start_time_filter=None, end_time_filter=None):
+    """API compatibility wrapper around the canonical integer ledger."""
+
+    return microseconds_to_seconds(_get_logged_microseconds(
+        user_id,
+        start_time_filter,
+        end_time_filter,
+    ))
+
+
+def _get_logged_microseconds_by_utc_day(
+    user_id,
+    first_day_start,
+    day_count,
+    *,
+    final_end=None,
+):
+    """Bucket finalized usage into exact UTC-day windows from one row fetch."""
+
+    first_day_start = as_utc(first_day_start).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    day_count = int(day_count)
+    if day_count < 0:
+        raise ValueError("day_count must be non-negative")
+    range_end = first_day_start + timedelta(days=day_count)
+    if final_end is not None:
+        range_end = min(range_end, as_utc(final_end))
+    if day_count == 0 or range_end <= first_day_start:
+        return {}
+
+    query = db.session.query(
+        BoostLog.started_at,
+        BoostLog.stopped_at,
+        BoostLog.duration_microseconds,
+        BoostLog.duration_seconds,
+    ).filter(
+        BoostLog.user_id == user_id,
+        BoostLog.started_at < range_end,
+        or_(
+            BoostLog.stopped_at > first_day_start,
+            BoostLog.stopped_at.is_(None),
+            BoostLog.stopped_at <= BoostLog.started_at,
+        ),
+    )
+    rows = query.all()
+    buckets = {}
+    for index in range(day_count):
+        day_start = first_day_start + timedelta(days=index)
+        day_end = min(day_start + timedelta(days=1), range_end)
+        if day_end <= day_start:
+            break
+        buckets[day_start.date()] = sum(
+            _boost_log_microseconds_in_window(
+                row.started_at,
+                row.stopped_at,
+                row.duration_microseconds,
+                row.duration_seconds,
+                day_start,
+                day_end,
+            )
+            for row in rows
+        )
+    return buckets
+
+
+def _get_active_microseconds(user_id, start_time_filter=None):
     active = 0
     if start_time_filter is not None:
         start_time_filter = as_utc(start_time_filter)
@@ -979,11 +1197,18 @@ def _get_active_seconds(user_id, start_time_filter=None):
                 if start_time_filter is not None
                 else active_start_utc
             )
-            active += max(
+            active += billable_microseconds(max(
                 0.0,
                 (active_stop_utc - counted_start).total_seconds(),
-            )
+            ))
     return active
+
+
+def _get_active_seconds(user_id, start_time_filter=None):
+    return microseconds_to_seconds(_get_active_microseconds(
+        user_id,
+        start_time_filter,
+    ))
 
 
 def _utc_datetime_epoch(value):
@@ -1055,82 +1280,97 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
     today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow_start = today_start + timedelta(days=1)
     daily_limit = limits.get("daily_hours")
-    daily_limit_seconds = (
-        float(daily_limit) * 3600.0 if daily_limit is not None else None
+    daily_limit_microseconds = (
+        billable_microseconds(float(daily_limit) * 3600.0)
+        if daily_limit is not None
+        else None
     )
-    daily_logged = (
-        _get_logged_seconds(user_id, today_start, now_utc)
-        if daily_limit_seconds is not None
-        else 0.0
+    daily_logged_microseconds = (
+        _get_logged_microseconds(user_id, today_start, now_utc)
+        if daily_limit_microseconds is not None
+        else 0
     )
-    daily_active = 0.0
-    if daily_limit_seconds is not None:
+    daily_active_microseconds = 0
+    if daily_limit_microseconds is not None:
         today_epoch = _utc_datetime_epoch(today_start)
         for run in runs:
             if run["start_time"] is not None:
-                daily_active += max(
+                daily_active_microseconds += billable_microseconds(max(
                     0.0,
                     run["observed_stop_time"]
                     - max(run["start_time"], today_epoch),
-                )
-    daily_used = daily_logged + daily_active
-    daily_remaining = (
-        daily_limit_seconds - daily_used
-        if daily_limit_seconds is not None
+                ))
+    daily_used_microseconds = (
+        daily_logged_microseconds + daily_active_microseconds
+    )
+    daily_remaining_microseconds = (
+        daily_limit_microseconds - daily_used_microseconds
+        if daily_limit_microseconds is not None
         else None
     )
 
     total_limit = limits.get("total_hours")
-    total_limit_seconds = (
-        float(total_limit) * 3600.0 if total_limit is not None else None
+    total_limit_microseconds = (
+        billable_microseconds(float(total_limit) * 3600.0)
+        if total_limit is not None
+        else None
     )
     # Legacy paid rows without an activation timestamp must not receive a new
     # quota window accidentally. Count from account creation instead of an
     # arbitrary recent cutoff.
     plan_start = user.plan_activated_at or user.created_at or UTC_EPOCH
-    total_logged = (
+    total_logged_microseconds = (
         # Finalized total-plan usage is cumulative from activation. Its
         # duration is authoritative, so an upper "now" bound is unnecessary
         # and could hide a durable segment after a backward wall correction.
-        _get_logged_seconds(user_id, plan_start, None)
-        if total_limit_seconds is not None
-        else 0.0
+        _get_logged_microseconds(user_id, plan_start, None)
+        if total_limit_microseconds is not None
+        else 0
     )
-    total_active = 0.0
-    if total_limit_seconds is not None:
+    total_active_microseconds = 0
+    if total_limit_microseconds is not None:
         plan_start_epoch = _utc_datetime_epoch(plan_start)
         for run in runs:
             if run["start_time"] is not None:
-                total_active += max(
+                total_active_microseconds += billable_microseconds(max(
                     0.0,
                     run["observed_stop_time"]
                     - max(run["start_time"], plan_start_epoch),
-                )
-    total_used = total_logged + total_active
-    total_remaining = (
-        total_limit_seconds - total_used
-        if total_limit_seconds is not None
+                ))
+    total_used_microseconds = (
+        total_logged_microseconds + total_active_microseconds
+    )
+    total_remaining_microseconds = (
+        total_limit_microseconds - total_used_microseconds
+        if total_limit_microseconds is not None
         else None
     )
 
     constraints = []
-    if daily_remaining is not None:
-        constraints.append((daily_remaining, "daily_limit"))
-    if total_remaining is not None:
-        constraints.append((total_remaining, "total_limit"))
+    if daily_remaining_microseconds is not None:
+        constraints.append((daily_remaining_microseconds, "daily_limit"))
+    if total_remaining_microseconds is not None:
+        constraints.append((total_remaining_microseconds, "total_limit"))
     if invalid_runtime:
-        constraints.append((0.0, "invalid_runtime"))
+        constraints.append((0, "invalid_runtime"))
 
     limiting = min(constraints, key=lambda item: item[0]) if constraints else None
-    remaining_usage = max(0.0, limiting[0]) if limiting else None
+    remaining_usage_microseconds = max(0, limiting[0]) if limiting else None
+    remaining_usage = (
+        microseconds_to_seconds(remaining_usage_microseconds)
+        if remaining_usage_microseconds is not None
+        else None
+    )
     estimated_wall = (
-        remaining_usage / active_count
-        if remaining_usage is not None and active_count > 0
+        microseconds_to_seconds(
+            remaining_usage_microseconds // active_count
+        )
+        if remaining_usage_microseconds is not None and active_count > 0
         else None
     )
     quota_depleted = bool(
         limiting is not None
-        and limiting[0] <= QUOTA_EXHAUSTION_EPSILON_SECONDS
+        and limiting[0] <= 0
     )
     exhausted = bool(active_count > 0 and quota_depleted)
 
@@ -1148,15 +1388,26 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
         else None
     )
     if active_count > 0 and not exhausted:
-        if daily_remaining is not None:
-            daily_delay = max(0.0, daily_remaining / active_count)
+        if daily_remaining_microseconds is not None:
+            daily_delay = max(
+                0.0,
+                microseconds_to_seconds(
+                    max(0, daily_remaining_microseconds) // active_count
+                ),
+            )
             midnight_delay = max(
                 0.0,
                 _utc_datetime_epoch(tomorrow_start) - now_epoch,
             )
             # At an exact tie the UTC reset wins: daily windows are [start,end)
             # and the next day's quota becomes available at midnight.
-            if midnight_delay <= daily_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS:
+            midnight_usage_microseconds = (
+                billable_microseconds(midnight_delay) * active_count
+            )
+            if (
+                midnight_usage_microseconds
+                <= daily_remaining_microseconds
+            ):
                 events.append((
                     midnight_delay,
                     0,
@@ -1173,16 +1424,21 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
                 ))
                 if (
                     plan_expiry_delay is None
-                    or daily_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS
-                    < plan_expiry_delay
+                    or daily_remaining_microseconds
+                    < billable_microseconds(plan_expiry_delay) * active_count
                 ):
                     daily_hard_deadline = daily_deadline
-        if total_remaining is not None:
-            total_delay = max(0.0, total_remaining / active_count)
+        if total_remaining_microseconds is not None:
+            total_delay = max(
+                0.0,
+                microseconds_to_seconds(
+                    max(0, total_remaining_microseconds) // active_count
+                ),
+            )
             if (
                 plan_expiry_delay is None
-                or total_delay + QUOTA_EXHAUSTION_EPSILON_SECONDS
-                < plan_expiry_delay
+                or total_remaining_microseconds
+                < billable_microseconds(plan_expiry_delay) * active_count
             ):
                 total_hard_deadline = accounting_now_epoch + total_delay
             events.append((
@@ -1238,14 +1494,35 @@ def _quota_usage_snapshot(user_id, *, now_epoch=None):
         "now_utc": now_utc,
         "runs": runs,
         "active_count": active_count,
-        "daily_used_seconds": daily_used,
+        "daily_used_microseconds": daily_used_microseconds,
+        "daily_used_seconds": microseconds_to_seconds(
+            daily_used_microseconds
+        ),
+        "daily_remaining_microseconds": (
+            max(0, daily_remaining_microseconds)
+            if daily_remaining_microseconds is not None
+            else None
+        ),
         "daily_remaining_seconds": (
-            max(0.0, daily_remaining) if daily_remaining is not None else None
+            microseconds_to_seconds(max(0, daily_remaining_microseconds))
+            if daily_remaining_microseconds is not None
+            else None
         ),
-        "total_used_seconds": total_used,
+        "total_used_microseconds": total_used_microseconds,
+        "total_used_seconds": microseconds_to_seconds(
+            total_used_microseconds
+        ),
+        "total_remaining_microseconds": (
+            max(0, total_remaining_microseconds)
+            if total_remaining_microseconds is not None
+            else None
+        ),
         "total_remaining_seconds": (
-            max(0.0, total_remaining) if total_remaining is not None else None
+            microseconds_to_seconds(max(0, total_remaining_microseconds))
+            if total_remaining_microseconds is not None
+            else None
         ),
+        "remaining_usage_microseconds": remaining_usage_microseconds,
         "remaining_usage_seconds": remaining_usage,
         "estimated_wall_seconds": estimated_wall,
         "quota_deadline_epoch": quota_deadline_epoch,
@@ -1286,6 +1563,7 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
     if not math.isfinite(snapshot_epoch):
         raise ValueError("quota snapshot epoch must be finite")
     elapsed = max(0.0, started_epoch - snapshot_epoch)
+    elapsed_microseconds = billable_microseconds(elapsed)
     previous_active_count = max(0, int(quota_ready.get("active_count") or 0))
     active_count = previous_active_count + 1
     plan_expiry_remaining = quota_ready.get(
@@ -1309,8 +1587,17 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
 
     events = []
     hard_candidates = []
-    daily_remaining = quota_ready.get("daily_remaining_seconds")
-    if daily_remaining is not None:
+    daily_remaining_microseconds = quota_ready.get(
+        "daily_remaining_microseconds"
+    )
+    if daily_remaining_microseconds is None:
+        daily_remaining_seconds = quota_ready.get("daily_remaining_seconds")
+        if daily_remaining_seconds is not None:
+            daily_remaining_microseconds = billable_microseconds(
+                daily_remaining_seconds
+            )
+    if daily_remaining_microseconds is not None:
+        daily_remaining_microseconds = int(daily_remaining_microseconds)
         started_utc = utc_from_epoch(started_epoch)
         started_midnight = started_utc.replace(
             hour=0,
@@ -1327,38 +1614,52 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
             microsecond=0,
         )
         if started_midnight == snapshot_midnight:
-            remaining_at_start = max(
-                0.0,
-                float(daily_remaining) - previous_active_count * elapsed,
+            remaining_at_start_microseconds = max(
+                0,
+                daily_remaining_microseconds
+                - previous_active_count * elapsed_microseconds,
             )
         else:
             daily_hours = (quota_ready.get("limits") or {}).get("daily_hours")
-            daily_limit_seconds = (
-                float(daily_hours) * 3600.0
+            daily_limit_microseconds = (
+                billable_microseconds(float(daily_hours) * 3600.0)
                 if daily_hours is not None
                 else None
             )
-            remaining_at_start = (
+            remaining_at_start_microseconds = (
                 max(
-                    0.0,
-                    daily_limit_seconds
+                    0,
+                    daily_limit_microseconds
                     - previous_active_count
-                    * max(0.0, started_epoch - started_midnight_epoch),
+                    * billable_microseconds(max(
+                        0.0,
+                        started_epoch - started_midnight_epoch,
+                    )),
                 )
-                if daily_limit_seconds is not None
+                if daily_limit_microseconds is not None
                 else None
             )
-        if remaining_at_start is not None:
-            deadline = started_epoch + remaining_at_start / active_count
+        if remaining_at_start_microseconds is not None:
+            deadline = started_epoch + (
+                microseconds_to_seconds(
+                    remaining_at_start_microseconds // active_count
+                )
+            )
             next_midnight_epoch = started_midnight_epoch + 24 * 3600.0
             reset_wins = (
-                next_midnight_epoch
-                <= deadline + QUOTA_EXHAUSTION_EPSILON_SECONDS
+                billable_microseconds(max(
+                    0.0,
+                    next_midnight_epoch - started_epoch,
+                )) * active_count
+                <= remaining_at_start_microseconds
             )
             expiry_wins = (
                 plan_expiry_epoch is not None
-                and deadline + QUOTA_EXHAUSTION_EPSILON_SECONDS
-                >= plan_expiry_epoch
+                and billable_microseconds(max(
+                    0.0,
+                    plan_expiry_epoch - started_epoch,
+                )) * active_count
+                <= remaining_at_start_microseconds
             )
             if reset_wins:
                 events.append((next_midnight_epoch, 0, "utc_midnight"))
@@ -1367,17 +1668,33 @@ def _provisional_quota_schedule_after_start(quota_ready, started_epoch):
                 if not expiry_wins:
                     hard_candidates.append((deadline, "daily_limit"))
 
-    total_remaining = quota_ready.get("total_remaining_seconds")
-    if total_remaining is not None:
-        remaining_at_start = max(
-            0.0,
-            float(total_remaining) - previous_active_count * elapsed,
+    total_remaining_microseconds = quota_ready.get(
+        "total_remaining_microseconds"
+    )
+    if total_remaining_microseconds is None:
+        total_remaining_seconds = quota_ready.get("total_remaining_seconds")
+        if total_remaining_seconds is not None:
+            total_remaining_microseconds = billable_microseconds(
+                total_remaining_seconds
+            )
+    if total_remaining_microseconds is not None:
+        remaining_at_start_microseconds = max(
+            0,
+            int(total_remaining_microseconds)
+            - previous_active_count * elapsed_microseconds,
         )
-        deadline = started_epoch + remaining_at_start / active_count
+        deadline = started_epoch + (
+            microseconds_to_seconds(
+                remaining_at_start_microseconds // active_count
+            )
+        )
         expiry_wins = (
             plan_expiry_epoch is not None
-            and deadline + QUOTA_EXHAUSTION_EPSILON_SECONDS
-            >= plan_expiry_epoch
+            and billable_microseconds(max(
+                0.0,
+                plan_expiry_epoch - started_epoch,
+            )) * active_count
+            <= remaining_at_start_microseconds
         )
         events.append((deadline, 1, "total_limit"))
         if not expiry_wins:
@@ -1601,7 +1918,7 @@ def _claim_user_quota_hard_fence(user_id, generation, token):
             entry.get("deadline_monotonic") or now_monotonic
         )
         remaining = deadline_monotonic - now_monotonic
-        if remaining > QUOTA_EXHAUSTION_EPSILON_SECONDS:
+        if remaining > QUOTA_DEADLINE_EPSILON_SECONDS:
             return {
                 "claimed": False,
                 "early": True,
@@ -1665,12 +1982,27 @@ def _current_user_hard_quota_deadline(user_id):
     return min(deadlines) if deadlines else None
 
 
-def _cap_user_hard_quota_stop_epoch(user_id, stopped_epoch):
+def _cap_user_hard_quota_stop(user_id, stopped_epoch):
+    """Return the billing stop and whether a published hard cap applied.
+
+    Equality is intentionally a cap. At large epoch values, subtracting two
+    floats that represent an exact deadline can sit just above the intended
+    microsecond boundary; ordinary ceiling would then bill one extra
+    microsecond.
+    """
     stopped_epoch = float(stopped_epoch)
     if not math.isfinite(stopped_epoch):
         raise ValueError("stopped_epoch must be finite")
     deadline = _current_user_hard_quota_deadline(user_id)
-    return min(stopped_epoch, deadline) if deadline is not None else stopped_epoch
+    if deadline is None or stopped_epoch < deadline:
+        return stopped_epoch, False
+    return deadline, True
+
+
+def _cap_user_hard_quota_stop_epoch(user_id, stopped_epoch):
+    """Backward-compatible scalar wrapper around the marked cap helper."""
+
+    return _cap_user_hard_quota_stop(user_id, stopped_epoch)[0]
 
 
 def _finish_user_quota_hard_fence(user_id, generation, token):
@@ -1964,7 +2296,7 @@ def _stop_all_user_boosts_locked(user_id, reason, *, stopped_epoch=None):
     observed_stop_epoch = (
         clock.steady_epoch() if stopped_epoch is None else float(stopped_epoch)
     )
-    stopped_epoch = _cap_user_hard_quota_stop_epoch(
+    stopped_epoch, _stopped_by_hard_cap = _cap_user_hard_quota_stop(
         user_id,
         observed_stop_epoch,
     )
@@ -1984,6 +2316,7 @@ def _stop_all_user_boosts_locked(user_id, reason, *, stopped_epoch=None):
                 expected_generation=snapshot.get("generation"),
                 stopped_at=stopped_epoch,
                 context=f"user quota: {reason}",
+                hard_cap=_stopped_by_hard_cap,
             )
         except Exception:
             logger.exception(
@@ -2877,6 +3210,19 @@ def _ensure_schema():
             boost_history_report["foreign_key_violations"],
         )
 
+        duration_ledger_report = migrate_boost_duration_ledger(db.engine)
+        logger.info(
+            "phase5g2.duration_ledger rows=%s duration_seconds=%s "
+            "duration_microseconds=%s added_columns=%s backfilled_rows=%s "
+            "enforcement_added=%s",
+            duration_ledger_report["rows"],
+            duration_ledger_report["duration_seconds"],
+            duration_ledger_report["duration_microseconds"],
+            duration_ledger_report["added_columns"],
+            duration_ledger_report["backfilled_rows"],
+            duration_ledger_report["enforcement_added"],
+        )
+
         session_cols = {
             c["name"] for c in inspector.get_columns("user_sessions")
         }
@@ -3197,18 +3543,25 @@ def _restore_accounting_clock_on_startup():
         rows = db.session.query(
             BoostLog.started_at,
             BoostLog.stopped_at,
+            BoostLog.duration_microseconds,
             BoostLog.duration_seconds,
         ).yield_per(1000)
-        for started_at, stopped_at, duration_seconds in rows:
+        for (
+            started_at,
+            stopped_at,
+            duration_microseconds,
+            duration_seconds,
+        ) in rows:
             if started_at is None:
                 raise RuntimeError("BoostLog.started_at cannot be NULL")
             started_epoch = utc_to_epoch(started_at)
             try:
-                duration = float(duration_seconds or 0)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("Invalid BoostLog.duration_seconds") from exc
-            if not math.isfinite(duration) or duration < 0:
-                raise RuntimeError("Invalid BoostLog.duration_seconds")
+                duration = microseconds_to_seconds(effective_microseconds(
+                    duration_microseconds,
+                    duration_seconds,
+                ))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("Invalid BoostLog duration ledger") from exc
 
             stopped_epoch = (
                 utc_to_epoch(stopped_at) if stopped_at is not None else None
@@ -3388,7 +3741,7 @@ def _checkpoint_active_boosts_once():
                     observed_stop_epoch = snapshot.get("observed_stop_time")
                     if observed_stop_epoch is None:
                         observed_stop_epoch = clock.steady_epoch()
-                    stopped_epoch = _cap_user_hard_quota_stop_epoch(
+                    stopped_epoch, hard_cap_applied = _cap_user_hard_quota_stop(
                         owner_id,
                         observed_stop_epoch,
                     )
@@ -3400,11 +3753,8 @@ def _checkpoint_active_boosts_once():
                         expected_session_id=snapshot.get("session_id"),
                         expected_generation=snapshot.get("generation"),
                         min_elapsed=60,
-                        now=(
-                            None
-                            if stopped_epoch >= observed_stop_epoch
-                            else stopped_epoch
-                        ),
+                        now=(stopped_epoch if hard_cap_applied else None),
+                        hard_cap=hard_cap_applied,
                     )
                     if checkpoint is None:
                         continue
@@ -3419,6 +3769,9 @@ def _checkpoint_active_boosts_once():
                         checkpoint["stopped_at"],
                         checkpoint["elapsed"],
                         checkpoint.get("app_ids") or acct.app_ids(),
+                        duration_microseconds=checkpoint.get(
+                            "elapsed_microseconds"
+                        ),
                     )
                     try:
                         db.session.commit()
@@ -6490,12 +6843,13 @@ def _stop_boost_session_and_persist(
     )
     if observed_stop_epoch is None:
         observed_stop_epoch = clock.steady_epoch()
-    stopped_epoch = _cap_user_hard_quota_stop_epoch(
+    stopped_epoch, hard_cap_applied = _cap_user_hard_quota_stop(
         user_id,
         observed_stop_epoch,
     )
     if (
         requested_stop_epoch is None
+        and not hard_cap_applied
         and stopped_epoch >= observed_stop_epoch
     ):
         segment = manager.stop_boost_segment(
@@ -6509,6 +6863,7 @@ def _stop_boost_session_and_persist(
             expected_generation=expected_generation,
             stopped_at=stopped_epoch,
             context="canonical deadline stop",
+            hard_cap=hard_cap_applied,
         )
         if segment is not None and not segment.get("local_stop_aborted"):
             segment = manager.confirm_prepared_stop_segment(
@@ -7431,25 +7786,23 @@ def toggle_boost():
 @app.route("/stats/my")
 @login_required
 def my_stats():
-    from sqlalchemy import func
     user = g.user
     now_utc = utc_now()
-    total_seconds = (
-        db.session.query(func.sum(BoostLog.duration_seconds))
+    duration_microseconds_sql = _boost_duration_microseconds_sql()
+    total_microseconds = (
+        db.session.query(func.sum(duration_microseconds_sql))
         .filter_by(user_id=user.id).scalar() or 0
     )
+    total_seconds = microseconds_to_seconds(total_microseconds)
     total_sessions = BoostLog.query.filter_by(user_id=user.id).count()
-    week_ago = now_utc - timedelta(days=7)
-    daily = (
-        db.session.query(
-            func.date(BoostLog.started_at).label("day"),
-            func.sum(BoostLog.duration_seconds).label("total"),
-        )
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at > week_ago)
-        .group_by(func.date(BoostLog.started_at))
-        .all()
-    )
     today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_start = today_start - timedelta(days=6)
+    daily = _get_logged_microseconds_by_utc_day(
+        user.id,
+        daily_start,
+        7,
+        final_end=now_utc,
+    )
     today_seconds = _get_logged_seconds(
         user.id,
         today_start,
@@ -7481,7 +7834,13 @@ def my_stats():
         "accounts_count": SteamAccount.query.filter_by(user_id=user.id).count(),
         "plan": user.plan,
         "member_since": utc_iso_z(user.created_at),
-        "daily": [{"day": str(d.day), "hours": round(d.total / 3600, 1)} for d in daily],
+        "daily": [{
+            "day": str(day),
+            "hours": round(
+                microseconds_to_seconds(total) / 3600,
+                1,
+            ),
+        } for day, total in sorted(daily.items())],
     })
 
 
@@ -7493,7 +7852,8 @@ def game_stats():
     game_hours: dict = {}
 
     for log in logs:
-        if not log.app_ids_json or log.duration_seconds <= 0:
+        duration_microseconds = _boost_log_effective_microseconds(log)
+        if not log.app_ids_json or duration_microseconds <= 0:
             continue
         try:
             app_ids = json.loads(log.app_ids_json)
@@ -7501,14 +7861,21 @@ def game_stats():
             continue
         if not app_ids:
             continue
-        per_game = log.duration_seconds / len(app_ids)
-        for aid in app_ids:
+        per_game, remainder = divmod(duration_microseconds, len(app_ids))
+        for index, aid in enumerate(app_ids):
             aid_str = str(aid)
-            game_hours[aid_str] = game_hours.get(aid_str, 0) + per_game
+            share = per_game + (1 if index < remainder else 0)
+            game_hours[aid_str] = game_hours.get(aid_str, 0) + share
 
     sorted_games = sorted(game_hours.items(), key=lambda x: x[1], reverse=True)
     result = [
-        {"app_id": int(k), "hours": round(v / 3600, 1)}
+        {
+            "app_id": int(k),
+            "hours": round(
+                microseconds_to_seconds(v) / 3600,
+                1,
+            ),
+        }
         for k, v in sorted_games[:20]
     ]
     return jsonify({"games": result, "total_tracked": len(game_hours)})
@@ -7517,71 +7884,67 @@ def game_stats():
 @app.route("/stats/detailed")
 @login_required
 def stats_detailed():
-    from sqlalchemy import func
     user = g.user
     now_utc = utc_now()
+    duration_microseconds_sql = _boost_duration_microseconds_sql()
 
     # ── Son 7 gün: günlük saat dağılımı ──
-    week_ago = now_utc - timedelta(days=7)
-    daily_rows = (
-        db.session.query(
-            func.date(BoostLog.started_at).label("day"),
-            func.sum(BoostLog.duration_seconds).label("total"),
-        )
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at > week_ago)
-        .group_by(func.date(BoostLog.started_at))
-        .all()
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    weekly_start = today_start - timedelta(days=6)
+    daily_rows = _get_logged_microseconds_by_utc_day(
+        user.id,
+        weekly_start,
+        7,
+        final_end=now_utc,
     )
     day_names_tr = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"]
     day_names_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     weekly_hours = []
     for i in range(6, -1, -1):
         d = (now_utc - timedelta(days=i)).date()
-        found = 0
-        for row in daily_rows:
-            rd = row.day if isinstance(row.day, type(d)) else datetime.strptime(str(row.day), "%Y-%m-%d").date()
-            if rd == d:
-                found = row.total or 0
-                break
+        found = daily_rows.get(d, 0)
         wd = d.weekday()
         weekly_hours.append({
             "day_tr": day_names_tr[wd],
             "day_en": day_names_en[wd],
             "date": str(d),
-            "hours": round(found / 3600, 1),
+            "hours": round(
+                microseconds_to_seconds(found) / 3600,
+                1,
+            ),
         })
 
     # ── Son 4 hafta: haftalık toplam ──
-    four_weeks_ago = now_utc - timedelta(days=28)
-    monthly_rows = (
-        db.session.query(
-            func.date(BoostLog.started_at).label("day"),
-            func.sum(BoostLog.duration_seconds).label("total"),
-        )
-        .filter(BoostLog.user_id == user.id, BoostLog.started_at > four_weeks_ago)
-        .group_by(func.date(BoostLog.started_at))
-        .all()
+    four_weeks_start = today_start - timedelta(days=28)
+    monthly_rows = _get_logged_microseconds_by_utc_day(
+        user.id,
+        four_weeks_start,
+        28,
+        final_end=today_start,
     )
     monthly_hours = []
     for w in range(3, -1, -1):
         w_start = (now_utc - timedelta(days=(w + 1) * 7)).date()
         w_end = (now_utc - timedelta(days=w * 7)).date()
         total = 0
-        for row in monthly_rows:
-            rd = row.day if isinstance(row.day, type(w_start)) else datetime.strptime(str(row.day), "%Y-%m-%d").date()
-            if w_start <= rd < w_end:
-                total += (row.total or 0)
+        for day, duration_microseconds in monthly_rows.items():
+            if w_start <= day < w_end:
+                total += duration_microseconds
         monthly_hours.append({
             "week_tr": f"Hafta {4 - w}",
             "week_en": f"Week {4 - w}",
-            "hours": round(total / 3600, 1),
+            "hours": round(
+                microseconds_to_seconds(total) / 3600,
+                1,
+            ),
         })
 
     # ── En çok boost edilen 10 oyun ──
     logs = BoostLog.query.filter_by(user_id=user.id).all()
     game_secs: dict = {}
     for log in logs:
-        if not log.app_ids_json or log.duration_seconds <= 0:
+        duration_microseconds = _boost_log_effective_microseconds(log)
+        if not log.app_ids_json or duration_microseconds <= 0:
             continue
         try:
             aids = json.loads(log.app_ids_json)
@@ -7589,27 +7952,35 @@ def stats_detailed():
             continue
         if not aids:
             continue
-        per = log.duration_seconds / len(aids)
-        for aid in aids:
-            game_secs[str(aid)] = game_secs.get(str(aid), 0) + per
+        per, remainder = divmod(duration_microseconds, len(aids))
+        for index, aid in enumerate(aids):
+            share = per + (1 if index < remainder else 0)
+            game_secs[str(aid)] = game_secs.get(str(aid), 0) + share
 
     sorted_games = sorted(game_secs.items(), key=lambda x: x[1], reverse=True)[:10]
     max_secs = sorted_games[0][1] if sorted_games else 1
     top_games = [
-        {"app_id": int(k), "hours": round(v / 3600, 1), "pct": round((v / max_secs) * 100)}
+        {
+            "app_id": int(k),
+            "hours": round(
+                microseconds_to_seconds(v) / 3600,
+                1,
+            ),
+            "pct": round((v / max_secs) * 100),
+        }
         for k, v in sorted_games
     ]
 
     # ── Özet istatistikler ──
-    total_seconds = (
-        db.session.query(func.sum(BoostLog.duration_seconds))
+    total_microseconds = (
+        db.session.query(func.sum(duration_microseconds_sql))
         .filter_by(user_id=user.id).scalar() or 0
     )
+    total_seconds = microseconds_to_seconds(total_microseconds)
     total_seconds += _get_active_seconds(user.id)
 
     total_sessions = BoostLog.query.filter_by(user_id=user.id).count()
 
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     today_seconds = _get_logged_seconds(
         user.id,
         today_start,
@@ -7625,7 +7996,7 @@ def stats_detailed():
     avg_daily = (total_seconds / max(active_days, 1)) if active_days else 0
 
     longest_log = (
-        db.session.query(func.max(BoostLog.duration_seconds))
+        db.session.query(func.max(duration_microseconds_sql))
         .filter_by(user_id=user.id).scalar() or 0
     )
 
@@ -7638,7 +8009,10 @@ def stats_detailed():
             "today_hours": round(today_seconds / 3600, 1),
             "total_sessions": total_sessions,
             "avg_daily_hours": round(avg_daily / 3600, 1),
-            "longest_session_hours": round(longest_log / 3600, 1),
+            "longest_session_hours": round(
+                microseconds_to_seconds(longest_log) / 3600,
+                1,
+            ),
             "active_days": active_days,
         },
     })

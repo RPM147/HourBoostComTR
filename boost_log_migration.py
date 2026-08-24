@@ -11,6 +11,11 @@ import sqlite3
 
 from sqlalchemy import inspect, text
 
+from usage_ledger import (
+    MAX_DURATION_MICROSECONDS,
+    MICROSECONDS_PER_SECOND,
+)
+
 
 _SNAPSHOT_COLUMNS = {
     "account_id_snapshot": "VARCHAR(32)",
@@ -38,12 +43,102 @@ def enable_sqlite_foreign_keys(dbapi_connection) -> bool:
     return True
 
 
-def _scalar(conn, statement: str):
-    return conn.execute(text(statement)).scalar_one()
+def _scalar(conn, statement: str, parameters=None):
+    return conn.execute(text(statement), parameters or {}).scalar_one()
 
 
 def _changed(result) -> int:
     return max(0, int(result.rowcount or 0))
+
+
+def _integer_sum(conn, statement: str) -> int:
+    """Accumulate integers in Python so SQLite SUM cannot overflow."""
+
+    total = 0
+    for (value,) in conn.execute(text(statement)):
+        if value is not None:
+            total += int(value)
+    return total
+
+
+def _duration_ledger_check_sql(prefix="") -> str:
+    seconds = f"{prefix}duration_seconds"
+    microseconds = f"{prefix}duration_microseconds"
+    maximum_seconds = (
+        MAX_DURATION_MICROSECONDS // MICROSECONDS_PER_SECOND
+    )
+    return (
+        f"{seconds} IS NULL OR {seconds} < 0 "
+        f"OR {seconds} > {maximum_seconds} "
+        f"OR ({microseconds} IS NOT NULL AND ("
+        f"{microseconds} < 0 "
+        f"OR {microseconds} > {MAX_DURATION_MICROSECONDS} "
+        f"OR ({seconds} = 0 AND {microseconds} <> 0) "
+        f"OR ({seconds} > 0 AND ("
+        f"{microseconds} <= (CAST({seconds} AS BIGINT) - 1) "
+        f"* {MICROSECONDS_PER_SECOND} "
+        f"OR {microseconds} > CAST({seconds} AS BIGINT) "
+        f"* {MICROSECONDS_PER_SECOND}))))"
+    )
+
+
+def _install_duration_ledger_enforcement(conn, dialect: str) -> int:
+    """Reject invalid dual-writes while still allowing old seconds-only code."""
+
+    constraint_name = "ck_boost_logs_duration_ledger"
+    if dialect == "sqlite":
+        trigger_names = {
+            row[0]
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND name IN ("
+                "'trg_boost_logs_duration_ledger_insert', "
+                "'trg_boost_logs_duration_ledger_update')"
+            ).all()
+        }
+        added = 0
+        definitions = (
+            (
+                "trg_boost_logs_duration_ledger_insert",
+                "BEFORE INSERT",
+            ),
+            (
+                "trg_boost_logs_duration_ledger_update",
+                "BEFORE UPDATE OF duration_seconds, duration_microseconds",
+            ),
+        )
+        for name, event in definitions:
+            if name in trigger_names:
+                continue
+            conn.exec_driver_sql(
+                f"CREATE TRIGGER {name} {event} ON boost_logs "
+                "WHEN typeof(NEW.duration_seconds) <> 'integer' "
+                "OR (NEW.duration_microseconds IS NOT NULL AND "
+                "typeof(NEW.duration_microseconds) <> 'integer') "
+                f"OR {_duration_ledger_check_sql('NEW.')} "
+                "BEGIN SELECT RAISE(ABORT, "
+                "'invalid boost duration ledger'); END"
+            )
+            added += 1
+        return added
+
+    if dialect == "postgresql":
+        constraints = {
+            item.get("name")
+            for item in inspect(conn).get_check_constraints("boost_logs")
+        }
+        if constraint_name in constraints:
+            return 0
+        conn.execute(text(
+            "ALTER TABLE boost_logs ADD CONSTRAINT "
+            f"{constraint_name} CHECK (NOT ("
+            f"{_duration_ledger_check_sql()}))"
+        ))
+        return 1
+
+    raise RuntimeError(
+        f"Phase 5G.2 does not support database dialect: {dialect}"
+    )
 
 
 def migrate_boost_log_history(engine) -> dict[str, int | str]:
@@ -407,4 +502,202 @@ def migrate_boost_log_history(engine) -> dict[str, int | str]:
             "unknown_account_snapshots": unknown_account_snapshots,
             "unknown_steam_usernames": unknown_steam_usernames,
             "foreign_key_violations": foreign_key_violations,
+        }
+
+
+def migrate_boost_duration_ledger(engine) -> dict[str, int | str]:
+    """Add and backfill the Phase 5G.2 integer-microsecond usage ledger.
+
+    The legacy seconds measurement is never changed.  Existing rows gain only
+    the precision they actually contain (seconds multiplied by one million),
+    while already migrated fractional rows remain untouched.  Keeping the new
+    column nullable is intentional rollback compatibility: an older writer may
+    insert a seconds-only row, which this idempotent bridge fills on next boot.
+    """
+
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        table_names = set(inspect(conn).get_table_names())
+        if "boost_logs" not in table_names:
+            raise RuntimeError(
+                "Phase 5G.2 migration requires the boost_logs table"
+            )
+
+        columns = {
+            column["name"]
+            for column in inspect(conn).get_columns("boost_logs")
+        }
+        required_columns = {"id", "duration_seconds"}
+        missing_columns = sorted(required_columns - columns)
+        if missing_columns:
+            raise RuntimeError(
+                "boost_logs is missing required columns: "
+                + ", ".join(missing_columns)
+            )
+
+        rows_before = int(_scalar(conn, "SELECT COUNT(*) FROM boost_logs"))
+        if dialect == "sqlite":
+            non_integer_legacy = int(_scalar(
+                conn,
+                "SELECT COUNT(*) FROM boost_logs "
+                "WHERE duration_seconds IS NOT NULL "
+                "AND typeof(duration_seconds) <> 'integer'",
+            ))
+            if non_integer_legacy:
+                raise RuntimeError(
+                    "Phase 5G.2 migration found non-integer legacy "
+                    f"durations: {non_integer_legacy}"
+                )
+        invalid_legacy = int(_scalar(
+            conn,
+            "SELECT COUNT(*) FROM boost_logs "
+            "WHERE duration_seconds IS NULL OR duration_seconds < 0 "
+            "OR duration_seconds > :maximum_seconds",
+            {
+                "maximum_seconds": (
+                    MAX_DURATION_MICROSECONDS // MICROSECONDS_PER_SECOND
+                ),
+            },
+        ))
+        if invalid_legacy:
+            raise RuntimeError(
+                "Phase 5G.2 migration found invalid legacy durations: "
+                f"{invalid_legacy}"
+            )
+        seconds_before = _integer_sum(
+            conn,
+            "SELECT duration_seconds FROM boost_logs",
+        )
+        if (
+            "duration_microseconds" not in columns
+            and seconds_before
+            > MAX_DURATION_MICROSECONDS // MICROSECONDS_PER_SECOND
+        ):
+            raise RuntimeError(
+                "Phase 5G.2 legacy duration total exceeds the canonical "
+                "ledger range"
+            )
+        added_columns = 0
+        if "duration_microseconds" not in columns:
+            conn.execute(text(
+                "ALTER TABLE boost_logs ADD COLUMN "
+                "duration_microseconds BIGINT"
+            ))
+            columns.add("duration_microseconds")
+            added_columns = 1
+
+        invalid_microseconds = int(_scalar(
+            conn,
+            "SELECT COUNT(*) FROM boost_logs "
+            "WHERE duration_microseconds IS NOT NULL "
+            "AND (duration_microseconds < 0 "
+            "OR duration_microseconds > :maximum_microseconds "
+            "OR (duration_seconds = 0 AND duration_microseconds <> 0) "
+            "OR (duration_seconds > 0 AND ("
+            "duration_microseconds <= "
+            "(CAST(duration_seconds AS BIGINT) - 1) "
+            "* :microseconds_per_second "
+            "OR duration_microseconds > CAST(duration_seconds AS BIGINT) "
+            "* :microseconds_per_second)))",
+            {
+                "microseconds_per_second": MICROSECONDS_PER_SECOND,
+                "maximum_microseconds": MAX_DURATION_MICROSECONDS,
+            },
+        ))
+        if invalid_microseconds:
+            raise RuntimeError(
+                "Phase 5G.2 migration found invalid canonical durations: "
+                f"{invalid_microseconds}"
+            )
+        if dialect == "sqlite":
+            non_integer_microseconds = int(_scalar(
+                conn,
+                "SELECT COUNT(*) FROM boost_logs "
+                "WHERE duration_microseconds IS NOT NULL "
+                "AND typeof(duration_microseconds) <> 'integer'",
+            ))
+            if non_integer_microseconds:
+                raise RuntimeError(
+                    "Phase 5G.2 migration found non-integer canonical "
+                    f"durations: {non_integer_microseconds}"
+                )
+
+        missing_before = int(_scalar(
+            conn,
+            "SELECT COUNT(*) FROM boost_logs "
+            "WHERE duration_microseconds IS NULL",
+        ))
+        existing_microseconds_before = _integer_sum(
+            conn,
+            "SELECT duration_microseconds FROM boost_logs "
+            "WHERE duration_microseconds IS NOT NULL",
+        )
+        missing_seconds_before = _integer_sum(
+            conn,
+            "SELECT duration_seconds FROM boost_logs "
+            "WHERE duration_microseconds IS NULL",
+        )
+        expected_microseconds = (
+            existing_microseconds_before
+            + missing_seconds_before * MICROSECONDS_PER_SECOND
+        )
+        if expected_microseconds > MAX_DURATION_MICROSECONDS:
+            raise RuntimeError(
+                "Phase 5G.2 duration total exceeds the canonical ledger range"
+            )
+
+        backfilled_rows = _changed(conn.execute(text(
+            "UPDATE boost_logs SET duration_microseconds = "
+            "CAST(duration_seconds AS BIGINT) * :microseconds_per_second "
+            "WHERE duration_microseconds IS NULL"
+        ), {
+            "microseconds_per_second": MICROSECONDS_PER_SECOND,
+        }))
+
+        rows_after = int(_scalar(conn, "SELECT COUNT(*) FROM boost_logs"))
+        seconds_after = _integer_sum(
+            conn,
+            "SELECT duration_seconds FROM boost_logs",
+        )
+        microseconds_after = _integer_sum(
+            conn,
+            "SELECT duration_microseconds FROM boost_logs",
+        )
+        missing_after = int(_scalar(
+            conn,
+            "SELECT COUNT(*) FROM boost_logs "
+            "WHERE duration_microseconds IS NULL",
+        ))
+        negative_after = int(_scalar(
+            conn,
+            "SELECT COUNT(*) FROM boost_logs "
+            "WHERE duration_microseconds < 0",
+        ))
+
+        if rows_before != rows_after or seconds_before != seconds_after:
+            raise RuntimeError(
+                "Phase 5G.2 migration changed protected legacy totals"
+            )
+        if backfilled_rows != missing_before or missing_after or negative_after:
+            raise RuntimeError(
+                "Phase 5G.2 migration left an incomplete canonical ledger"
+            )
+        if microseconds_after != expected_microseconds:
+            raise RuntimeError(
+                "Phase 5G.2 migration changed canonical duration totals"
+            )
+
+        enforcement_added = _install_duration_ledger_enforcement(
+            conn,
+            dialect,
+        )
+
+        return {
+            "dialect": dialect,
+            "rows": rows_after,
+            "duration_seconds": seconds_after,
+            "duration_microseconds": microseconds_after,
+            "added_columns": added_columns,
+            "backfilled_rows": backfilled_rows,
+            "enforcement_added": enforcement_added,
         }

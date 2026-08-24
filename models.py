@@ -155,6 +155,19 @@ class BoostLog(db.Model):
             "stopped_at",
             "started_at",
         ),
+        db.CheckConstraint(
+            "duration_seconds IS NOT NULL "
+            "AND duration_seconds >= 0 "
+            "AND duration_seconds <= 9223372036854 "
+            "AND (duration_microseconds IS NULL OR ("
+            "(duration_seconds = 0 AND duration_microseconds = 0) OR "
+            "(duration_seconds > 0 "
+            "AND duration_microseconds > "
+            "(CAST(duration_seconds AS BIGINT) - 1) * 1000000 "
+            "AND duration_microseconds <= "
+            "CAST(duration_seconds AS BIGINT) * 1000000)))",
+            name="ck_boost_logs_duration_ledger",
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -176,6 +189,10 @@ class BoostLog(db.Model):
     # hidden by backdating the billable boundary.
     remote_stopped_at = db.Column(UTCDateTime(), nullable=True)
     duration_seconds = db.Column(db.Integer, default=0)
+    # Phase 5G.2 canonical usage ledger.  This stays nullable so a rollback to
+    # the previous writer can still create seconds-only rows; the next startup
+    # backfills those rows losslessly.  New code always dual-writes both fields.
+    duration_microseconds = db.Column(db.BigInteger, nullable=True)
     games_count = db.Column(db.Integer, default=0)
     app_ids_json = db.Column(db.Text, nullable=True)
 
