@@ -63,6 +63,29 @@ MAX_PENDING_STATE_BYTES = 262144
 # if a later hard/manual stop can still append its final boundary.
 MAX_PENDING_CHECKPOINT_SEGMENTS = MAX_PENDING_FINAL_SEGMENTS - 1
 FATAL_FINALIZATION_RETRY_SECONDS = 2.0
+TRANSIENT_LOGIN_RESULTS = frozenset(
+    {
+        EResult.Invalid,
+        EResult.Fail,
+        EResult.NoConnection,
+        EResult.ServiceUnavailable,
+        EResult.LimitExceeded,
+        EResult.TryAnotherCM,
+        EResult.RateLimitExceeded,
+    }
+)
+TERMINAL_RECONNECT_RESULTS = frozenset(
+    {
+        EResult.InvalidPassword,
+        EResult.LoggedInElsewhere,
+        EResult.LogonSessionReplaced,
+        EResult.AlreadyLoggedInElsewhere,
+        EResult.AccountLogonDenied,
+        EResult.InvalidLoginAuthCode,
+        EResult.AccountLoginDeniedNeedTwoFactor,
+        EResult.TwoFactorCodeMismatch,
+    }
+)
 
 
 def _path_exists(path):
@@ -780,10 +803,10 @@ class SteamWorkerClient:
 
         return decorator
 
-    def _emit(self, event_name):
+    def _emit(self, event_name, *args):
         for callback in list(self._handlers.get(event_name, [])):
             try:
-                callback()
+                callback(*args)
             except Exception as e:
                 logger.error("Steam worker event handler hatasi (%s): %s", event_name, e)
 
@@ -885,7 +908,13 @@ class SteamWorkerClient:
                 try:
                     message = json.loads(line)
                 except Exception:
-                    logger.warning("Steam worker gecersiz cikti: %s", line.strip())
+                    # stdout carries refresh tokens. A killed worker can leave a
+                    # partial JSON line, so never log its raw content.
+                    logger.warning(
+                        "Steam worker gecersiz cikti: generation=%s chars=%s",
+                        generation,
+                        len(line),
+                    )
                     continue
                 self._handle_message(message, process, generation)
         except Exception as e:
@@ -905,7 +934,11 @@ class SteamWorkerClient:
                     self.logged_in = False
                     # Serialize the process transition with event publication. A
                     # replacement worker cannot be installed between these steps.
-                    self._emit("disconnected")
+                    self._emit(
+                        "disconnected",
+                        int(EResult.NoConnection),
+                        False,
+                    )
 
     def _read_stderr(self, process, generation):
         try:
@@ -951,10 +984,22 @@ class SteamWorkerClient:
             elif event == "disconnected":
                 self.logged_in = False
                 self.connected = False
-                self._emit("disconnected")
-            elif event == "error":
+                self._emit(
+                    "disconnected",
+                    int(message.get("eresult", EResult.NoConnection)),
+                    bool(message.get("terminal", False)),
+                )
+            elif event in ("error", "login_error"):
                 self.logged_in = False
+                self.connected = False
                 logger.warning("Steam worker event error: %s", message.get("message"))
+                self._emit(
+                    "disconnected",
+                    int(message.get("eresult", EResult.Fail)),
+                    bool(message.get("terminal", False)),
+                )
+            elif event == "refresh_token":
+                self._emit("refresh_token", message.get("refresh_token"))
 
     def _request(self, action, payload=None, timeout=60):
         if not self._ensure_process():
@@ -1046,6 +1091,22 @@ class SteamWorkerClient:
     def change_status(self, persona_state=EPersonaState.Online):
         response = self._request("set_persona", {"state": int(persona_state)}, timeout=20)
         return _safe_eresult(response.get("eresult"))
+
+    def get_profile(self):
+        """Return this authenticated account's own CM persona data.
+
+        The caller treats this as optional presentation data.  Raising on an
+        unavailable worker lets the profile resolver apply its bounded
+        cooldown without mutating login or boost state.
+        """
+        response = self._request("get_profile", timeout=15)
+        if not response.get("ok"):
+            raise RuntimeError("Steam worker profile is unavailable")
+        return {
+            "steam_id": response.get("steam_id"),
+            "name": response.get("name") or "",
+            "avatar": response.get("avatar") or "",
+        }
 
     def stop_games(self):
         response = self._request("stop_boost", timeout=20)
@@ -1192,6 +1253,10 @@ class SteamAccountManager:
         # this gevent-aware lock. It is public so route/timer/checkpoint code can
         # take one coherent snapshot instead of racing individual attributes.
         self.state_lock = RLock()
+        # Credential files are atomically replaced, but the read-modify-write
+        # sequence still needs serialization so token rotation and password
+        # persistence cannot overwrite one another.
+        self._credential_lock = RLock()
         # The hard quota fence must remain operable while state_lock is held by
         # a slow Node IPC request. Pending-segment storage therefore has its own
         # lock, and quota operation admission has a separate linearization lock.
@@ -2005,6 +2070,27 @@ class SteamAccountManager:
         return _credential_path(self.account_id, self.steam_username)
 
     def save_credentials(self, password=None, refresh_token=None):
+        with self._credential_lock:
+            return self._save_credentials_unlocked(
+                password=password,
+                refresh_token=refresh_token,
+            )
+
+    def _persist_refresh_token_if_current(self, refresh_token):
+        """Persist only a current token from an authenticated CM session."""
+        if not refresh_token:
+            return False
+        with self._credential_lock:
+            if (
+                self._removed
+                or not self.logged_in
+                or not self.client.logged_in
+                or self.client.refresh_token != refresh_token
+            ):
+                return False
+            return self._save_credentials_unlocked(refresh_token=refresh_token)
+
+    def _save_credentials_unlocked(self, password=None, refresh_token=None):
         try:
             if self._removed:
                 return False
@@ -2081,11 +2167,12 @@ class SteamAccountManager:
             return None
 
     def delete_credentials(self, *, include_legacy_machine_auth=False):
-        return delete_saved_credentials(
-            self.account_id,
-            self.steam_username,
-            include_legacy_machine_auth=include_legacy_machine_auth,
-        )
+        with self._credential_lock:
+            return delete_saved_credentials(
+                self.account_id,
+                self.steam_username,
+                include_legacy_machine_auth=include_legacy_machine_auth,
+            )
 
     def has_credentials(self):
         return os.path.exists(self._cred_path())
@@ -2094,8 +2181,14 @@ class SteamAccountManager:
         return self.has_credentials()
 
     def _setup_events(self):
-        def _process_disconnect_event(event_generation):
-            logger.warning("[%s] Baglanti koptu", self.steam_username)
+        def _process_disconnect_event(
+            event_generation,
+            eresult=None,
+            terminal=False,
+        ):
+            result = _safe_eresult(eresult, fallback=EResult.Fail)
+            terminal = bool(terminal or result in TERMINAL_RECONNECT_RESULTS)
+            terminal_token = None
             with self.state_lock:
                 if event_generation != self._connection_event_generation:
                     return
@@ -2105,17 +2198,47 @@ class SteamAccountManager:
                     if self._active_session_matches_unlocked()
                     else None
                 )
-            if generation is not None:
-                self._schedule_reconnect(generation)
+                if terminal and generation is not None:
+                    terminal_token = uuid.uuid4().hex
+                    self._reconnect_pending_generation = generation
+                    self._reconnect_pending_token = terminal_token
+
+            if generation is None:
+                return
+            if terminal:
+                logger.warning(
+                    "[%s] Terminal Steam oturum sonucu %s; aktif boost "
+                    "fail-closed sonlandiriliyor",
+                    self.steam_username,
+                    int(result),
+                )
+                self._finalize_fatal_session(
+                    generation,
+                    f"terminal session result {int(result)}",
+                    expected_reconnect_token=terminal_token,
+                    expected_connection_generation=event_generation,
+                )
+            else:
+                logger.warning(
+                    "[%s] Baglanti koptu (result=%s)",
+                    self.steam_username,
+                    int(result),
+                )
+                self._schedule_reconnect(
+                    generation,
+                    expected_connection_generation=event_generation,
+                )
 
         @self.client.on("disconnected")
-        def _on_dc():
+        def _on_dc(eresult=None, terminal=False):
             # SteamWorkerClient emits from its stdout reader. Never let lock
             # contention in account state block that reader from resolving IPC.
             self._connection_event_generation += 1
             gevent.spawn(
                 _process_disconnect_event,
                 self._connection_event_generation,
+                eresult,
+                terminal,
             )
 
         def _process_login_event(event_generation):
@@ -2150,6 +2273,17 @@ class SteamAccountManager:
                 _process_login_event,
                 self._connection_event_generation,
             )
+
+        @self.client.on("refresh_token")
+        def _on_refresh_token(refresh_token=None):
+            # Token rotation can happen after the synchronous loggedOn response.
+            # Persist the renewed token without blocking the stdout reader and
+            # without ever writing it to logs.
+            if refresh_token:
+                gevent.spawn(
+                    self._persist_refresh_token_if_current,
+                    refresh_token,
+                )
 
         @self.client.on("new_login_key")
         def _on_new_key():
@@ -2375,13 +2509,7 @@ class SteamAccountManager:
                     connection_generation,
                 )
                 return
-            if result in (
-                EResult.AccountLogonDenied,
-                EResult.AccountLoginDeniedNeedTwoFactor,
-                EResult.InvalidLoginAuthCode,
-                EResult.TwoFactorCodeMismatch,
-                EResult.InvalidPassword,
-            ):
+            if result in TERMINAL_RECONNECT_RESULTS:
                 logger.warning(
                     "[%s] Terminal reconnect sonucu %s; aktif boost "
                     "sonlandiriliyor",
@@ -2497,6 +2625,14 @@ class SteamAccountManager:
                 ):
                     return result
                 return EResult.NoConnection
+            if result in TRANSIENT_LOGIN_RESULTS:
+                logger.warning(
+                    "[%s] Refresh token login gecici olarak basarisiz: %s; "
+                    "ayni giris ucusunda sifre fallback uygulanmiyor",
+                    self.steam_username,
+                    result,
+                )
+                return result
             logger.warning(
                 "[%s] Refresh token login basarisiz: %s, sifre fallback deneniyor",
                 self.steam_username,

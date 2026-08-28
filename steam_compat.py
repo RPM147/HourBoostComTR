@@ -7,8 +7,12 @@ class EResult(IntEnum):
     Fail = 2
     NoConnection = 3
     InvalidPassword = 5
+    LoggedInElsewhere = 6
     ServiceUnavailable = 20
     LimitExceeded = 25
+    LogonSessionReplaced = 34
+    TryAnotherCM = 48
+    AlreadyLoggedInElsewhere = 50
     AccountLogonDenied = 63
     InvalidLoginAuthCode = 65
     RateLimitExceeded = 84

@@ -33,6 +33,32 @@ class Config:
         )
 
     STEAM_API_KEY = os.environ.get("STEAM_API_KEY")
+    # Profile lookups are presentation-only and must not create request storms
+    # when Steam or the configured Web API key is unavailable.
+    STEAM_PROFILE_CACHE_TTL_SECONDS = _env_positive_int(
+        "STEAM_PROFILE_CACHE_TTL_SECONDS",
+        15 * 60,
+    )
+    STEAM_PROFILE_STALE_TTL_SECONDS = _env_positive_int(
+        "STEAM_PROFILE_STALE_TTL_SECONDS",
+        24 * 3600,
+    )
+    STEAM_PROFILE_FAILURE_COOLDOWN_SECONDS = _env_positive_int(
+        "STEAM_PROFILE_FAILURE_COOLDOWN_SECONDS",
+        60,
+    )
+    STEAM_PROFILE_AUTH_COOLDOWN_SECONDS = _env_positive_int(
+        "STEAM_PROFILE_AUTH_COOLDOWN_SECONDS",
+        3600,
+    )
+    STEAM_PROFILE_CACHE_MAX_ENTRIES = _env_positive_int(
+        "STEAM_PROFILE_CACHE_MAX_ENTRIES",
+        500,
+    )
+    STEAM_PROFILE_XML_FALLBACK_ENABLED = _env_bool(
+        "STEAM_PROFILE_XML_FALLBACK_ENABLED",
+        True,
+    )
     SITE_URL = os.environ.get("SITE_URL", "https://hourboost.com.tr")
     SQLALCHEMY_DATABASE_URI = os.environ.get(
         "DATABASE_URL", "sqlite:///steamboost.db"

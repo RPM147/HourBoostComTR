@@ -10,8 +10,8 @@ import hmac
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
-import xml.etree.ElementTree as ET
 import bleach
 import mailer
 import jwt as pyjwt
@@ -57,7 +57,9 @@ def is_safe_url(url):
     """SSRF saldırılarını önlemek için URL'yi doğrula."""
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
+        # Every allowlisted production integration supports TLS. Accepting an
+        # HTTP downgrade would expose query-string credentials in transit.
+        if parsed.scheme != 'https':
             return False
         if not parsed.hostname:
             return False
@@ -100,20 +102,51 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     İzinli bir host açık-redirect ile iç IP'ye yönlendirse bile engellenir."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
         if not is_safe_url(newurl):
-            logger.warning("Güvensiz redirect engellendi: %s", newurl)
-            raise ValueError(f"Güvensiz redirect engellendi: {newurl}")
-        host = urlparse(newurl).hostname
+            # Never log a full redirect URL: outbound API credentials may be
+            # carried in its query string.
+            logger.warning(
+                "Güvensiz redirect engellendi: status=%s scheme=%s host=%s",
+                code,
+                parsed.scheme or "none",
+                parsed.hostname or "none",
+            )
+            raise ValueError("Güvensiz redirect engellendi")
+        host = parsed.hostname
         if _resolves_to_private_ip(host):
             logger.warning("Redirect özel IP'ye çözümleniyor, engellendi: %s", host)
             raise ValueError(f"Redirect özel IP'ye çözümleniyor: {host}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects for requests whose URL contains a credential."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
+        logger.warning(
+            "HTTP redirect reddedildi: status=%s scheme=%s host=%s",
+            code,
+            parsed.scheme or "none",
+            parsed.hostname or "none",
+        )
+        original = urlparse(req.full_url)
+        redacted_url = f"{original.scheme}://{original.hostname or 'invalid'}/"
+        raise urllib.error.HTTPError(
+            redacted_url,
+            code,
+            "Redirect rejected",
+            headers,
+            fp,
+        )
+
+
 _safe_opener = urllib.request.build_opener(_SafeRedirectHandler)
+_no_redirect_opener = urllib.request.build_opener(_RejectRedirectHandler)
 
 
-def safe_urlopen(url, timeout=10, **kwargs):
+def safe_urlopen(url, timeout=10, allow_redirects=True, **kwargs):
     """
     SSRF ve DNS Rebinding korumalı urlopen.
     ALLOWED_HOSTS listesi sıkı olduğu için TOCTOU/DNS Rebinding riski taşımaz.
@@ -136,15 +169,22 @@ def safe_urlopen(url, timeout=10, **kwargs):
         logger.warning("URL özel IP'ye çözümleniyor, engellendi: %s", hostname)
         raise ValueError(f"URL özel IP'ye çözümleniyor: {hostname}")
 
-    # Yönlendirmeler de doğrulanır (bkz. _SafeRedirectHandler).
-    return _safe_opener.open(req, timeout=timeout)
+    # Credential-bearing callers can disable redirects entirely. Other
+    # redirects remain protected by the allowlist/private-IP handler.
+    opener = _safe_opener if allow_redirects else _no_redirect_opener
+    return opener.open(req, timeout=timeout)
 
 
 # Geriye dönük uyumluluk için sınıf sarmalayıcı
 class SafeURLOpener:
     @staticmethod
-    def urlopen(url, timeout=10, **kwargs):
-        return safe_urlopen(url, timeout=timeout, **kwargs)
+    def urlopen(url, timeout=10, allow_redirects=True, **kwargs):
+        return safe_urlopen(
+            url,
+            timeout=timeout,
+            allow_redirects=allow_redirects,
+            **kwargs,
+        )
 
 
 from datetime import datetime, timedelta, timezone
@@ -178,6 +218,7 @@ from steam_manager import (
     reconcile_credential_quarantines,
     restore_quarantined_credentials,
 )
+from steam_profile import SteamProfileResolver, valid_steam_id
 import shopier as shopier_lib
 from payment_verification import (
     HB_TOKEN_RE,
@@ -339,6 +380,18 @@ limiter = Limiter(
 game_cache: dict = {}
 game_cache_lock = RLock()
 GAME_CACHE_MAX = 500
+
+steam_profile_resolver = SteamProfileResolver(
+    opener=safe_urlopen,
+    logger=logger,
+    monotonic=clock.monotonic,
+    cache_ttl=Config.STEAM_PROFILE_CACHE_TTL_SECONDS,
+    stale_ttl=Config.STEAM_PROFILE_STALE_TTL_SECONDS,
+    failure_cooldown=Config.STEAM_PROFILE_FAILURE_COOLDOWN_SECONDS,
+    auth_cooldown=Config.STEAM_PROFILE_AUTH_COOLDOWN_SECONDS,
+    max_entries=Config.STEAM_PROFILE_CACHE_MAX_ENTRIES,
+    xml_fallback_enabled=Config.STEAM_PROFILE_XML_FALLBACK_ENABLED,
+)
 
 SERVER_START = clock.monotonic()
 
@@ -3137,6 +3190,29 @@ def _ensure_schema():
                     f"ALTER TABLE users ADD COLUMN plan_activated_at {col_type}"
                 ))
             logger.info("Şema güncellendi: users.plan_activated_at eklendi")
+
+        # Legacy login branches could persist the literal string "None" when
+        # a worker reported success before exposing its SteamID. Such values
+        # must not shadow a later valid CM identity.
+        with db.engine.begin() as conn:
+            steam_id_rows = conn.execute(text(
+                "SELECT id, steam_id FROM steam_accounts "
+                "WHERE steam_id IS NOT NULL"
+            )).mappings().all()
+            invalid_steam_account_ids = [
+                row["id"]
+                for row in steam_id_rows
+                if valid_steam_id(row["steam_id"]) is None
+            ]
+            for account_id in invalid_steam_account_ids:
+                conn.execute(text(
+                    "UPDATE steam_accounts SET steam_id = NULL WHERE id = :id"
+                ), {"id": account_id})
+        if invalid_steam_account_ids:
+            logger.warning(
+                "steam_profile.invalid_persisted_ids_cleared count=%d",
+                len(invalid_steam_account_ids),
+            )
 
         # Legacy paid users must not receive a fresh quota merely because the
         # activation timestamp did not exist in their original schema. The
@@ -6144,6 +6220,33 @@ def shopier_webhook():
 
 # ───────────────────── Steam Hesaplar ─────────────────────
 
+def _persist_manager_steam_id(account, manager):
+    """Persist only a valid SteamID64 reported by the live worker.
+
+    ``str(None)`` used to store the literal value ``"None"`` and then shadow a
+    later valid worker ID.  Invalid runtime values are ignored; an existing
+    valid database value is preserved.
+    """
+    raw_value = getattr(getattr(manager, "client", None), "steam_id", None)
+    steam_id = valid_steam_id(raw_value)
+    if steam_id is None:
+        if raw_value not in (None, ""):
+            logger.warning(
+                "steam_profile.invalid_worker_steam_id account=%s",
+                account.id,
+            )
+        return valid_steam_id(account.steam_id)
+    if account.steam_id != steam_id:
+        previous = valid_steam_id(account.steam_id)
+        if previous is not None and previous != steam_id:
+            logger.warning(
+                "steam_profile.worker_db_id_mismatch account=%s",
+                account.id,
+            )
+        account.steam_id = steam_id
+    return steam_id
+
+
 @app.route("/accounts")
 @login_required
 def get_accounts():
@@ -6171,6 +6274,8 @@ def account_login():
     password = data.get("password", "")
     code = sanitize(data.get("code", ""), 10)
     code_type = data.get("code_type", "email")
+    if not isinstance(code_type, str) or code_type not in {"email", "2fa"}:
+        return jsonify({"ok": False, "error": "Invalid Steam Guard code type."}), 400
     acct_id = data.get("acct_id")
     if acct_id is not None and (
         not isinstance(acct_id, str)
@@ -6246,12 +6351,18 @@ def account_login():
     if use_credentials and mgr.has_credentials():
         creds = mgr.load_credentials()
         if creds:
-            result = mgr._login_with_credentials(creds["password"], code=code or None, code_type=code_type or "2fa")
+            # Saved credentials can legitimately contain only a refresh token
+            # (including legacy files created before the CM-success persist
+            # fence was introduced).
+            # Always use the token-first manager path, which falls back to the
+            # saved password only for terminal token failures.
+            result = mgr._login_with_saved_credentials(
+                creds,
+                code=code or None,
+                code_type=code_type or "2fa",
+            )
             if result == EResult.OK:
-                try:
-                    acct_db.steam_id = str(mgr.client.steam_id)
-                except Exception:
-                    pass
+                _persist_manager_steam_id(acct_db, mgr)
                 db.session.commit()
                 with mgr.state_lock:
                     mgr.app_ids = acct_db.app_ids()
@@ -6269,10 +6380,7 @@ def account_login():
     if use_token:
         result = mgr.login()
         if result == EResult.OK:
-            try:
-                acct_db.steam_id = str(mgr.client.steam_id)
-            except Exception:
-                pass
+            _persist_manager_steam_id(acct_db, mgr)
             db.session.commit()
             with mgr.state_lock:
                 mgr.app_ids = acct_db.app_ids()
@@ -6281,7 +6389,16 @@ def account_login():
         elif result == EResult.AccountLogonDenied:
             return jsonify({"ok": False, "need_code": True, "code_type": "email", "acct_id": acct_id, "msg": "Email Guard code required."})
         elif result in (EResult.AccountLoginDeniedNeedTwoFactor, EResult.TwoFactorCodeMismatch):
-            return jsonify({"ok": False, "need_2fa": True, "acct_id": acct_id, "msg": "2FA code required."})
+            return jsonify({
+                "ok": False,
+                "need_code": True,
+                # Keep the legacy flag during the UI/API transition while
+                # exposing the same typed Guard contract as every other path.
+                "need_2fa": True,
+                "code_type": "2fa",
+                "acct_id": acct_id,
+                "msg": "2FA code required.",
+            })
         elif not password:
             return jsonify({"ok": False, "error": "Credentials invalid, please login with password.", "token_expired": True})
 
@@ -6292,17 +6409,31 @@ def account_login():
 
     if result == EResult.AccountLogonDenied:
         return jsonify({"ok": False, "need_code": True, "code_type": "email", "msg": "Email Guard code required."})
-    if result == EResult.AccountLoginDeniedNeedTwoFactor:
-        return jsonify({"ok": False, "need_code": True, "code_type": "2fa", "msg": "Authenticator code required."})
+    if result in (
+        EResult.AccountLoginDeniedNeedTwoFactor,
+        EResult.TwoFactorCodeMismatch,
+    ):
+        return jsonify({
+            "ok": False,
+            "need_code": True,
+            "code_type": "2fa",
+            "msg": (
+                "Invalid or expired authenticator code."
+                if result == EResult.TwoFactorCodeMismatch
+                else "Authenticator code required."
+            ),
+        })
     if result == EResult.InvalidLoginAuthCode:
-        return jsonify({"ok": False, "need_code": True, "msg": "Invalid code, please try again."})
+        return jsonify({
+            "ok": False,
+            "need_code": True,
+            "code_type": "email",
+            "msg": "Invalid code, please try again.",
+        })
     if result != EResult.OK:
         return jsonify({"ok": False, "error": str(result)})
 
-    try:
-        acct_db.steam_id = str(mgr.client.steam_id)
-    except Exception:
-        pass
+    _persist_manager_steam_id(acct_db, mgr)
     db.session.commit()
     with mgr.state_lock:
         mgr.app_ids = acct_db.app_ids()
@@ -8053,22 +8184,41 @@ def steam_profile():
 
     mgr = boost_service.get(acct_id)
     manager_snapshot = mgr.boost_snapshot() if mgr else None
-    if not manager_snapshot or not manager_snapshot.get("logged_in"):
-        return jsonify({"ok": False})
+    manager_logged_in = bool(
+        manager_snapshot and manager_snapshot.get("logged_in")
+    )
 
-    steamid = str(
-        acct_db.steam_id or getattr(mgr.client, "steam_id", "") or ""
-    ).strip()
-    if not re.fullmatch(r"\d{17}", steamid):
+    database_steam_id = valid_steam_id(acct_db.steam_id)
+    worker_steam_id = valid_steam_id(
+        getattr(getattr(mgr, "client", None), "steam_id", None)
+    )
+    # A currently authenticated CM session is the strongest identity signal.
+    steamid = (
+        worker_steam_id
+        if manager_logged_in and worker_steam_id
+        else database_steam_id
+    )
+    if steamid is None:
+        steamid = worker_steam_id
+    if steamid is None:
         logger.warning("Steam profili için geçersiz SteamID: account=%s", acct_id)
         return jsonify({"ok": False})
 
-    # Worker SteamID'yi biliyor fakat eski kayıtta DB alanı boşsa kalıcılaştır.
+    # Worker SteamID'yi biliyor fakat eski kayıtta DB alanı boş/geçersizse
+    # kalıcılaştır. Profil gösterimi anlık CM bağlantısına bağlı değildir.
     if acct_db.steam_id != steamid:
         acct_db.steam_id = steamid
         db.session.commit()
 
-    profile = _get_steam_profile(steamid)
+    live_loader = None
+    if manager_logged_in and hasattr(mgr.client, "get_profile"):
+        live_loader = mgr.client.get_profile
+
+    profile = _get_steam_profile(
+        steamid,
+        live_profile_loader=live_loader,
+        fallback_profile={"name": acct_db.steam_username},
+    )
     return jsonify({
         "ok": True,
         "name": profile.get("name") or acct_db.steam_username or steamid,
@@ -9273,49 +9423,18 @@ def _verify_steam_callback(params: dict):
         return None
 
 
-def _get_steam_profile(steam_id: str) -> dict:
-    steam_id = str(steam_id or "").strip()
-    if not re.fullmatch(r"\d{17}", steam_id):
-        return {}
-
-    api_key = Config.STEAM_API_KEY
-    if api_key:
-        try:
-            url = (
-                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-                f"?key={urllib.parse.quote(api_key)}&steamids={steam_id}"
-            )
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with safe_urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8"))
-            players = data.get("response", {}).get("players", [])
-            if players:
-                player = players[0]
-                return {
-                    "steam_id": steam_id,
-                    "name": player.get("personaname", ""),
-                    "avatar": player.get("avatarfull", ""),
-                    "profile_url": player.get("profileurl", ""),
-                }
-        except Exception as e:
-            logger.warning("Steam Web API profil isteği başarısız: %s", e)
-
-    # API anahtarı yoksa veya Web API geçici olarak başarısızsa public XML
-    # profili kullan. Bu fallback başarısız olsa bile caller hesap adını gösterir.
-    try:
-        url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with safe_urlopen(req, timeout=5) as r:
-            root = ET.fromstring(r.read().decode("utf-8"))
-        return {
-            "steam_id": steam_id,
-            "name": (root.findtext("steamID") or "").strip(),
-            "avatar": (root.findtext("avatarFull") or "").strip(),
-            "profile_url": f"https://steamcommunity.com/profiles/{steam_id}",
-        }
-    except Exception as e:
-        logger.warning("Steam Community profil isteği başarısız: %s", e)
-        return {}
+def _get_steam_profile(
+    steam_id: str,
+    *,
+    live_profile_loader=None,
+    fallback_profile=None,
+) -> dict:
+    return steam_profile_resolver.resolve(
+        steam_id,
+        api_key=Config.STEAM_API_KEY,
+        live_profile_loader=live_profile_loader,
+        fallback_profile=fallback_profile,
+    )
 
 
 @app.route("/steam/login")
@@ -9357,8 +9476,11 @@ def steam_callback():
 
     if user:
         user.last_login = utc_now()
-        user.steam_avatar = avatar
-        user.steam_display_name = display_name
+        # A temporary profile-provider outage must not erase known-good data.
+        if avatar:
+            user.steam_avatar = avatar
+        if display_name:
+            user.steam_display_name = display_name
         db.session.commit()
     else:
         base_username = re.sub(r"[^a-zA-Z0-9_]", "", display_name)[:30] or f"steam_{steam_id[-6:]}"
