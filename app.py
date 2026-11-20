@@ -328,13 +328,11 @@ if not app.debug and app.config["DATABASE_BACKEND"] == "sqlite":
 # ── SQLite eşzamanlılık sertleştirme ──────────────────────────────
 # gevent altında çok sayıda greenlet eşzamanlı yazınca SQLite "database is
 # locked" hatası verebilir. WAL modu + busy_timeout bunu büyük ölçüde önler.
-# Listener Engine sınıfına bağlandığından helper yalnız SQLite bağlantılarında
-# PRAGMA uygular; PostgreSQL'de no-op'tur.
+# Yalnız uygulamanın engine'lerine bağla; standalone şema ve yedek araçlarının
+# SQLite bağlantı ayarlarına müdahale etme.
 from sqlalchemy import event as _sa_event
-from sqlalchemy.engine import Engine as _SAEngine
 
 
-@_sa_event.listens_for(_SAEngine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
     try:
         is_sqlite = enable_sqlite_foreign_keys(dbapi_connection)
@@ -354,6 +352,11 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
             logger.error("SQLite PRAGMA ayarlanamadi: %s", _e)
         finally:
             cur.close()
+
+
+with app.app_context():
+    for _engine in db.engines.values():
+        _sa_event.listen(_engine, "connect", _set_sqlite_pragma)
 
 
 # ── Legacy Flask-Migrate registration ───────────────────────────
