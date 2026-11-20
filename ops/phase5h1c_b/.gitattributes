@@ -1,0 +1,3 @@
+# The archive utility verifies the exact bytes of its shell publisher.
+pg_wal_publish.sh text eol=lf
+pg_wal_archive.py text eol=lf

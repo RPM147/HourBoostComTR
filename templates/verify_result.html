@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>E-posta Doğrulama — HourBoost</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:#0d0e12;color:#e8eaf0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,160,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
+.card{position:relative;z-index:1;background:#13151b;border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:48px 40px;max-width:440px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.4);}
+.icon{font-size:52px;margin-bottom:20px;}
+.title{font-size:1.4rem;font-weight:700;margin-bottom:12px;}
+.title.success{color:#00e5a0;}
+.title.error{color:#ff4d6d;}
+.message{font-size:0.9rem;color:#8892a0;line-height:1.7;margin-bottom:28px;}
+.btn{display:inline-block;padding:12px 32px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;font-weight:700;font-size:0.9rem;text-decoration:none;border-radius:10px;transition:all 0.2s;}
+.btn{border:0;cursor:pointer;font-family:inherit;}
+.btn:hover{box-shadow:0 4px 20px rgba(0,229,160,0.3);transform:translateY(-1px);}
+.btn:disabled{opacity:0.55;cursor:not-allowed;transform:none;box-shadow:none;}
+.btn.error-btn{background:rgba(255,77,109,0.1);color:#ff4d6d;border:1px solid rgba(255,77,109,0.2);}
+[hidden]{display:none!important;}
+.logo{font-size:0.85rem;font-weight:700;letter-spacing:1px;color:#5a6070;margin-bottom:28px;}
+.logo span{color:#00e5a0;}
+</style>
+<script src="/static/token_action.js" defer></script>
+</head>
+<body>
+<div class="card" id="token-action"
+     data-endpoint="{{ action_endpoint }}"
+     data-invalid-message="{{ invalid_message }}"
+     data-request-error="{{ request_error }}"
+     data-success-title="Doğrulama Başarılı!"
+     data-error-title="Doğrulama Başarısız">
+  <div class="logo">HOUR<span>BOOST</span></div>
+  <div class="icon" id="token-action-icon">✉️</div>
+  <div class="title" id="token-action-title">Onay Gerekli</div>
+  <div class="message" id="token-action-message">{{ pending_message }}</div>
+  <button type="button" class="btn" id="token-action-button">{{ action_label }}</button>
+  <a href="/" class="btn" id="token-action-return" hidden>Ana Sayfaya Dön</a>
+</div>
+</body>
+</html>
