@@ -1,5 +1,8 @@
 .env
 *.db
+*.db-*
+*.sqlite
+*.sqlite3*
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -15,10 +18,32 @@ env/
 tokens/
 sentry/
 .cred_key
+.cloudflared/
+ops/ssh-r4b/runtime/
+ops/ssh-r4b/secrets/
+cloudflare-api-token
+tunnel-token
+cert.pem
+*.key
+*.p12
+*.pfx
+*.age
+*.dpapi
+HourBoostBackups/
 
 # Loglar
 logs/
 *.log
+backups/
+*.bak
 
 # Node Steam worker
 node_modules/
+
+# Yerel analiz, arşiv ve işletim sistemi artefaktları
+KIMI_ANALYSIS.md
+Old MD files/
+Kaynak kodlar/
+desktop.ini
+Thumbs.db
+.DS_Store

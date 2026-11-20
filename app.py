@@ -227,6 +227,13 @@ from payment_verification import (
     token_fingerprint,
     validate_canonical_order,
 )
+from payment_transactions import (
+    build_payment_claim_transition,
+    build_postgresql_due_payment_claim_select,
+    postgresql_transaction_sqlstate,
+    run_postgresql_transaction_with_retry,
+)
+from schema_tools import assert_runtime_schema
 from time_utils import (
     UTC_EPOCH,
     as_utc,
@@ -312,7 +319,7 @@ db.init_app(app)
 
 # Üretim ortamı kontrolü (ISSUES.md #16): SQLite tek-worker gunicorn altında
 # çalışır ama ödeme alan bir uygulama için PostgreSQL önerilir. Sesli uyar.
-if not app.debug and "sqlite" in app.config["SQLALCHEMY_DATABASE_URI"].lower():
+if not app.debug and app.config["DATABASE_BACKEND"] == "sqlite":
     logger.warning(
         "SQLite veritabani kullaniliyor (DATABASE_URL ayarlanmamis olabilir). "
         "Uretimde PostgreSQL onerilir; bkz. .env.example"
@@ -349,13 +356,15 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
             cur.close()
 
 
-# ── DB Migration (Flask-Migrate / Alembic) ────────────────────────
-# Şema değişikliklerini düzgün yönetmek için. Kurulum sonrası ilk sefer:
-#   flask db init
-# Her şema değişikliğinde:
-#   flask db migrate -m "açıklama"   &&   flask db upgrade
-# Not: flask_migrate yalnızca CLI içindir, runtime için zorunlu değildir;
-# kurulu değilse uygulama yine de çalışır (aşağıda savunmacı import).
+# ── Legacy Flask-Migrate registration ───────────────────────────
+# Migration işlemleri için `flask db` kullanmayın: app importu background worker
+# ve yaşam döngüsü kurtarma işlemlerini başlatır. Şema sahipliği standalone
+# schema_tools.py aracındadır; bootstrap/adoption işlemleri için
+# migrations/README.md belgesindeki çevrimdışı prosedürü izleyin.
+# Bu eski extension kaydı bir migration yetkisi vermez: standalone env.py
+# sıradan flask/Alembic upgrade ve stamp çağrılarını reddeder. Runtime başlangıcı
+# migration revision'ını, fiziksel şemayı ve veri önkoşullarını salt-okunur
+# doğrular; eksik Alembic desteği veya uyumsuz DB fail-closed davranır.
 try:
     from flask_migrate import Migrate
     migrate = Migrate(app, db)
@@ -3164,400 +3173,14 @@ def _generate_match_token() -> str:
 
 
 def _ensure_schema():
-    """Idempotent runtime bridge until Alembic migrations are established.
+    """Reject the retired runtime migration bridge.
 
-    Auth/payment schema errors are fatal. Booting with a partially migrated
-    security or financial table is more dangerous than an explicit outage.
+    Runtime and direct calls must not mutate schema or silently backfill data.
+    Standalone schema_tools owns reviewed offline migration/adoption now.
     """
-    try:
-        from sqlalchemy import inspect, text
-
-        inspector = inspect(db.engine)
-        dialect = db.engine.dialect.name
-        false_literal = "FALSE" if dialect == "postgresql" else "0"
-        true_literal = "TRUE" if dialect == "postgresql" else "1"
-        cols = {c["name"] for c in inspector.get_columns("users")}
-        if "tokens_valid_after" not in cols:
-            col_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-            with db.engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE users ADD COLUMN tokens_valid_after {col_type}"))
-            logger.info("Şema güncellendi: users.tokens_valid_after eklendi")
-
-        if "plan_activated_at" not in cols:
-            col_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-            with db.engine.begin() as conn:
-                conn.execute(text(
-                    f"ALTER TABLE users ADD COLUMN plan_activated_at {col_type}"
-                ))
-            logger.info("Şema güncellendi: users.plan_activated_at eklendi")
-
-        # Legacy login branches could persist the literal string "None" when
-        # a worker reported success before exposing its SteamID. Such values
-        # must not shadow a later valid CM identity.
-        with db.engine.begin() as conn:
-            steam_id_rows = conn.execute(text(
-                "SELECT id, steam_id FROM steam_accounts "
-                "WHERE steam_id IS NOT NULL"
-            )).mappings().all()
-            invalid_steam_account_ids = [
-                row["id"]
-                for row in steam_id_rows
-                if valid_steam_id(row["steam_id"]) is None
-            ]
-            for account_id in invalid_steam_account_ids:
-                conn.execute(text(
-                    "UPDATE steam_accounts SET steam_id = NULL WHERE id = :id"
-                ), {"id": account_id})
-        if invalid_steam_account_ids:
-            logger.warning(
-                "steam_profile.invalid_persisted_ids_cleared count=%d",
-                len(invalid_steam_account_ids),
-            )
-
-        # Legacy paid users must not receive a fresh quota merely because the
-        # activation timestamp did not exist in their original schema. The
-        # conservative fallback matches quota accounting: count from account
-        # creation, or the Unix epoch for malformed legacy rows. Free users
-        # intentionally remain NULL; a later paid activation opens a new usage
-        # window explicitly.
-        paid_plan_names = tuple(
-            name
-            for name, limits in Config.PLANS.items()
-            if name != "free" and limits.get("total_hours") is not None
-        )
-        if paid_plan_names:
-            plan_params = {
-                f"paid_plan_{index}": name
-                for index, name in enumerate(paid_plan_names)
-            }
-            plan_placeholders = ", ".join(
-                f":{key}" for key in plan_params
-            )
-            with db.engine.begin() as conn:
-                backfilled = conn.execute(text(
-                    "UPDATE users SET plan_activated_at = "
-                    "COALESCE(created_at, :legacy_plan_epoch) "
-                    "WHERE plan_activated_at IS NULL "
-                    f"AND plan IN ({plan_placeholders})"
-                ), {
-                    **plan_params,
-                    "legacy_plan_epoch": storage_utc(UTC_EPOCH),
-                })
-            if backfilled.rowcount:
-                logger.warning(
-                    "Legacy plan quota window backfilled: %d users",
-                    backfilled.rowcount,
-                )
-
-        boost_log_cols = {
-            c["name"] for c in inspect(db.engine).get_columns("boost_logs")
-        }
-        if "remote_stopped_at" not in boost_log_cols:
-            boost_datetime_type = (
-                "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-            )
-            with db.engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE boost_logs ADD COLUMN remote_stopped_at "
-                    + boost_datetime_type
-                ))
-            logger.info(
-                "Sema guncellendi: boost_logs.remote_stopped_at eklendi"
-            )
-
-        boost_history_report = migrate_boost_log_history(db.engine)
-        logger.info(
-            "phase5f.boost_log_migration rows=%s duration_seconds=%s "
-            "added_columns=%s account_snapshots=%s steam_usernames=%s "
-            "owner_ids=%s owner_usernames=%s detached_accounts=%s "
-            "detached_users=%s unknown_accounts=%s unknown_usernames=%s "
-            "fk_violations=%s",
-            boost_history_report["rows"],
-            boost_history_report["duration_seconds"],
-            boost_history_report["added_columns"],
-            boost_history_report["account_snapshot_backfilled"],
-            boost_history_report["steam_username_backfilled"],
-            boost_history_report["owner_id_backfilled"],
-            boost_history_report["owner_username_backfilled"],
-            boost_history_report["orphan_accounts_detached"],
-            boost_history_report["orphan_users_detached"],
-            boost_history_report["unknown_account_snapshots"],
-            boost_history_report["unknown_steam_usernames"],
-            boost_history_report["foreign_key_violations"],
-        )
-
-        duration_ledger_report = migrate_boost_duration_ledger(db.engine)
-        logger.info(
-            "phase5g2.duration_ledger rows=%s duration_seconds=%s "
-            "duration_microseconds=%s added_columns=%s backfilled_rows=%s "
-            "enforcement_added=%s",
-            duration_ledger_report["rows"],
-            duration_ledger_report["duration_seconds"],
-            duration_ledger_report["duration_microseconds"],
-            duration_ledger_report["added_columns"],
-            duration_ledger_report["backfilled_rows"],
-            duration_ledger_report["enforcement_added"],
-        )
-
-        session_cols = {
-            c["name"] for c in inspector.get_columns("user_sessions")
-        }
-        with db.engine.begin() as conn:
-            if "token_jti" not in session_cols:
-                conn.execute(text(
-                    "ALTER TABLE user_sessions ADD COLUMN token_jti VARCHAR(64)"
-                ))
-                logger.info("Şema güncellendi: user_sessions.token_jti eklendi")
-            if "expires_at" not in session_cols:
-                session_datetime_type = (
-                    "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-                )
-                conn.execute(text(
-                    "ALTER TABLE user_sessions ADD COLUMN expires_at "
-                    + session_datetime_type
-                ))
-                logger.info("Şema güncellendi: user_sessions.expires_at eklendi")
-
-        session_indexes = {
-            item["name"]: item
-            for item in inspect(db.engine).get_indexes("user_sessions")
-        }
-        jti_index = session_indexes.get("ix_user_sessions_token_jti")
-        if jti_index is not None and not jti_index.get("unique", False):
-            raise RuntimeError(
-                "ix_user_sessions_token_jti exists but is not unique"
-            )
-        if jti_index is None:
-            with db.engine.begin() as conn:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX ix_user_sessions_token_jti "
-                    "ON user_sessions (token_jti)"
-                ))
-            logger.info(
-                "Şema güncellendi: ix_user_sessions_token_jti oluşturuldu"
-            )
-
-        # Eski token_hint değerlerinden JWT jti geri üretilemez. Kullanıcı
-        # cutoff'u eski kodun da bu JWT'leri reddetmesini sağlar; ardından satır
-        # kapatılır. Böylece auth migration sonrası güvenli kod rollback'i
-        # iptal edilmiş legacy oturumları yeniden canlandırmaz.
-        legacy_cutoff = storage_utc(utc_now())
-        with db.engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE users SET tokens_valid_after = :cutoff "
-                "WHERE id IN ("
-                "SELECT DISTINCT user_id FROM user_sessions "
-                "WHERE is_active = " + true_literal + " "
-                "AND (token_jti IS NULL OR expires_at IS NULL)"
-                ") AND (tokens_valid_after IS NULL OR tokens_valid_after < :cutoff)"
-            ), {"cutoff": legacy_cutoff})
-            legacy_sessions = conn.execute(text(
-                "UPDATE user_sessions SET is_active = " + false_literal + " "
-                "WHERE is_active = " + true_literal + " "
-                "AND (token_jti IS NULL OR expires_at IS NULL)"
-            ))
-        if legacy_sessions.rowcount:
-            logger.warning(
-                "Güvenli oturum migration'ı: %d legacy oturum kapatıldı",
-                legacy_sessions.rowcount,
-            )
-
-        datetime_type = "TIMESTAMP" if dialect == "postgresql" else "DATETIME"
-        pcols = {c["name"] for c in inspector.get_columns("payments")}
-        payment_columns = {
-            "owner_user_id_snapshot": "INTEGER",
-            "owner_username_snapshot": "VARCHAR(80)",
-            "owner_detached_at": datetime_type,
-            "match_token": "VARCHAR(64)",
-            "admin_hidden": f"BOOLEAN NOT NULL DEFAULT {false_literal}",
-            "shopier_webhook_id": "VARCHAR(100)",
-            "shopier_event": "VARCHAR(50)",
-            "shopier_account_id": "VARCHAR(100)",
-            "shopier_timestamp": "BIGINT",
-            "webhook_body_sha256": "VARCHAR(64)",
-            "webhook_received_at": datetime_type,
-            "verification_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "verification_error": "VARCHAR(255)",
-            "verification_last_http_status": "INTEGER",
-            "next_verification_at": datetime_type,
-            "verification_lock_until": datetime_type,
-            "verified_at": datetime_type,
-            "verified_amount_minor": "INTEGER",
-        }
-        with db.engine.begin() as conn:
-            for column_name, column_type in payment_columns.items():
-                if column_name not in pcols:
-                    conn.execute(text(
-                        f"ALTER TABLE payments ADD COLUMN {column_name} {column_type}"
-                    ))
-                    logger.info("Şema güncellendi: payments.%s eklendi", column_name)
-
-        # Backfill durable ownership hints before any future user deletion.
-        # The live FK is intentionally cleared on deletion, while these fields
-        # keep the financial row attributable without relying on a reusable
-        # SQLite integer ID alone.
-        with db.engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE payments SET owner_user_id_snapshot = user_id "
-                "WHERE owner_user_id_snapshot IS NULL AND user_id IS NOT NULL"
-            ))
-            conn.execute(text(
-                "UPDATE payments SET owner_username_snapshot = ("
-                "SELECT users.username FROM users WHERE users.id = payments.user_id"
-                ") WHERE owner_username_snapshot IS NULL AND user_id IS NOT NULL"
-            ))
-
-        if dialect == "postgresql":
-            with db.engine.begin() as conn:
-                conn.execute(text(
-                    "ALTER TABLE payments ALTER COLUMN match_token TYPE VARCHAR(64)"
-                ))
-                conn.execute(text(
-                    "ALTER TABLE payments ALTER COLUMN status TYPE VARCHAR(32)"
-                ))
-
-        # Eski sürümde yalnızca checkout butonuna basmak status=pending üretiyordu.
-        # match_token içeren ve henüz işlem görmemiş bu kayıtlar ödeme değil,
-        # checkout niyetidir; idempotent biçimde admin kuyruğundan çıkarılır.
-        with db.engine.begin() as conn:
-            rows = conn.execute(text(
-                "SELECT id, match_token, status FROM payments "
-                "WHERE match_token IS NOT NULL ORDER BY id"
-            )).mappings().all()
-            used_tokens = set()
-            for row in rows:
-                token = str(row["match_token"] or "").strip().upper()
-                if not token:
-                    conn.execute(
-                        text("UPDATE payments SET match_token = NULL WHERE id = :id"),
-                        {"id": row["id"]},
-                    )
-                    continue
-                status = row["status"]
-                is_checkout_intent = status in ("checkout_started", "pending")
-                needs_new_active_token = (
-                    is_checkout_intent
-                    and not re.fullmatch(r"HB-[0-9A-F]{32}", token)
-                )
-                duplicate = token in used_tokens
-
-                if status == "verification_pending" and (
-                    not re.fullmatch(r"HB-[0-9A-F]{32}", token) or duplicate
-                ):
-                    raise RuntimeError(
-                        "verification_pending kaydında geçersiz/duplicate HB token bulundu"
-                    )
-
-                if is_checkout_intent and (needs_new_active_token or duplicate):
-                    new_token = _new_match_token()
-                    while new_token in used_tokens:
-                        new_token = _new_match_token()
-                    conn.execute(
-                        text("UPDATE payments SET match_token = :token WHERE id = :id"),
-                        {"token": new_token, "id": row["id"]},
-                    )
-                    used_tokens.add(new_token)
-                elif duplicate:
-                    conn.execute(
-                        text("UPDATE payments SET match_token = NULL WHERE id = :id"),
-                        {"id": row["id"]},
-                    )
-                else:
-                    if token != row["match_token"]:
-                        conn.execute(
-                            text("UPDATE payments SET match_token = :token WHERE id = :id"),
-                            {"token": token, "id": row["id"]},
-                        )
-                    used_tokens.add(token)
-
-        with db.engine.begin() as conn:
-            migrated = conn.execute(text(
-                "UPDATE payments SET status = 'checkout_started' "
-                "WHERE status = 'pending' "
-                "AND match_token IS NOT NULL "
-                "AND transaction_id IS NULL"
-            ))
-        if migrated.rowcount:
-            logger.info(
-                "Şema veri düzeltmesi: %d checkout kaydı checkout_started yapıldı",
-                migrated.rowcount,
-            )
-
-        # Tek kullanıcı için yalnızca bir açık checkout/payment verification
-        # bulunabilir. Eski checkout duplikelerinde en yeni kayıt korunur;
-        # birden fazla verification_pending varsa güvenli otomatik karar yoktur.
-        with db.engine.begin() as conn:
-            open_rows = conn.execute(text(
-                "SELECT id, user_id, status FROM payments "
-                "WHERE user_id IS NOT NULL "
-                "AND status IN ('checkout_started', 'verification_pending') "
-                "ORDER BY user_id, id DESC"
-            )).mappings().all()
-            by_user = {}
-            for row in open_rows:
-                by_user.setdefault(row["user_id"], []).append(row)
-            for user_id, rows in by_user.items():
-                pending = [r for r in rows if r["status"] == "verification_pending"]
-                if len(pending) > 1:
-                    raise RuntimeError(
-                        f"user_id={user_id} için birden fazla verification_pending bulundu"
-                    )
-                keep_id = pending[0]["id"] if pending else rows[0]["id"]
-                for row in rows:
-                    if row["id"] != keep_id and row["status"] == "checkout_started":
-                        conn.execute(text(
-                            "UPDATE payments SET status = 'cancelled' WHERE id = :id"
-                        ), {"id": row["id"]})
-
-        with db.engine.begin() as conn:
-            duplicates = conn.execute(text(
-                "SELECT transaction_id, COUNT(*) AS n FROM payments "
-                "WHERE transaction_id IS NOT NULL GROUP BY transaction_id HAVING COUNT(*) > 1"
-            )).mappings().all()
-            if duplicates:
-                raise RuntimeError(
-                    f"payments.transaction_id duplicate kayıt sayısı: {len(duplicates)}"
-                )
-
-            if dialect in ("sqlite", "postgresql"):
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_match_token "
-                    "ON payments (match_token) WHERE match_token IS NOT NULL"
-                ))
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_transaction_id "
-                    "ON payments (transaction_id) WHERE transaction_id IS NOT NULL"
-                ))
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_one_open_checkout "
-                    "ON payments (user_id) WHERE user_id IS NOT NULL "
-                    "AND status IN ('checkout_started', 'verification_pending')"
-                ))
-            else:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX ux_payments_match_token ON payments (match_token)"
-                ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_payments_shopier_webhook_id "
-                "ON payments (shopier_webhook_id)"
-            ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_payments_verification_due "
-                "ON payments (status, next_verification_at, verification_lock_until)"
-            ))
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_boost_logs_user_window "
-                "ON boost_logs (user_id, stopped_at, started_at)"
-            ))
-    except Exception as e:
-        try:
-            db.session.rollback()
-        except RuntimeError:
-            # _ensure_schema normalde app context içinde çağrılır. Hatalı bir
-            # CLI/test çağrısı asli migration hatasını gölgelememelidir.
-            pass
-        logger.critical("Kritik şema güncelleme hatası; başlangıç durduruldu: %s", e)
-        raise
+    raise RuntimeError(
+        "Runtime schema repair is retired; use the reviewed offline schema tools."
+    )
 
 
 def _reconcile_boost_state_on_startup():
@@ -3755,9 +3378,34 @@ def _reconcile_steam_credentials_on_startup():
         )
 
 
+def _initialize_database_schema():
+    """Validate the offline-owned schema without DDL or automatic repairs."""
+
+    schema_mode = app.config["DB_SCHEMA_MODE"]
+    expected_backend = app.config["DATABASE_BACKEND"]
+    actual_backend = db.engine.dialect.name
+    if actual_backend != expected_backend:
+        raise RuntimeError(
+            "Configured and active database backends do not match."
+        )
+
+    if schema_mode != "alembic" or actual_backend != "sqlite":
+        raise RuntimeError(
+            "Runtime requires SQLite with offline-owned Alembic schema."
+        )
+    paid_plan_names = tuple(
+        name for name, plan in app.config["PLANS"].items()
+        if name != "free" and plan.get("total_hours") is not None
+    )
+    assert_runtime_schema(
+        db.engine,
+        os.path.join(app.root_path, "migrations"),
+        paid_plan_names=paid_plan_names,
+    )
+
+
 with app.app_context():
-    db.create_all()
-    _ensure_schema()
+    _initialize_database_schema()
     _restore_accounting_clock_on_startup()
     _reconcile_steam_credentials_on_startup()
     _reconcile_boost_state_on_startup()
@@ -4195,9 +3843,17 @@ SHOPIER_VERIFICATION_BATCH_SIZE = 10
 SHOPIER_VERIFICATION_LOCK_SECONDS = 60
 SHOPIER_RETRY_DELAYS = (5, 30, 120, 600, 3600)
 SHOPIER_MAX_ATTEMPTS = len(SHOPIER_RETRY_DELAYS) + 1
+SHOPIER_DATABASE_TRANSACTION_MAX_ATTEMPTS = 3
 
 _payment_verification_wakeup = Event()
 _payment_verification_greenlet = None
+
+
+def _payment_transaction_retry_delay(attempt: int) -> float:
+    """Return bounded jitter for a rolled-back PostgreSQL transaction."""
+
+    base_ms = min(400, 50 * (2 ** max(0, attempt - 1)))
+    return (base_ms + secrets.randbelow(26)) / 1000.0
 
 
 def _shopier_products():
@@ -4231,6 +3887,30 @@ def _verification_retry_delay(attempt: int, retry_after=None) -> int:
 def _claim_due_payment(now=None):
     """Atomically lease one due row. Requires an active Flask app context."""
     now = as_utc(now) if now is not None else utc_now()
+    lock_until = now + timedelta(seconds=SHOPIER_VERIFICATION_LOCK_SECONDS)
+
+    if db.engine.dialect.name == "postgresql":
+        # Competing PostgreSQL workers must spread across ready jobs instead of
+        # all blocking on the first row.  The row remains locked until the lease
+        # increment commits; API I/O still happens after this transaction.
+        payment = db.session.execute(
+            build_postgresql_due_payment_claim_select(Payment, now)
+        ).scalars().first()
+        if payment is None:
+            db.session.rollback()
+            return None
+
+        payment.verification_attempts += 1
+        payment.verification_lock_until = lock_until
+        claim = {
+            "payment_id": payment.id,
+            "order_id": payment.transaction_id,
+            "attempt": payment.verification_attempts,
+        }
+        db.session.commit()
+        return claim
+
+    # Preserve the deployed SQLite SELECT + compare-and-swap path exactly.
     candidate = (
         Payment.query
         .filter(
@@ -4253,7 +3933,6 @@ def _claim_due_payment(now=None):
         return None
 
     payment_id = candidate[0]
-    lock_until = now + timedelta(seconds=SHOPIER_VERIFICATION_LOCK_SECONDS)
     result = db.session.execute(
         update(Payment)
         .where(
@@ -4290,23 +3969,29 @@ def _claim_due_payment(now=None):
 
 def _mark_verification_failed(payment_id, attempt, reason, http_status=None):
     payment = db.session.get(Payment, payment_id)
-    if (
-        not payment
-        or payment.status != "verification_pending"
-        or payment.verification_attempts != attempt
-    ):
+    order_id = payment.transaction_id if payment is not None else None
+    safe_reason = _safe_verification_reason(reason)
+    result = db.session.execute(build_payment_claim_transition(
+        Payment,
+        payment_id=payment_id,
+        attempt=attempt,
+        values={
+            "status": "verification_failed",
+            "verification_error": safe_reason,
+            "verification_last_http_status": http_status,
+            "next_verification_at": None,
+            "verification_lock_until": None,
+        },
+    ))
+    if result.rowcount != 1:
+        db.session.rollback()
         return False
-    payment.status = "verification_failed"
-    payment.verification_error = _safe_verification_reason(reason)
-    payment.verification_last_http_status = http_status
-    payment.next_verification_at = None
-    payment.verification_lock_until = None
     db.session.commit()
     logger.warning(
         "shopier.verification.failed payment_id=%s order_id=%s reason=%s attempt=%s",
-        payment.id,
-        payment.transaction_id,
-        payment.verification_error,
+        payment_id,
+        order_id,
+        safe_reason,
         attempt,
     )
     return True
@@ -4314,13 +3999,7 @@ def _mark_verification_failed(payment_id, attempt, reason, http_status=None):
 
 def _schedule_verification_retry(payment_id, attempt, error):
     payment = db.session.get(Payment, payment_id)
-    if (
-        not payment
-        or payment.status != "verification_pending"
-        or payment.verification_attempts != attempt
-    ):
-        return False
-
+    order_id = payment.transaction_id if payment is not None else None
     reason = _safe_verification_reason(getattr(error, "reason", "api_error"))
     http_status = getattr(error, "status_code", None)
     retryable = bool(getattr(error, "retryable", False))
@@ -4333,16 +4012,27 @@ def _schedule_verification_retry(payment_id, attempt, error):
     delay = _verification_retry_delay(
         attempt, getattr(error, "retry_after", None)
     )
-    payment.verification_error = reason
-    payment.verification_last_http_status = http_status
-    payment.next_verification_at = utc_now() + timedelta(seconds=delay)
-    payment.verification_lock_until = None
+    next_verification_at = utc_now() + timedelta(seconds=delay)
+    result = db.session.execute(build_payment_claim_transition(
+        Payment,
+        payment_id=payment_id,
+        attempt=attempt,
+        values={
+            "verification_error": reason,
+            "verification_last_http_status": http_status,
+            "next_verification_at": next_verification_at,
+            "verification_lock_until": None,
+        },
+    ))
+    if result.rowcount != 1:
+        db.session.rollback()
+        return False
     db.session.commit()
     logger.warning(
         "shopier.verification.retry payment_id=%s order_id=%s reason=%s "
         "attempt=%s delay=%s",
-        payment.id,
-        payment.transaction_id,
+        payment_id,
+        order_id,
         reason,
         attempt,
         delay,
@@ -4386,85 +4076,178 @@ def _locked_user(user_id):
     return (
         db.session.query(User)
         .filter(User.id == user_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
 
 
-def _finalize_canonical_order(
-    payment_id, attempt, canonical, _owner_lock_acquired=False
-):
-    """Finalize payment and plan in one DB transaction."""
-    payment = db.session.get(Payment, payment_id)
-    if (
-        not payment
-        or payment.status != "verification_pending"
-        or payment.verification_attempts != attempt
-        or payment.transaction_id != canonical.order_id
-    ):
+def _locked_payment_rows(*payment_ids):
+    """Lock known payment rows in the global deterministic ID order."""
+
+    ordered_ids = sorted({payment_id for payment_id in payment_ids if payment_id})
+    if not ordered_ids:
+        return {}
+    rows = (
+        db.session.query(Payment)
+        .filter(Payment.id.in_(ordered_ids))
+        .order_by(Payment.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    return {row.id: row for row in rows}
+
+
+def _payment_matches_claim(payment, payment_id, attempt, canonical):
+    return bool(
+        payment
+        and payment.id == payment_id
+        and payment.status == "verification_pending"
+        and payment.verification_attempts == attempt
+        and payment.transaction_id == canonical.order_id
+    )
+
+
+def _checkout_matches_canonical(checkout, canonical, reference_time):
+    if not checkout or not canonical.token or checkout.created_at is None:
         return False
+    return bool(
+        checkout.match_token == canonical.token
+        and checkout.status == "checkout_started"
+        and checkout.transaction_id is None
+        and as_utc(checkout.created_at) >= _checkout_cutoff(reference_time)
+    )
 
-    if not _owner_lock_acquired:
-        owner_id = payment.user_id
-        if owner_id is None and not payment.match_token and canonical.token:
-            checkout = _find_active_checkout_by_token(
-                canonical.token,
-                payment.webhook_received_at or utc_now(),
-            )
-            owner_id = checkout.user_id if checkout else None
-        if owner_id is not None:
-            # Re-run every precondition after acquiring the lock.  If deletion
-            # won the race, the refreshed row is finalized as unmatched; if the
-            # worker won, deletion observes the completed financial record.
-            db.session.rollback()
-            with _user_operation_lock(owner_id):
-                return _finalize_canonical_order(
-                    payment_id,
-                    attempt,
-                    canonical,
-                    _owner_lock_acquired=True,
-                )
 
-    if canonical.token_error:
-        if payment.match_token:
-            return _mark_verification_failed(
-                payment_id, attempt, canonical.token_error, 200
-            )
-        return _commit_financially_verified_unmatched(
-            payment,
-            canonical,
-            canonical.token_error,
-        )
+def _finalization_lock_hints(payment_id, attempt, canonical):
+    """Read lock targets optimistically, then end the discovery transaction."""
 
-    target = payment
-    user = None
-    if payment.match_token:
-        if payment.match_token != canonical.token:
-            return _mark_verification_failed(
-                payment_id, attempt, "token_mismatch", 200
-            )
-        user = _locked_user(payment.user_id)
-        if not user:
-            payment.owner_user_id_snapshot = (
-                payment.owner_user_id_snapshot or payment.user_id
-            )
-            if payment.user_id is not None and payment.owner_detached_at is None:
-                payment.owner_detached_at = utc_now()
-            return _commit_financially_verified_unmatched(
-                payment, canonical, "owner_not_found"
-            )
-    else:
-        target = _find_active_checkout_by_token(
+    payment = db.session.get(Payment, payment_id)
+    if not _payment_matches_claim(payment, payment_id, attempt, canonical):
+        db.session.rollback()
+        return None
+    checkout = None
+    if payment.user_id is None and not payment.match_token and canonical.token:
+        checkout = _find_active_checkout_by_token(
             canonical.token,
             payment.webhook_received_at or utc_now(),
         )
-        if not target or not target.user_id:
-            return _commit_financially_verified_unmatched(
-                payment, canonical, "active_token_not_found"
+    hints = (
+        payment.user_id if payment.user_id is not None else (
+            checkout.user_id if checkout is not None else None
+        ),
+        checkout.id if checkout is not None else None,
+    )
+    # No row lock may be taken before the User -> Payment order begins.
+    db.session.rollback()
+    return hints
+
+
+def _finalize_canonical_order_transaction(payment_id, attempt, canonical):
+    """Commit one fenced DB-only finalization and describe post-commit work."""
+
+    hints = _finalization_lock_hints(payment_id, attempt, canonical)
+    if hints is None:
+        return False, None
+    owner_id, checkout_id = hints
+    owner_lock = (
+        _user_operation_lock(owner_id) if owner_id is not None else nullcontext()
+    )
+
+    with owner_lock:
+        # Cross-process serialization begins with the User row. SQLite ignores
+        # FOR UPDATE, while its accepted single-worker path remains protected
+        # by the process-local lock above.
+        user = _locked_user(owner_id) if owner_id is not None else None
+        locked_payments = _locked_payment_rows(payment_id, checkout_id)
+        payment = locked_payments.get(payment_id)
+        if not _payment_matches_claim(payment, payment_id, attempt, canonical):
+            db.session.rollback()
+            return False, None
+
+        if payment.user_id != owner_id and payment.match_token:
+            db.session.rollback()
+            return False, None
+
+        target = payment
+        if not payment.match_token and canonical.token:
+            if checkout_id is None:
+                # A checkout created after discovery requires a fresh lock pass;
+                # never acquire its owner/payment locks in reverse order here.
+                discovered = _find_active_checkout_by_token(
+                    canonical.token,
+                    payment.webhook_received_at or utc_now(),
+                )
+                if discovered is not None:
+                    db.session.rollback()
+                    return False, None
+            else:
+                target = locked_payments.get(checkout_id)
+                if not _checkout_matches_canonical(
+                    target,
+                    canonical,
+                    payment.webhook_received_at or utc_now(),
+                ):
+                    target = None
+                elif target.user_id != owner_id:
+                    db.session.rollback()
+                    return False, None
+
+        if canonical.token_error:
+            if payment.match_token:
+                return (
+                    _mark_verification_failed(
+                        payment_id, attempt, canonical.token_error, 200
+                    ),
+                    None,
+                )
+            return (
+                _commit_financially_verified_unmatched(
+                    payment,
+                    canonical,
+                    canonical.token_error,
+                ),
+                None,
             )
 
-        user = _locked_user(target.user_id)
-        if not user:
+        if payment.match_token:
+            if payment.match_token != canonical.token:
+                return (
+                    _mark_verification_failed(
+                        payment_id, attempt, "token_mismatch", 200
+                    ),
+                    None,
+                )
+            if not user:
+                payment.owner_user_id_snapshot = (
+                    payment.owner_user_id_snapshot or payment.user_id
+                )
+                if payment.user_id is not None and payment.owner_detached_at is None:
+                    payment.owner_detached_at = utc_now()
+                return (
+                    _commit_financially_verified_unmatched(
+                        payment, canonical, "owner_not_found"
+                    ),
+                    None,
+                )
+        elif (
+            not target
+            or not target.user_id
+            or target.match_token != canonical.token
+        ):
+            # A user_id alone is never payment authorization. Legacy or
+            # malformed verification rows may carry an owner without the HB
+            # token that bound the checkout to that owner. Keep the
+            # canonically paid order for manual review, but never activate a
+            # plan unless the locked target row owns the exact API token.
+            return (
+                _commit_financially_verified_unmatched(
+                    payment, canonical, "active_token_not_found"
+                ),
+                None,
+            )
+        elif not user:
             detached_at = target.owner_detached_at or utc_now()
             payment.owner_user_id_snapshot = (
                 target.owner_user_id_snapshot or target.user_id
@@ -4490,73 +4273,137 @@ def _finalize_canonical_order(
                 target.id,
                 token_fingerprint(canonical.token),
             )
-            return True
+            return True, None
+        elif target is not payment:
+            metadata = {
+                "transaction_id": payment.transaction_id,
+                "shopier_webhook_id": payment.shopier_webhook_id,
+                "shopier_event": payment.shopier_event,
+                "shopier_account_id": payment.shopier_account_id,
+                "shopier_timestamp": payment.shopier_timestamp,
+                "webhook_body_sha256": payment.webhook_body_sha256,
+                "webhook_received_at": payment.webhook_received_at,
+                "verification_attempts": payment.verification_attempts,
+                # Hiding either side of a consolidation is append-only admin
+                # state; never make a hidden financial row visible again.
+                "admin_hidden": bool(payment.admin_hidden or target.admin_hidden),
+            }
+            PaymentAuditLog.query.filter_by(payment_id=payment.id).update(
+                {"payment_id": target.id}, synchronize_session=False
+            )
+            db.session.delete(payment)
+            db.session.flush()
+            for field, value in metadata.items():
+                setattr(target, field, value)
 
-        metadata = {
-            "transaction_id": payment.transaction_id,
-            "shopier_webhook_id": payment.shopier_webhook_id,
-            "shopier_event": payment.shopier_event,
-            "shopier_account_id": payment.shopier_account_id,
-            "shopier_timestamp": payment.shopier_timestamp,
-            "webhook_body_sha256": payment.webhook_body_sha256,
-            "webhook_received_at": payment.webhook_received_at,
-            "verification_attempts": payment.verification_attempts,
-            # Hiding either side of a consolidation is append-only admin state;
-            # never make a previously hidden financial row visible again.
-            "admin_hidden": bool(payment.admin_hidden or target.admin_hidden),
+        if not user:
+            # Defensive fallback for corrupt legacy rows. A canonically paid
+            # order ends in manual review instead of being reclaimed forever.
+            target.owner_user_id_snapshot = (
+                target.owner_user_id_snapshot or target.user_id
+            )
+            if target.user_id is not None and target.owner_detached_at is None:
+                target.owner_detached_at = utc_now()
+            return (
+                _commit_financially_verified_unmatched(
+                    target, canonical, "owner_not_found"
+                ),
+                None,
+            )
+
+        target.status = "completed"
+        target.plan = canonical.plan
+        target.amount = float(canonical.amount)
+        target.verified_amount_minor = canonical.amount_minor
+        target.verified_at = utc_now()
+        target.verification_error = None
+        target.verification_last_http_status = 200
+        target.next_verification_at = None
+        target.verification_lock_until = None
+        plan_changed = _activate_paid_plan(user, canonical.plan)
+        target_id = target.id
+        order_id = target.transaction_id
+        user_id = user.id
+        db.session.commit()
+        return True, {
+            "user_id": user_id,
+            "payment_id": target_id,
+            "order_id": order_id,
+            "plan": canonical.plan,
+            "amount_minor": canonical.amount_minor,
+            "plan_changed": plan_changed,
         }
-        PaymentAuditLog.query.filter_by(payment_id=payment.id).update(
-            {"payment_id": target.id}, synchronize_session=False
-        )
-        db.session.delete(payment)
-        db.session.flush()
-        for field, value in metadata.items():
-            setattr(target, field, value)
 
-    if not user:
-        # Defensive fallback for corrupt legacy rows. A canonically paid order
-        # must end in manual review instead of being reclaimed forever.
-        target.owner_user_id_snapshot = (
-            target.owner_user_id_snapshot or target.user_id
-        )
-        if target.user_id is not None and target.owner_detached_at is None:
-            target.owner_detached_at = utc_now()
-        return _commit_financially_verified_unmatched(
-            target, canonical, "owner_not_found"
-        )
 
-    target.status = "completed"
-    target.plan = canonical.plan
-    target.amount = float(canonical.amount)
-    target.verified_amount_minor = canonical.amount_minor
-    target.verified_at = utc_now()
-    target.verification_error = None
-    target.verification_last_http_status = 200
-    target.next_verification_at = None
-    target.verification_lock_until = None
-    plan_changed = _activate_paid_plan(user, canonical.plan)
-    db.session.commit()
-    if plan_changed:
-        quota_result = _reconcile_user_quota_locked(
-            user.id,
-            "verified_payment_plan_change",
-            enforce=True,
-        )
+def _finalize_canonical_order(payment_id, attempt, canonical):
+    """Finalize with bounded PG transaction retry, then run external effects once."""
+
+    finalized, post_commit = run_postgresql_transaction_with_retry(
+        lambda: _finalize_canonical_order_transaction(
+            payment_id,
+            attempt,
+            canonical,
+        ),
+        dialect_name=db.engine.dialect.name,
+        rollback=db.session.rollback,
+        sleep=gevent.sleep,
+        delay=_payment_transaction_retry_delay,
+        max_attempts=SHOPIER_DATABASE_TRANSACTION_MAX_ATTEMPTS,
+    )
+    if not finalized or post_commit is None:
+        return finalized
+
+    if post_commit["plan_changed"]:
+        with _user_operation_lock(post_commit["user_id"]):
+            db.session.expire_all()
+            try:
+                quota_result = _reconcile_user_quota_locked(
+                    post_commit["user_id"],
+                    "verified_payment_plan_change",
+                    enforce=True,
+                )
+            except Exception as exc:
+                # The financial transition is already durable.  A post-commit
+                # operational effect must never make the worker report the paid
+                # order as failed or attempt a second financial finalization.
+                db.session.rollback()
+                logger.critical(
+                    "quota.payment_reconcile_exception user_id=%s payment_id=%s "
+                    "error_type=%s",
+                    post_commit["user_id"],
+                    post_commit["payment_id"],
+                    type(exc).__name__,
+                )
+                try:
+                    _install_user_quota_watchdog(
+                        post_commit["user_id"],
+                        QUOTA_RECONCILE_RETRY_SECONDS,
+                        "reconcile_retry",
+                    )
+                except Exception as schedule_exc:
+                    logger.critical(
+                        "quota.payment_reconcile_recovery_schedule_failed "
+                        "user_id=%s payment_id=%s error_type=%s",
+                        post_commit["user_id"],
+                        post_commit["payment_id"],
+                        type(schedule_exc).__name__,
+                    )
+                quota_result = {"ok": False, "exception": True}
         if not quota_result.get("ok"):
             logger.critical(
                 "quota.payment_reschedule_failed user_id=%s payment_id=%s",
-                user.id,
-                target.id,
+                post_commit["user_id"],
+                post_commit["payment_id"],
             )
 
     logger.info(
         "shopier.payment.completed payment_id=%s order_id=%s plan=%s "
         "amount_minor=%s plan_changed=%s",
-        target.id,
-        target.transaction_id,
-        canonical.plan,
-        canonical.amount_minor,
-        plan_changed,
+        post_commit["payment_id"],
+        post_commit["order_id"],
+        post_commit["plan"],
+        post_commit["amount_minor"],
+        post_commit["plan_changed"],
     )
     return True
 
@@ -4606,31 +4453,44 @@ def _process_payment_claim(claim):
     except IntegrityError:
         with app.app_context():
             db.session.rollback()
-            synthetic = shopier_lib.ShopierAPIError(
-                "concurrent_conflict", retryable=True
+            _mark_verification_failed(
+                claim["payment_id"],
+                claim["attempt"],
+                "finalize_integrity_error",
             )
-            _schedule_verification_retry(
-                claim["payment_id"], claim["attempt"], synthetic
-            )
-        logger.warning(
-            "shopier.verification.concurrent_conflict payment_id=%s order_id=%s",
+        logger.error(
+            "shopier.verification.integrity_error payment_id=%s order_id=%s",
             claim["payment_id"],
             claim["order_id"],
         )
         return False
-    except Exception:
+    except Exception as exc:
+        sqlstate = postgresql_transaction_sqlstate(exc)
         with app.app_context():
             db.session.rollback()
-            synthetic = shopier_lib.ShopierAPIError(
-                "internal_finalize_error", retryable=True
-            )
-            _schedule_verification_retry(
-                claim["payment_id"], claim["attempt"], synthetic
-            )
-        logger.exception(
-            "shopier.verification.internal_error payment_id=%s order_id=%s",
+            if sqlstate is not None:
+                synthetic = shopier_lib.ShopierAPIError(
+                    f"transaction_retry_exhausted:{sqlstate}",
+                    retryable=True,
+                )
+                _schedule_verification_retry(
+                    claim["payment_id"], claim["attempt"], synthetic
+                )
+            else:
+                _mark_verification_failed(
+                    claim["payment_id"],
+                    claim["attempt"],
+                    "internal_finalize_error",
+                )
+        # Do not render the exception: SQLAlchemy DB errors may include SQL
+        # parameters, payment tokens, or connection details.
+        logger.error(
+            "shopier.verification.internal_error payment_id=%s order_id=%s "
+            "error_type=%s sqlstate=%s",
             claim["payment_id"],
             claim["order_id"],
+            type(exc).__name__,
+            sqlstate or "none",
         )
         return False
 
@@ -5918,14 +5778,34 @@ def plan_upgrade():
     user_id = g.user.id
     db.session.rollback()
     with _user_operation_lock(user_id):
-        user = db.session.get(User, user_id)
+        user = _locked_user(user_id)
         if user is None:
+            db.session.rollback()
             return jsonify({"ok": False, "error": "User not found."}), 404
         if user.plan == plan:
+            db.session.rollback()
             return jsonify({"ok": False, "error": "You are already on this plan."})
+        if _PLAN_RANK.get(user.plan, 0) > _PLAN_RANK[plan]:
+            db.session.rollback()
+            return jsonify({
+                "ok": False,
+                "error": "A paid plan cannot be downgraded through this endpoint.",
+            }), 409
 
         _activate_plan(user, plan)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            logger.exception(
+                "plan.admin_upgrade_database_error user_id=%s plan=%s",
+                user_id,
+                plan,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "The plan change could not be persisted.",
+            }), 503
         quota_result = _reconcile_user_quota_locked(
             user_id,
             "admin_self_plan_upgrade",
@@ -5953,29 +5833,46 @@ def plan_request():
 @app.route("/plan/checkout", methods=["POST"])
 @login_required
 def plan_checkout():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid request body."}), 400
     plan = data.get("plan")
     if plan not in ("basic", "premium"):
         return jsonify({"ok": False, "error": "Invalid plan."})
 
-    user = g.user
+    user_id = g.user.id
+    # `login_required` supplies a process-local lock for normal users. The DB
+    # lock is additionally required once PostgreSQL/multiple processes exist.
+    db.session.rollback()
+    user = _locked_user(user_id)
+    if user is None:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "User not found."}), 404
     if user.plan == plan:
+        db.session.rollback()
         return jsonify({"ok": False, "error": "You are already on this plan."})
     if _PLAN_RANK.get(user.plan, 0) > _PLAN_RANK[plan]:
+        db.session.rollback()
         return jsonify({
             "ok": False,
             "error": "A paid plan cannot be downgraded through checkout.",
         }), 409
 
-    pending_verification = Payment.query.filter_by(
-        user_id=user.id,
-        status="verification_pending",
-    ).first()
+    pending_verification = (
+        Payment.query
+        .filter_by(user_id=user_id, status="verification_pending")
+        .order_by(Payment.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if pending_verification:
+        payment_id = pending_verification.id
+        db.session.rollback()
         return jsonify({
             "ok": False,
             "error": "A payment is already being verified. Please wait.",
-            "payment_id": pending_verification.id,
+            "payment_id": payment_id,
         }), 409
 
     # Ürün ID'leri Config'ten (SHOPIER_*_PRODUCT_ID) gelir; URL burada türetilir
@@ -5991,9 +5888,19 @@ def plan_checkout():
     # iptal et. Iptal edilen veya tamamlanan token tekrar plan aktive edemez.
     checkout_intents = (
         Payment.query
-        .filter_by(user_id=user.id, status="checkout_started")
-        .order_by(Payment.created_at.desc())
+        .filter_by(user_id=user_id, status="checkout_started")
+        # Acquire dependent row locks in the same global ID order used by
+        # finalization and account deletion. Presentation order is applied in
+        # Python after all rows are locked.
+        .order_by(Payment.id.asc())
+        .populate_existing()
+        .with_for_update()
         .all()
+    )
+    checkout_intents.sort(
+        key=lambda item: (as_utc(item.created_at), item.id)
+        if item.created_at is not None else (UTC_EPOCH, item.id),
+        reverse=True,
     )
     payment = None
     cutoff = _checkout_cutoff()
@@ -6006,8 +5913,8 @@ def plan_checkout():
     if payment is None:
         token = _generate_match_token()
         payment = Payment(
-            user_id=user.id,
-            owner_user_id_snapshot=user.id,
+            user_id=user_id,
+            owner_user_id_snapshot=user_id,
             owner_username_snapshot=user.username,
             amount=Config.PLANS[plan]["price"],
             plan=plan,
@@ -6017,36 +5924,70 @@ def plan_checkout():
         db.session.add(payment)
     else:
         token = payment.match_token
-        payment.owner_user_id_snapshot = user.id
+        payment.owner_user_id_snapshot = user_id
         payment.owner_username_snapshot = user.username
         payment.owner_detached_at = None
     try:
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        active = Payment.query.filter_by(
-            user_id=user.id,
-            status="checkout_started",
-        ).first()
+        user = _locked_user(user_id)
+        active = (
+            Payment.query
+            .filter_by(user_id=user_id, status="checkout_started")
+            .order_by(Payment.id.asc())
+            .populate_existing()
+            .with_for_update()
+            .first()
+            if user is not None else None
+        )
         if active and active.plan == plan and active.match_token:
             payment = active
             token = active.match_token
+            payment_id = active.id
+            try:
+                db.session.commit()
+            except SQLAlchemyError:
+                db.session.rollback()
+                logger.error(
+                    "shopier.checkout_recovery_database_error user_id=%s plan=%s",
+                    user_id,
+                    plan,
+                )
+                return jsonify({
+                    "ok": False,
+                    "error": "Checkout could not be recovered. Please try again.",
+                }), 503
         else:
+            db.session.rollback()
             return jsonify({
                 "ok": False,
                 "error": "Another checkout is already active. Please retry.",
             }), 409
+    except SQLAlchemyError:
+        db.session.rollback()
+        logger.error(
+            "shopier.checkout_database_error user_id=%s plan=%s",
+            user_id,
+            plan,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Checkout could not be created. Please try again.",
+        }), 503
+    else:
+        payment_id = payment.id
 
     logger.info(
         "Checkout baslatildi: user_id=%s payment_id=%s plan=%s token_fp=%s",
-        user.id,
-        payment.id,
+        user_id,
+        payment_id,
         plan,
         token_fingerprint(token),
     )
     return jsonify({
         "ok": True,
-        "payment_id": payment.id,
+        "payment_id": payment_id,
         "shopier_url": shopier_links[plan],
         "match_token": token,
         "note": f"Order note code: {token}",
@@ -8586,8 +8527,18 @@ def admin_approve_payment():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "A JSON object is required.",
+        }), 400
     payment_id = data.get("payment_id")
+    if type(payment_id) is not int or payment_id <= 0:
+        return jsonify({
+            "ok": False,
+            "error": "A valid payment_id is required.",
+        }), 400
     payment = db.session.get(Payment, payment_id)
     if not payment:
         return jsonify({"ok": False, "error": "Payment not found."}), 404
@@ -8625,19 +8576,21 @@ def admin_approve_payment():
     )
     user_id = user.id
     payment_id = payment.id
+    actor_id = g.user.id
+    actor_username = g.user.username
     db.session.rollback()
     with _user_operation_lock(user_id):
-        # The account may have been deleted while this admin request waited for
-        # its operation lock. Re-read both rows and fail closed.
-        db.session.expire_all()
-        user = db.session.get(User, user_id)
-        payment = db.session.get(Payment, payment_id)
+        # Cross-process order is User first, then Payment. Re-read every
+        # business precondition only after both rows are locked.
+        user = _locked_user(user_id)
+        payment = _locked_payment_rows(payment_id).get(payment_id)
         if not user or (
             user.id,
             user.username,
             user.created_at,
             user.password_hash,
         ) != user_identity:
+            db.session.rollback()
             return jsonify({
                 "ok": False,
                 "error": "The target user changed before matching.",
@@ -8651,6 +8604,7 @@ def admin_approve_payment():
             or payment.verified_amount_minor is None
             or payment.plan not in ("basic", "premium")
         ):
+            db.session.rollback()
             return jsonify({
                 "ok": False,
                 "error": "The payment changed before matching. Please reload.",
@@ -8666,14 +8620,37 @@ def admin_approve_payment():
         plan_changed = _activate_paid_plan(user, payment.plan)
         db.session.add(PaymentAuditLog(
             payment_id=payment.id,
-            actor_user_id=g.user.id,
-            actor_username=g.user.username,
+            actor_user_id=actor_id,
+            actor_username=actor_username,
             action="manual_match",
             from_status=old_status,
             to_status="completed",
             reason=reason,
         ))
-        db.session.commit()
+        matched_username = user.username
+        matched_plan = payment.plan
+        order_id = payment.transaction_id
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({
+                "ok": False,
+                "error": "The payment changed before matching. Please reload.",
+                "conflict": "payment_state_changed",
+            }), 409
+        except SQLAlchemyError:
+            db.session.rollback()
+            logger.exception(
+                "shopier.payment.manual_match_database_error "
+                "payment_id=%s admin_id=%s",
+                payment_id,
+                actor_id,
+            )
+            return jsonify({
+                "ok": False,
+                "error": "The verified payment could not be matched.",
+            }), 503
         if plan_changed:
             quota_result = _reconcile_user_quota_locked(
                 user_id,
@@ -8688,13 +8665,13 @@ def admin_approve_payment():
                 )
     logger.warning(
         "shopier.payment.manual_match payment_id=%s order_id=%s admin_id=%s",
-        payment.id,
-        payment.transaction_id,
-        g.user.id,
+        payment_id,
+        order_id,
+        actor_id,
     )
     return jsonify({
         "ok": True,
-        "message": f"{user.username} matched to verified {payment.plan} order.",
+        "message": f"{matched_username} matched to verified {matched_plan} order.",
         "plan_changed": plan_changed,
     })
 
@@ -8785,6 +8762,7 @@ def admin_retry_payment():
 
     old_status = payment.status
     transaction_id = payment.transaction_id
+    observed_attempt = payment.verification_attempts
     owner_condition = (
         Payment.user_id.is_(None)
         if payment.user_id is None
@@ -8798,11 +8776,11 @@ def admin_retry_payment():
                 Payment.status == "verification_failed",
                 Payment.admin_hidden.is_(False),
                 Payment.transaction_id == transaction_id,
+                Payment.verification_attempts == observed_attempt,
                 owner_condition,
             )
             .values(
                 status="verification_pending",
-                verification_attempts=0,
                 verification_error=None,
                 verification_last_http_status=None,
                 next_verification_at=utc_now(),
@@ -8868,26 +8846,61 @@ def admin_hide_payment():
     if not g.user.is_admin:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.get_json(silent=True) or {}
-    payment = db.session.get(Payment, data.get("payment_id"))
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "ok": False,
+            "error": "A JSON object is required.",
+        }), 400
+    payment_id = data.get("payment_id")
+    if type(payment_id) is not int or payment_id <= 0:
+        return jsonify({
+            "ok": False,
+            "error": "A valid payment_id is required.",
+        }), 400
+
+    actor_id = g.user.id
+    actor_username = g.user.username
+    db.session.rollback()
+    payment = _locked_payment_rows(payment_id).get(payment_id)
     if not payment:
+        db.session.rollback()
         return jsonify({"ok": False, "error": "Payment not found."}), 404
+
+    if payment.admin_hidden:
+        db.session.rollback()
+        return jsonify({
+            "ok": True,
+            "message": "Payment is already hidden from the admin panel.",
+        })
 
     payment.admin_hidden = True
     db.session.add(PaymentAuditLog(
         payment_id=payment.id,
-        actor_user_id=g.user.id,
-        actor_username=g.user.username,
+        actor_user_id=actor_id,
+        actor_username=actor_username,
         action="admin_hide",
         from_status=payment.status,
         to_status=payment.status,
         reason="Admin panel cleanup; payment record retained.",
     ))
-    db.session.commit()
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        logger.exception(
+            "shopier.payment.hide_database_error payment_id=%s admin_id=%s",
+            payment_id,
+            actor_id,
+        )
+        return jsonify({
+            "ok": False,
+            "error": "Payment could not be hidden. Please try again.",
+        }), 503
     logger.info(
         "Ödeme admin panelinden gizlendi: payment_id=%s admin=%s",
-        payment.id,
-        g.user.username,
+        payment_id,
+        actor_username,
     )
     return jsonify({"ok": True, "message": "Payment hidden from the admin panel."})
 
@@ -9057,6 +9070,8 @@ def admin_delete_user():
     username = target_user.username
     payments = (
         Payment.query.filter_by(user_id=target_id)
+        .order_by(Payment.id.asc())
+        .populate_existing()
         .with_for_update()
         .all()
     )

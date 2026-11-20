@@ -1,6 +1,12 @@
 import os
 import secrets
 from dotenv import load_dotenv
+from runtime_guardrails import (
+    DEFAULT_LIMITER_STORAGE_URI,
+    RuntimeConfigError,
+    sqlite_runtime_creator,
+    validate_runtime_config,
+)
 
 load_dotenv()
 
@@ -21,6 +27,21 @@ def _env_positive_int(name, default):
     if value <= 0:
         raise RuntimeError(f"{name} must be a positive integer.")
     return value
+
+
+# Validate cross-setting safety before Flask extensions, database engines or
+# background greenlets are created. The resulting profile is deliberately
+# secret-free and can be exposed to application code without carrying URLs.
+_runtime_profile = validate_runtime_config(
+    os.environ,
+    workers=os.environ.get("WEB_CONCURRENCY", "1"),
+)
+if _runtime_profile.database_backend != "sqlite":
+    raise RuntimeConfigError(
+        "PostgreSQL runtime is not enabled before Phase 5H.1C acceptance."
+    )
+_database_url = os.environ["DATABASE_URL"].strip()
+_sqlite_creator = sqlite_runtime_creator(_database_url)
 
 
 class Config:
@@ -60,9 +81,20 @@ class Config:
         True,
     )
     SITE_URL = os.environ.get("SITE_URL", "https://hourboost.com.tr")
-    SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:///steamboost.db"
-    )
+    RUNTIME_PROFILE = _runtime_profile
+    DATABASE_BACKEND = _runtime_profile.database_backend
+    DB_SCHEMA_MODE = _runtime_profile.schema_mode
+    SECURITY_STATE_BACKEND = _runtime_profile.security_state_backend
+    WEB_CONCURRENCY = _runtime_profile.workers
+    REDIS_URL = (os.environ.get("REDIS_URL") or "").strip() or None
+    SQLALCHEMY_DATABASE_URI = _database_url
+    # Never render bound values in SQLAlchemy statement/exception strings.
+    # This contains DB error-path leakage without suppressing the SQL shape.
+    # Open-existing-only prevents SQLite from recreating a missing live DB.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "hide_parameters": True,
+        "creator": _sqlite_creator,
+    }
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     PERMANENT_SESSION_LIFETIME = 30 * 24 * 3600
     # Global Flask/Werkzeug request-body cap. The Shopier webhook already uses
@@ -72,8 +104,11 @@ class Config:
         512 * 1024,
     )
 
-    # Rate Limiting Depolama (Redis önerilir: redis://localhost:6379)
-    LIMITER_STORAGE_URI = os.environ.get("LIMITER_STORAGE_URI", "memory://")
+    # Phase 5H.0 permits only the local/memory pairing. Redis activation stays
+    # fail-closed until every security-state adapter is implemented together.
+    LIMITER_STORAGE_URI = os.environ.get(
+        "LIMITER_STORAGE_URI", DEFAULT_LIMITER_STORAGE_URI
+    ).strip()
 
     # Güvenli oturum çerezi ayarları
     SESSION_COOKIE_HTTPONLY = True

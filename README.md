@@ -32,15 +32,20 @@ An automated Steam game hour boosting service. Connect multiple Steam accounts, 
 
 - Python 3.10+
 - pip
+- Node.js and npm for the Steam worker
 
 ⚙️ Installation
 
-1. Clone the repository
-2. Create a virtual environment
-3. Install dependencies
-4. Set up environment variables
-5. Fill in .env with your own values:
-6. Run
+1. Clone the repository and activate a Python virtual environment.
+2. Run `python -m pip install -r requirements.txt` and `npm ci`.
+3. Copy `.env.example` to `.env` and set your own values. Do not commit this file.
+4. Initialize or audit SQLite as described in [the migration guide](migrations/README.md).
+   The database URL must point to an existing, initialized SQLite database via an absolute path.
+5. For local development, run `python app.py` on a trusted network.
+
+The application runtime is SQLite with a single worker. The PostgreSQL
+migrations and WAL utilities do not enable PostgreSQL in production. The WAL
+utilities are building blocks, not a complete backup or recovery installation.
 
 ## License
 

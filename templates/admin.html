@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<meta name="google-adsense-account" content="ca-pub-4233612570799995">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hour Boost — Admin Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--purple:#7c5cfc;--red:#ff4d6d;--red-dim:rgba(255,77,109,0.12);--gold:#f0a841;--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);padding:28px;min-height:100vh;}
+.top-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;}
+.top-bar h1{font-size:1.4rem;font-weight:700;}
+.top-bar a{color:var(--accent);text-decoration:none;font-size:0.85rem;}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:28px;}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;}
+.stat-card .label{font-size:0.68rem;font-weight:600;letter-spacing:1.5px;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;}
+.stat-card .value{font-family:Space Grotesk,monospace;font-size:1.5rem;font-weight:700;color:var(--text);}
+.stat-card .value.green{color:var(--accent);}
+.stat-card .value.gold{color:var(--gold);}
+.stat-card .value.purple{color:var(--purple);}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;}
+.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.section-title{font-size:0.85rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);}
+.search-input{padding:8px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:Outfit,sans-serif;font-size:0.85rem;outline:none;width:250px;}
+.search-input:focus{border-color:rgba(0,229,160,0.4);}
+table{width:100%;border-collapse:collapse;}
+th{text-align:left;font-size:0.68rem;font-weight:600;letter-spacing:1px;color:var(--text-muted);text-transform:uppercase;padding:10px 12px;border-bottom:1px solid var(--border);}
+td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.85rem;color:var(--text-sub);}
+tr:hover td{background:var(--surface2);}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;}
+.badge-free{background:rgba(90,96,112,0.2);color:var(--text-muted);}
+.badge-basic{background:rgba(124,92,252,0.15);color:var(--purple);}
+.badge-premium{background:rgba(240,168,65,0.15);color:var(--gold);}
+.badge-pending{background:rgba(240,168,65,0.15);color:var(--gold);}
+.badge-completed{background:var(--accent-dim);color:var(--accent);}
+.badge-admin{background:var(--red-dim);color:var(--red);}
+.btn-sm{padding:5px 12px;border:none;border-radius:6px;font-family:Outfit,sans-serif;font-size:0.75rem;font-weight:600;cursor:pointer;transition:all 0.2s;}
+.btn-approve{background:var(--accent-dim);color:var(--accent);border:1px solid rgba(0,229,160,0.2);}
+.btn-approve:hover{background:rgba(0,229,160,0.2);}
+.btn-edit{background:rgba(124,92,252,0.1);color:var(--purple);border:1px solid rgba(124,92,252,0.2);}
+.btn-edit:hover{background:rgba(124,92,252,0.2);}
+/* Silme butonu stili */
+.btn-delete{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,77,109,0.2);}
+.btn-delete:hover{background:rgba(255,77,109,0.25);}
+.payment-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.btn-delete:disabled{opacity:0.4;cursor:not-allowed;}
+select{padding:4px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:Outfit,sans-serif;font-size:0.8rem;}
+.msg{padding:10px 14px;border-radius:10px;font-size:0.82rem;margin-bottom:14px;display:none;font-weight:500;}
+.msg.ok{background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.2);color:var(--accent);display:block;}
+.msg.er{background:var(--red-dim);border:1px solid rgba(255,77,109,0.2);color:var(--red);display:block;}
+.pagination{display:flex;gap:6px;margin-top:14px;justify-content:center;}
+.page-btn{padding:6px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text-sub);font-size:0.8rem;cursor:pointer;}
+.page-btn.active{background:var(--accent-dim);color:var(--accent);border-color:rgba(0,229,160,0.3);}
+.empty{text-align:center;padding:20px;color:var(--text-muted);font-size:0.85rem;}
+/* Bakım modu */
+.maint-status{font-size:0.75rem;font-weight:700;padding:4px 12px;border-radius:20px;letter-spacing:0.3px;}
+.maint-status.on{background:var(--red-dim);color:var(--red);}
+.maint-status.off{background:var(--accent-dim);color:var(--accent);}
+.maint-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+.maint-desc{font-size:0.84rem;color:var(--text-sub);line-height:1.55;flex:1;min-width:240px;}
+.btn-maint{padding:10px 22px;border:none;border-radius:10px;font-family:Outfit,sans-serif;font-size:0.85rem;font-weight:700;cursor:pointer;transition:all 0.2s;white-space:nowrap;}
+.btn-maint.enable{background:linear-gradient(135deg,#f0a841,#e0902f);color:#1a1100;}
+.btn-maint.disable{background:var(--red);color:#fff;}
+.btn-maint:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,0.35);}
+.btn-maint:disabled{opacity:0.5;cursor:not-allowed;}
+/* Silme onay modalı */
+#deleteModal{
+  display:none;position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,0.75);
+  align-items:center;justify-content:center;
+}
+#deleteModal.open{display:flex;}
+.delete-modal-card{
+  background:#13151b;border:1px solid rgba(255,77,109,0.3);
+  border-radius:16px;padding:32px;max-width:440px;width:100%;
+  box-shadow:0 20px 60px rgba(0,0,0,0.6);
+}
+.delete-modal-icon{font-size:40px;text-align:center;margin-bottom:14px;}
+.delete-modal-title{font-size:1.1rem;font-weight:700;color:var(--red);margin-bottom:10px;text-align:center;}
+.delete-modal-body{font-size:0.88rem;color:var(--text-sub);line-height:1.7;margin-bottom:24px;text-align:center;}
+.delete-modal-body strong{color:var(--text);}
+.delete-modal-footer{display:flex;gap:10px;justify-content:center;}
+.btn-cancel{padding:10px 24px;background:transparent;color:var(--text-sub);border:1px solid var(--border2);border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;cursor:pointer;}
+.btn-cancel:hover{color:var(--text);}
+.btn-confirm-delete{padding:10px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-family:Outfit,sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;}
+.btn-confirm-delete:hover{background:#e0354f;box-shadow:0 4px 16px rgba(255,77,109,0.4);}
+.btn-confirm-delete:disabled{opacity:0.5;cursor:not-allowed;}
+</style>
+<script data-cfasync="false" nonce="{{ csp_nonce }}">
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('consent', 'default', {
+  'ad_user_data': 'denied',
+  'ad_personalization': 'denied',
+  'ad_storage': 'denied',
+  'analytics_storage': 'denied',
+  'wait_for_update': 500
+});
+</script>
+</head>
+<body>
+
+<div class="top-bar">
+  <h1>&#128736; Admin Panel</h1>
+  <a href="/dashboard">&#8592; Dashboard'a Dön</a>
+</div>
+
+<div class="msg" id="adminMsg"></div>
+<div class="stats-grid" id="statsGrid"></div>
+
+<div class="section" id="maintenanceSection">
+  <div class="section-header">
+    <div class="section-title">&#128679; Bakım Modu</div>
+    <span class="maint-status" id="maintStatus">Yükleniyor...</span>
+  </div>
+  <div class="maint-row">
+    <div class="maint-desc">Bakım modu açıkken ziyaretçiler bakım sayfasını görür; yöneticiler siteyi normal kullanmaya devam eder.</div>
+    <button class="btn-maint" id="maintToggleBtn" disabled>Yükleniyor...</button>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">&#128176; Bekleyen Ödemeler</div>
+  </div>
+  <div id="pendingPayments"><div class="empty">Yükleniyor...</div></div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <div class="section-title">&#128101; Kullanıcılar</div>
+    <input class="search-input" type="text" id="userSearch"
+           placeholder="Kullanıcı ara...">
+  </div>
+  <div id="usersTable"><div class="empty">Yükleniyor...</div></div>
+  <div class="pagination" id="pagination"></div>
+</div>
+
+<!-- Silme Onay Modalı -->
+<div id="deleteModal">
+  <div class="delete-modal-card">
+    <div class="delete-modal-icon">&#9888;&#65039;</div>
+    <div class="delete-modal-title">Kullanıcıyı Sil</div>
+    <div class="delete-modal-body" id="deleteModalBody">
+      Bu işlem geri alınamaz.
+    </div>
+    <div class="delete-modal-footer">
+      <button class="btn-cancel" id="cancelDeleteBtn">İptal</button>
+      <button class="btn-confirm-delete" id="confirmDeleteBtn">
+        &#128465; Evet, Sil
+      </button>
+    </div>
+  </div>
+</div>
+
+<script data-cfasync="false" nonce="{{ csp_nonce }}">
+var searchTimer = null;
+var currentPage = 1;
+var _deleteTargetId = null;
+var _deleteTargetName = null;
+
+// ── API yardımcıları ──────────────────────────────────────────────────────────
+
+function authHeaders(jsonBody) {
+  var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+  var csrf = csrfMeta ? csrfMeta.content : '';
+  var token = localStorage.getItem('api_token');
+  var headers = {
+    'X-Requested-With': 'XMLHttpRequest'
+  };
+  if (jsonBody) headers['Content-Type'] = 'application/json';
+  if (csrf) headers['X-CSRFToken'] = csrf;
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  return headers;
+}
+
+function parseApiResponse(r) {
+  var contentType = r.headers.get('content-type') || '';
+  if (r.status === 401) {
+    localStorage.removeItem('api_token');
+    admsg('Oturum suresi doldu. Tekrar giris yapin.', 'er');
+    setTimeout(function() { window.location.href = '/'; }, 800);
+    return Promise.reject(new Error('Oturum suresi doldu.'));
+  }
+  if (contentType.indexOf('application/json') === -1) {
+    return r.text().then(function() {
+      throw new Error('Sunucu JSON yerine HTML dondurdu. Oturum gecersiz olabilir.');
+    });
+  }
+  return r.json().then(function(d) {
+    if (!r.ok) {
+      throw new Error(d.error || 'Sunucu hatasi.');
+    }
+    return d;
+  });
+}
+
+function apiFetch(path) {
+  return fetch(path, { headers: authHeaders(false) }).then(parseApiResponse);
+}
+
+function api(path, d) {
+  return fetch(path, {
+    method: 'POST',
+    headers: authHeaders(true),
+    body: JSON.stringify(d || {})
+  }).then(parseApiResponse).catch(function(err) {
+    return { ok: false, error: err.message || 'Sunucu hatasi.' };
+  });
+}
+
+function showLoadError(targetId, err) {
+  var msg = (err && err.message) ? err.message : 'Admin verisi yuklenemedi.';
+  var el = document.getElementById(targetId);
+  if (el) el.innerHTML = '<div class="empty">' + escapeHtml(msg) + '</div>';
+  admsg(msg, 'er');
+}
+
+function admsg(t, c) {
+  var e = document.getElementById('adminMsg');
+  e.textContent = t;
+  e.className = 'msg ' + c;
+  setTimeout(function() { e.className = 'msg'; }, 6000);
+}
+
+// ── İstatistikler ─────────────────────────────────────────────────────────────
+
+function loadStats() {
+  apiFetch('/admin/stats').then(function(d) {
+    var grid = document.getElementById('statsGrid');
+    grid.innerHTML =
+      card('Toplam Kullanıcı',   '',       d.total_users) +
+      card('Bu Hafta Yeni',      '',       d.new_users_week) +
+      card('Ödeme Yapan',        'purple', d.paying_users) +
+      card('Aktif Boost',        'green',  d.active_boosts) +
+      card('Aylık Gelir',        'gold',   '₺' + Number(d.revenue_month).toFixed(2)) +
+      card('Toplam Gelir',       'gold',   '₺' + Number(d.revenue_total).toFixed(2)) +
+      card('Free / Basic / Premium', '',
+           d.plan_breakdown.free + ' / ' + d.plan_breakdown.basic + ' / ' + d.plan_breakdown.premium) +
+      card('Bekleyen Ödeme',     '',       d.pending_payments);
+  }).catch(function(err) {
+    showLoadError('statsGrid', err);
+  });
+}
+
+function card(label, color, value) {
+  return '<div class="stat-card"><div class="label">' + label +
+         '</div><div class="value' + (color ? ' ' + color : '') + '">' +
+         value + '</div></div>';
+}
+
+// ── Ödemeler ──────────────────────────────────────────────────────────────────
+
+function loadPendingPayments() {
+  apiFetch('/admin/payments').then(function(d) {
+    var el = document.getElementById('pendingPayments');
+    if (!d.payments.length) {
+      el.innerHTML = '<div class="empty">Ödeme yok &#10003;</div>';
+      return;
+    }
+    var html = '<table><thead><tr>' +
+      '<th>Kullanıcı</th><th>Plan</th><th>Tutar</th>' +
+      '<th>Durum</th><th>Tarih</th><th>İşlem</th>' +
+      '</tr></thead><tbody>';
+
+    d.payments.forEach(function(p) {
+      var rowStyle = (p.status === 'unmatched' || p.status === 'verification_failed')
+        ? 'style="background:rgba(240,80,80,0.08)"' : '';
+      var planClass = (p.plan === 'basic' || p.plan === 'premium') ? p.plan : 'free';
+
+      var statusBadge =
+        p.status === 'completed'            ? '<span style="color:#00e5a0">&#10003; Tamamlandı</span>' :
+        p.status === 'verification_pending' ? '<span style="color:#f0a841">&#8987; API doğrulanıyor (' + escapeHtml(p.verification_attempts) + ')</span>' :
+        p.status === 'verification_failed'  ? '<span style="color:#f05050">&#9888; Doğrulama başarısız</span>' :
+        p.status === 'unmatched'            ? '<span style="color:#f05050">&#9888; Eşleşmedi</span>' :
+        p.status === 'pending'              ? '<span style="color:#f0a841">Eski manuel kayıt</span>' :
+                                               '<span style="color:#5a6070">' + escapeHtml(p.status) + '</span>';
+      if (p.verification_error) {
+        statusBadge += '<div style="font-size:.72rem;color:#8d96a6;margin-top:4px">' +
+          escapeHtml(p.verification_error) + '</div>';
+      }
+
+      var primaryAction =
+        p.can_match ? '<button class="btn-sm btn-approve" data-action="approve-unmatched" data-id="' + p.id + '">&#9881; Eşleştir</button>' :
+        p.can_retry ? '<button class="btn-sm btn-approve" data-action="retry-payment" data-id="' + p.id + '">&#8635; Yeniden Dene</button>' : '';
+      var hideAction = '<button class="btn-sm btn-delete" data-action="hide-payment" data-id="' + p.id + '">&#128465; Sil</button>';
+      var actionBtn = '<div class="payment-actions">' + primaryAction + hideAction + '</div>';
+      var amountText = p.amount === null || p.amount === undefined ? '-' : '₺' + escapeHtml(p.amount);
+      var planText = p.plan || '-';
+      var dateText = p.created_at ? new Date(p.created_at).toLocaleDateString('tr') : '-';
+
+      html += '<tr ' + rowStyle + '>' +
+        '<td>' + escapeHtml(p.username) + '</td>' +
+        '<td><span class="badge badge-' + planClass + '">' + escapeHtml(planText) + '</span></td>' +
+        '<td>' + amountText + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td>' + dateText + '</td>' +
+        '<td>' + actionBtn + '</td>' +
+        '</tr>';
+    });
+
+    el.innerHTML = html + '</tbody></table>';
+  }).catch(function(err) {
+    showLoadError('pendingPayments', err);
+  });
+}
+
+function approveUnmatched(id) {
+  var username = prompt('Sipariş hangi kullanıcıya ait? HourBoost kullanıcı adını girin:');
+  if (!username || !username.trim()) return;
+  var reason = prompt('Audit kaydı için eşleştirme gerekçesini girin (zorunlu):');
+  if (!reason || reason.trim().length < 5) return;
+  api('/admin/payments/approve', {
+    payment_id: id,
+    username: username.trim(),
+    reason: reason.trim()
+  }).then(function(r) {
+    if (r.ok) { admsg(r.message, 'ok'); loadPendingPayments(); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+function retryPayment(id) {
+  var reason = prompt('Doğrulamayı yeniden deneme gerekçesini girin (zorunlu):');
+  if (!reason || reason.trim().length < 5) return;
+  api('/admin/payments/retry', { payment_id: id, reason: reason.trim() }).then(function(r) {
+    if (r.ok) { admsg(r.message, 'ok'); loadPendingPayments(); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+function hidePayment(id) {
+  if (!confirm('Bu satır admin panelinden gizlensin mi? Ödeme kaydı ve loglar silinmeyecek.')) return;
+  api('/admin/payments/hide', { payment_id: id }).then(function(r) {
+    if (r.ok) { admsg('Ödeme satırı gizlendi.', 'ok'); loadPendingPayments(); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+// ── Kullanıcılar ──────────────────────────────────────────────────────────────
+
+function loadUsers(page, search) {
+  currentPage = page || 1;
+  var url = '/admin/users?page=' + currentPage;
+  if (search) url += '&q=' + encodeURIComponent(search);
+
+  apiFetch(url).then(function(d) {
+    var el = document.getElementById('usersTable');
+    if (!d.users.length) {
+      el.innerHTML = '<div class="empty">Kullanıcı bulunamadı</div>';
+      return;
+    }
+
+    var html = '<table><thead><tr>' +
+      '<th>ID</th><th>Kullanıcı</th><th>E-posta</th><th>Plan</th>' +
+      '<th>Hesaplar</th><th>Kayıt</th><th>Son Giriş</th><th>İşlem</th>' +
+      '</tr></thead><tbody>';
+
+    d.users.forEach(function(u) {
+      // Silme butonu: admin hesabına ve kendi hesabına gösterilmez
+      var deleteBtn = u.is_admin
+        ? '<span style="color:var(--text-muted);font-size:0.75rem;">—</span>'
+        : '<button class="btn-sm btn-delete" data-action="delete" data-id="' +
+            u.id + '" data-username="' + escapeHtml(u.username) + '">' +
+          '&#128465; Sil</button>';
+
+      html += '<tr>' +
+        '<td>' + u.id + '</td>' +
+        '<td>' + escapeHtml(u.username) +
+          (u.is_admin ? ' <span class="badge badge-admin">ADMIN</span>' : '') +
+        '</td>' +
+        '<td>' + escapeHtml(u.email) + '</td>' +
+        '<td>' +
+          '<select data-action="change-plan" data-id="' + u.id + '">' +
+            '<option value="free"'     + (u.plan === 'free'    ? ' selected' : '') + '>Free</option>' +
+            '<option value="basic"'    + (u.plan === 'basic'   ? ' selected' : '') + '>Basic</option>' +
+            '<option value="premium"'  + (u.plan === 'premium' ? ' selected' : '') + '>Premium</option>' +
+          '</select>' +
+        '</td>' +
+        '<td>' + u.accounts + '</td>' +
+        '<td>' + new Date(u.created_at).toLocaleDateString('tr') + '</td>' +
+        '<td>' + (u.last_login ? new Date(u.last_login).toLocaleDateString('tr') : '-') + '</td>' +
+        '<td>' + deleteBtn + '</td>' +
+        '</tr>';
+    });
+
+    el.innerHTML = html + '</tbody></table>';
+
+    // Sayfalama
+    var pag = document.getElementById('pagination');
+    pag.innerHTML = '';
+    for (var i = 1; i <= d.pages; i++) {
+      var btn = document.createElement('button');
+      btn.className = 'page-btn' + (i === currentPage ? ' active' : '');
+      btn.textContent = i;
+      (function(p) {
+        btn.onclick = function() {
+          loadUsers(p, document.getElementById('userSearch').value);
+        };
+      })(i);
+      pag.appendChild(btn);
+    }
+  }).catch(function(err) {
+    showLoadError('usersTable', err);
+  });
+}
+
+function changePlan(userId, plan) {
+  api('/admin/users/update', { user_id: userId, plan: plan }).then(function(r) {
+    if (r.ok) { admsg('Plan güncellendi.', 'ok'); loadStats(); }
+    else { admsg(r.error || 'Hata', 'er'); }
+  });
+}
+
+// ── Kullanıcı Silme ───────────────────────────────────────────────────────────
+
+function openDeleteModal(userId, username) {
+  _deleteTargetId   = userId;
+  _deleteTargetName = username;
+
+  document.getElementById('deleteModalBody').innerHTML =
+    '<strong>' + escapeHtml(username) + '</strong> adlı kullanıcı hesabı, Steam hesapları ve ' +
+    'boost geçmişi <strong>kalıcı olarak silinecek.</strong> Ödeme ve audit kayıtları finansal ' +
+    'bütünlük için korunacak; kullanıcı bağlantısı kaldırılacaktır.' +
+    '<br><br>Bu işlem geri alınamaz. Emin misiniz?';
+
+  var btn = document.getElementById('confirmDeleteBtn');
+  btn.disabled = false;
+  btn.textContent = '🗑️ Evet, Sil';
+
+  document.getElementById('deleteModal').classList.add('open');
+}
+
+function closeDeleteModal() {
+  _deleteTargetId   = null;
+  _deleteTargetName = null;
+  document.getElementById('deleteModal').classList.remove('open');
+}
+
+function confirmDelete() {
+  if (!_deleteTargetId) return;
+
+  var btn = document.getElementById('confirmDeleteBtn');
+  btn.disabled = true;
+  btn.textContent = 'Siliniyor...';
+
+  api('/admin/users/delete', { user_id: _deleteTargetId }).then(function(r) {
+    closeDeleteModal();
+    if (r.ok) {
+      admsg(r.message, 'ok');
+      // Mevcut sayfayı yenile; sayfa boşaldıysa bir öncekine git
+      var search = document.getElementById('userSearch').value;
+      loadUsers(currentPage, search);
+      loadStats();
+    } else {
+      admsg(r.error || 'Silme basarisiz.', 'er');
+    }
+  }).catch(function() {
+    closeDeleteModal();
+    admsg('Sunucu hatası. Lütfen tekrar deneyin.', 'er');
+  });
+}
+
+// Modal dışına tıklayınca kapat
+document.getElementById('deleteModal').addEventListener('click', function(e) {
+  if (e.target === this) closeDeleteModal();
+});
+
+// ── Yardımcılar ───────────────────────────────────────────────────────────────
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function searchUsers() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(function() {
+    loadUsers(1, document.getElementById('userSearch').value);
+  }, 400);
+}
+
+// ── Bakım Modu ────────────────────────────────────────────────────────────────
+
+function renderMaintenance(on) {
+  var s = document.getElementById('maintStatus');
+  var b = document.getElementById('maintToggleBtn');
+  if (!s || !b) return;
+  if (on) {
+    s.textContent = '● Bakım modu AÇIK';
+    s.className = 'maint-status on';
+    b.textContent = 'Bakım Modunu Kapat';
+    b.className = 'btn-maint disable';
+  } else {
+    s.textContent = '● Site aktif';
+    s.className = 'maint-status off';
+    b.textContent = 'Bakım Modunu Aç';
+    b.className = 'btn-maint enable';
+  }
+  b.disabled = false;
+}
+
+function loadMaintenanceStatus() {
+  apiFetch('/admin/maintenance').then(function(d) {
+    renderMaintenance(!!d.enabled);
+  }).catch(function() {
+    var s = document.getElementById('maintStatus');
+    if (s) { s.textContent = 'durum alınamadı'; s.className = 'maint-status'; }
+  });
+}
+
+function toggleMaintenance() {
+  var b = document.getElementById('maintToggleBtn');
+  if (!b) return;
+  var turningOn = b.className.indexOf('enable') !== -1;
+  var msg = turningOn
+    ? 'Site bakım moduna alınacak. Yöneticiler hariç tüm ziyaretçiler bakım sayfasını görecek. Onaylıyor musunuz?'
+    : 'Bakım modu kapatılacak ve site herkese yeniden açılacak. Onaylıyor musunuz?';
+  if (!window.confirm(msg)) return;
+  b.disabled = true;
+  api('/admin/maintenance/toggle', {}).then(function(r) {
+    if (r.ok) {
+      renderMaintenance(!!r.enabled);
+      admsg(r.enabled ? 'Site bakım moduna alındı.' : 'Bakım modu kapatıldı.', 'ok');
+    } else {
+      admsg(r.error || 'İşlem başarısız.', 'er');
+      b.disabled = false;
+    }
+  });
+}
+
+// ── Olay bağlama (nonce CSP: inline handler yok, event delegation) ───────────
+
+// Statik handler'lar
+document.getElementById('userSearch').addEventListener('input', searchUsers);
+document.getElementById('cancelDeleteBtn').addEventListener('click', closeDeleteModal);
+document.getElementById('confirmDeleteBtn').addEventListener('click', confirmDelete);
+document.getElementById('maintToggleBtn').addEventListener('click', toggleMaintenance);
+
+// Ödemeler tablosu (dinamik) — delegasyon
+document.getElementById('pendingPayments').addEventListener('click', function(e) {
+  var btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  var id = parseInt(btn.getAttribute('data-id'), 10);
+  if (btn.getAttribute('data-action') === 'approve-unmatched') approveUnmatched(id);
+  else if (btn.getAttribute('data-action') === 'retry-payment') retryPayment(id);
+  else if (btn.getAttribute('data-action') === 'hide-payment') hidePayment(id);
+});
+
+// Kullanıcılar tablosu (dinamik) — delegasyon (silme butonu + plan select)
+var usersTableEl = document.getElementById('usersTable');
+usersTableEl.addEventListener('click', function(e) {
+  var btn = e.target.closest('button[data-action="delete"]');
+  if (!btn) return;
+  openDeleteModal(parseInt(btn.getAttribute('data-id'), 10), btn.getAttribute('data-username'));
+});
+usersTableEl.addEventListener('change', function(e) {
+  var sel = e.target.closest('select[data-action="change-plan"]');
+  if (!sel) return;
+  changePlan(parseInt(sel.getAttribute('data-id'), 10), sel.value);
+});
+
+// ── Başlangıç ─────────────────────────────────────────────────────────────────
+
+loadStats();
+loadMaintenanceStatus();
+loadPendingPayments();
+loadUsers(1);
+</script>
+
+
+</body>
+</html>

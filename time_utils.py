@@ -1,8 +1,9 @@
 """UTC and elapsed-time primitives for HourBoost.
 
-SQLite has no native timezone-aware timestamp type.  Persistent values therefore
-remain stored as timezone-naive UTC for rollback compatibility, while the Python
-side of the application always receives aware UTC datetimes.
+SQLite has no native timezone-aware timestamp type. Persistent SQLite values
+therefore remain timezone-naive UTC for rollback compatibility. PostgreSQL uses
+its native timezone-aware timestamp type. The Python side always receives aware
+UTC datetimes on both backends.
 """
 
 from __future__ import annotations
@@ -150,20 +151,28 @@ def utc_iso_z(value: Optional[datetime]) -> Optional[str]:
 
 
 class UTCDateTime(TypeDecorator):
-    """Portable aware-UTC ORM type backed by naive UTC storage.
+    """Portable aware-UTC ORM type with dialect-correct physical storage.
 
     Existing SQLite rows remain byte-for-byte compatible with the old
     ``DateTime`` mapping.  New and legacy naive writes are interpreted as UTC;
-    ORM reads always return aware UTC.  PostgreSQL's physical TIMESTAMPTZ
-    conversion intentionally remains a separate Phase 5H migration.
+    ORM reads always return aware UTC. PostgreSQL is mapped to ``TIMESTAMPTZ``
+    and receives an aware UTC value; the later data migration remains
+    responsible for converting any pre-existing physical columns.
     """
 
     impl = DateTime
     cache_ok = True
 
+    def load_dialect_impl(self, dialect):
+        return dialect.type_descriptor(
+            DateTime(timezone=dialect.name == "postgresql")
+        )
+
     def process_bind_param(self, value, dialect):
         if value is None:
             return None
+        if dialect.name == "postgresql":
+            return as_utc(value)
         return storage_utc(value)
 
     def process_result_value(self, value, dialect):

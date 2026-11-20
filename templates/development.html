@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<title>Bakım Modu — Hour Boost</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d0e12;--surface:#13151b;--surface2:#1a1d26;--border:rgba(255,255,255,0.07);--accent:#00e5a0;--accent-dim:rgba(0,229,160,0.12);--purple:#7c5cfc;--text:#e8eaf0;--text-muted:#5a6070;--text-sub:#8892a0;}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{font-family:Outfit,sans-serif;background:var(--bg);color:var(--text);overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:24px;}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,160,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
+body::after{content:'';position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:900px;height:700px;max-width:140vw;background:radial-gradient(ellipse,rgba(0,229,160,0.08) 0%,transparent 70%);pointer-events:none;z-index:0;}
+.wrap{position:relative;z-index:1;max-width:560px;width:100%;}
+.logo{display:inline-flex;align-items:center;gap:11px;font-size:1.05rem;font-weight:700;letter-spacing:1.5px;margin-bottom:48px;}
+.logo span{color:var(--accent);}
+.logo-icon{width:34px;height:34px;background:linear-gradient(135deg,var(--accent),#00a572);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:15px;}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:7px 18px;background:var(--accent-dim);border:1px solid rgba(0,229,160,0.2);border-radius:20px;font-size:0.8rem;font-weight:600;color:var(--accent);margin-bottom:32px;}
+.badge .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 0 rgba(0,229,160,0.6);animation:pulse 2s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,229,160,0.5);}70%{box-shadow:0 0 0 12px rgba(0,229,160,0);}100%{box-shadow:0 0 0 0 rgba(0,229,160,0);}}
+.gear{width:110px;height:110px;margin:0 auto 36px;position:relative;display:flex;align-items:center;justify-content:center;}
+.gear svg{width:100%;height:100%;color:var(--accent);filter:drop-shadow(0 0 24px rgba(0,229,160,0.35));}
+.gear .spin{animation:spin 9s linear infinite;transform-origin:50% 50%;}
+.gear .spin-rev{animation:spin 7s linear infinite reverse;transform-origin:50% 50%;}
+@keyframes spin{to{transform:rotate(360deg);}}
+h1{font-size:2.4rem;font-weight:700;line-height:1.2;margin-bottom:18px;}
+h1 span{background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.sub{font-size:1.05rem;color:var(--text-sub);line-height:1.7;margin-bottom:40px;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 24px;display:inline-flex;align-items:center;gap:14px;text-align:left;}
+.card .ico{font-size:1.4rem;flex-shrink:0;}
+.card .txt{font-size:0.86rem;color:var(--text-sub);line-height:1.5;}
+.card .txt b{color:var(--text);font-weight:600;}
+.bar{width:200px;height:4px;background:var(--surface2);border-radius:4px;margin:36px auto 0;overflow:hidden;position:relative;}
+.bar::before{content:'';position:absolute;top:0;left:0;height:100%;width:40%;background:linear-gradient(90deg,transparent,var(--accent),transparent);border-radius:4px;animation:load 1.8s ease-in-out infinite;}
+@keyframes load{0%{left:-40%;}100%{left:100%;}}
+.foot{margin-top:44px;font-size:0.78rem;color:var(--text-muted);}
+.admin-access{margin-top:18px;}
+.admin-access a{color:var(--text-muted);font-size:0.76rem;text-decoration:none;border-bottom:1px dashed rgba(90,96,112,0.5);cursor:pointer;transition:all 0.2s;}
+.admin-access a:hover{color:var(--accent);border-color:var(--accent);}
+.admin-login{margin:18px auto 0;max-width:300px;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;display:none;text-align:left;}
+.admin-login.open{display:block;}
+.admin-login label{display:block;font-size:0.7rem;font-weight:600;letter-spacing:0.5px;color:var(--text-muted);text-transform:uppercase;margin:0 0 6px;}
+.admin-login input{width:100%;padding:10px 12px;margin-bottom:12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:Outfit,sans-serif;font-size:0.9rem;outline:none;}
+.admin-login input:focus{border-color:rgba(0,229,160,0.4);}
+.admin-login button{width:100%;padding:11px;background:linear-gradient(135deg,#00c98b,#00a572);color:#001a0f;border:none;border-radius:9px;font-family:Outfit,sans-serif;font-weight:700;font-size:0.9rem;cursor:pointer;transition:all 0.2s;}
+.admin-login button:hover:not(:disabled){box-shadow:0 4px 18px rgba(0,229,160,0.3);}
+.admin-login button:disabled{opacity:0.6;cursor:not-allowed;}
+.admin-login .err{color:#ff6b81;font-size:0.78rem;margin-top:10px;min-height:1em;text-align:center;}
+@media(max-width:600px){h1{font-size:1.7rem;}.sub{font-size:0.95rem;}.gear{width:90px;height:90px;}.logo{margin-bottom:36px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="logo"><div class="logo-icon">&#9889;</div>HOUR <span>BOOST</span></div>
+
+  <div class="badge"><span class="dot"></span>Bakım Modu</div>
+
+  <div class="gear">
+    <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g class="spin">
+        <path fill="currentColor" d="M50 32a18 18 0 1 0 0 36 18 18 0 0 0 0-36Zm0 27a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z"/>
+        <path fill="currentColor" d="M54.6 6h-9.2l-1.6 8.3c-2 .5-3.9 1.3-5.7 2.3l-7-4.7-6.5 6.5 4.7 7c-1 1.8-1.8 3.7-2.3 5.7L18.7 39v9.2l8.3 1.6c.5 2 1.3 3.9 2.3 5.7l-4.7 7 6.5 6.5 7-4.7c1.8 1 3.7 1.8 5.7 2.3L51 82h.2l1.6-8.3c2-.5 3.9-1.3 5.7-2.3l7 4.7 6.5-6.5-4.7-7c1-1.8 1.8-3.7 2.3-5.7l8.3-1.6V40l-8.3-1.6c-.5-2-1.3-3.9-2.3-5.7l4.7-7-6.5-6.5-7 4.7c-1.8-1-3.7-1.8-5.7-2.3L54.6 6Zm-4.6 56a12 12 0 1 1 0-24 12 12 0 0 1 0 24Z" opacity="0.28"/>
+      </g>
+    </svg>
+  </div>
+
+  <h1>Şu Anda <span>Bakımdayız</span></h1>
+  <p class="sub">HourBoost şu anda bakım aşamasındadır.<br>Sistemlerimizi iyileştiriyoruz, kısa süre içinde geri döneceğiz.</p>
+
+  <div class="card">
+    <div class="ico">&#128295;</div>
+    <div class="txt"><b>Boostlarınız güvende.</b> Bakım sırasında aktif boost süreleriniz kaydedilmeye devam ediyor.</div>
+  </div>
+
+  <div class="bar"></div>
+
+  <div class="foot">Hour Boost &middot; Steam Saat Boost Servisi</div>
+
+  <div class="admin-access"><a id="adminToggle">Yönetici Girişi</a></div>
+
+  <form class="admin-login" id="adminLogin" autocomplete="off">
+    <label for="alUser">Kullanıcı Adı</label>
+    <input type="text" id="alUser" name="username" autocomplete="username">
+    <label for="alPass">Parola</label>
+    <input type="password" id="alPass" name="password" autocomplete="current-password">
+    <button type="submit" id="alBtn">Giriş Yap</button>
+    <div class="err" id="alErr"></div>
+  </form>
+
+</div>
+
+<script nonce="{{ csp_nonce }}">
+(function () {
+  var toggle = document.getElementById('adminToggle');
+  var box = document.getElementById('adminLogin');
+  var form = document.getElementById('adminLogin');
+  var btn = document.getElementById('alBtn');
+  var err = document.getElementById('alErr');
+
+  toggle.addEventListener('click', function () {
+    box.classList.toggle('open');
+    if (box.classList.contains('open')) document.getElementById('alUser').focus();
+  });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    err.textContent = '';
+    var u = document.getElementById('alUser').value.trim();
+    var p = document.getElementById('alPass').value;
+    if (!u || !p) { err.textContent = 'Kullanıcı adı ve parola gerekli.'; return; }
+    btn.disabled = true; btn.textContent = 'Giriş yapılıyor...';
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    fetch('/site_login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRFToken': meta ? meta.content : ''
+      },
+      body: JSON.stringify({ username: u, password: p })
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    }).then(function (res) {
+      var d = res.d || {};
+      if (res.ok && d.ok) {
+        if (d.token) localStorage.setItem('api_token', d.token);
+        if (d.is_admin) {
+          window.location.href = '/admin';
+        } else {
+          err.textContent = 'Bu hesap yönetici değil.';
+          btn.disabled = false; btn.textContent = 'Giriş Yap';
+        }
+      } else {
+        err.textContent = (d && d.error) ? d.error : 'Giriş başarısız.';
+        btn.disabled = false; btn.textContent = 'Giriş Yap';
+      }
+    }).catch(function () {
+      err.textContent = 'Sunucu hatası. Tekrar deneyin.';
+      btn.disabled = false; btn.textContent = 'Giriş Yap';
+    });
+  });
+})();
+</script>
+</body>
+</html>
