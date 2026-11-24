@@ -47,6 +47,15 @@ The application runtime is SQLite with a single worker. The PostgreSQL
 migrations and WAL utilities do not enable PostgreSQL in production. The WAL
 utilities are building blocks, not a complete backup or recovery installation.
 
+Candidate PostgreSQL backups are operator-triggered. Capture, transfer and a
+successful isolated restore are separate outcomes: downloading a file does not
+verify it. Retention keeps the three latest restore-verified native generations
+and preserves the WAL required by the retained backups. Periodic Windows pulls
+and notifications are disabled; backup operations do not need a background
+connection from the operator's PC. This policy does not back up live SQLite.
+Host-specific operators, recovery material and backup receipts are not part
+of this public distribution.
+
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
